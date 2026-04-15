@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Runtime data and logs
+data/
+temp/
+memory/
+*.log
+*.out
+*.err
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Nested repositories
+.git/
+
+# Secrets
+mykey.py
+sk-*
+*.pem
+*.key
+*.secret
+
+# Archives
+*.zip
