@@ -1,0 +1,9 @@
+{
+  "channel": "napcat",
+  "payload": {
+    "post_type": "message",
+    "message_type": "private",
+    "user_id": 2918684141,
+    "raw_message": "你好"
+  }
+}

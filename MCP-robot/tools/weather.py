@@ -10,6 +10,17 @@ from tools.base import BaseTool, ToolResult
 class SeniverseWeatherTool(BaseTool):
     name = "weather.query"
     description = "查询心知天气实时天气或未来几日预报。"
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "location": {"type": "string"},
+            "text": {"type": "string"},
+            "temperature": {"type": ["string", "number", "null"]},
+            "daily": {"type": "array"},
+            "updated_at": {"type": "string"},
+        },
+    }
+    tags = ("weather", "query", "external_api")
     input_schema = {
         "type": "object",
         "properties": {

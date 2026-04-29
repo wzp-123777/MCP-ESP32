@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -13,20 +13,51 @@ class ToolResult:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class ToolCapability:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] = field(default_factory=dict)
+    risk_level: str = "low"
+    requires_approval: bool = False
+    can_direct_device: bool = False
+    background_capable: bool = False
+    tags: list[str] = field(default_factory=list)
+
+
 class BaseTool:
     name: str = ""
     description: str = ""
     input_schema: dict[str, Any] = {}
+    output_schema: dict[str, Any] = {}
+    risk_level: str = "low"
+    requires_approval: bool = False
+    can_direct_device: bool = False
+    background_capable: bool = False
+    tags: tuple[str, ...] = ()
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         raise NotImplementedError
 
+    def capability(self) -> ToolCapability:
+        return ToolCapability(
+            name=self.name,
+            description=self.description,
+            input_schema=self.input_schema,
+            output_schema=self.output_schema,
+            risk_level=self.risk_level,
+            requires_approval=self.requires_approval,
+            can_direct_device=self.can_direct_device,
+            background_capable=self.background_capable,
+            tags=list(self.tags),
+        )
+
+    def should_require_approval(self, arguments: dict[str, Any]) -> bool:
+        return self.requires_approval
+
     def as_catalog_entry(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": self.input_schema,
-        }
+        return asdict(self.capability())
 
 
 @dataclass(slots=True)
@@ -57,6 +88,34 @@ class ToolRegistry:
 
     def catalog(self) -> list[dict[str, Any]]:
         return [tool.as_catalog_entry() for tool in self._tools.values()]
+
+    def capability_catalog(self) -> list[ToolCapability]:
+        return [tool.capability() for tool in self._tools.values()]
+
+    def get(self, name: str) -> BaseTool | None:
+        return self._tools.get(name)
+
+    def approval_requirements(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        requirements: list[dict[str, Any]] = []
+        for call in calls:
+            name = str(call.get("name") or "")
+            arguments = call.get("arguments") or {}
+            tool = self._tools.get(name)
+            if tool is None:
+                continue
+            if tool.should_require_approval(arguments):
+                capability = tool.capability()
+                requirements.append(
+                    {
+                        "name": name,
+                        "arguments": arguments,
+                        "risk_level": capability.risk_level,
+                        "requires_approval": True,
+                        "can_direct_device": capability.can_direct_device,
+                        "tags": capability.tags,
+                    }
+                )
+        return requirements
 
     async def execute_plan(self, calls: list[dict[str, Any]]) -> ToolExecutionBundle:
         bundle = ToolExecutionBundle()

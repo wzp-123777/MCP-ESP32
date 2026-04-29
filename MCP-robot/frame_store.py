@@ -16,6 +16,8 @@ class FrameRecord:
     image_base64: str
     note: str = ""
     lowres_summary: str = ""
+    highres_summary: str = ""
+    knowledge_summary: str = ""
 
 
 class FrameStore:
@@ -48,6 +50,16 @@ class FrameStore:
         frame.lowres_summary = summary
         self._write(frame)
 
+    def update_highres_summary(self, frame_id: str, summary: str) -> None:
+        frame = self.load(frame_id)
+        frame.highres_summary = summary
+        self._write(frame)
+
+    def update_knowledge_summary(self, frame_id: str, summary: str) -> None:
+        frame = self.load(frame_id)
+        frame.knowledge_summary = summary
+        self._write(frame)
+
     def load(self, frame_id: str) -> FrameRecord:
         path = self.root_dir / f"{frame_id}.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -65,12 +77,47 @@ class FrameStore:
             return None
         return self.load(frame_id)
 
+    def latest_payload(self, *, device_id: str | None = None) -> dict[str, str] | None:
+        frame = self.list_recent(device_id=device_id, limit=1)
+        if not frame:
+            return None
+        item = frame[0]
+        return asdict(item)
+
     def summary_context(self) -> str:
         frame = self.latest()
         if frame is None:
             return ""
-        summary = frame.lowres_summary or frame.note or "最近收到过图像帧，但还没有视觉摘要。"
+        summary = frame.knowledge_summary or frame.highres_summary or frame.lowres_summary or frame.note or "最近收到过图像帧，但还没有视觉摘要。"
         return f"最近图像帧: id={frame.frame_id} time={frame.timestamp} summary={summary}"
+
+    def summary_context_for(self, device_id: str | None = None) -> str:
+        if not device_id:
+            return self.summary_context()
+        matches = self.list_recent(device_id=device_id, limit=1)
+        if not matches:
+            return ""
+        frame = matches[0]
+        summary = frame.knowledge_summary or frame.highres_summary or frame.lowres_summary or frame.note or "最近收到过图像帧，但还没有视觉摘要。"
+        return f"最近图像帧: id={frame.frame_id} time={frame.timestamp} summary={summary}"
+
+    def list_recent(self, *, device_id: str | None = None, limit: int = 5) -> list[FrameRecord]:
+        records: list[FrameRecord] = []
+        for path in sorted(self.root_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                frame = FrameRecord(**payload)
+            except Exception:
+                continue
+            if device_id and frame.device_id != device_id:
+                continue
+            records.append(frame)
+            if len(records) >= limit:
+                break
+        return records
+
+    def list_recent_payloads(self, *, device_id: str | None = None, limit: int = 5) -> list[dict[str, str]]:
+        return [asdict(item) for item in self.list_recent(device_id=device_id, limit=limit)]
 
     def _write(self, frame: FrameRecord) -> None:
         path = self.root_dir / f"{frame.frame_id}.json"

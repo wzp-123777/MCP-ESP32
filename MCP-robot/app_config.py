@@ -21,10 +21,52 @@ class ModelConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingConfig:
+    api_key: str
+    endpoint: str
+    model: str
+    dimension: int = 1024
+    timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
 class ToolApiConfig:
     seniverse_key: str
-    tavily_key: str
     amap_key: str
+    quark_search_api_key: str
+    quark_search_agent_id: str
+    quark_search_agent_version: str
+    quark_search_workspace_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TTSPreset:
+    voice: str
+    style_prompt: str
+
+
+TTS_PRESETS: dict[str, TTSPreset] = {
+    "clear_female": TTSPreset(
+        voice="茉莉",
+        style_prompt="清脆女声，悠扬高雅，语速适中，吐字清楚，语气温柔自然",
+    ),
+    "sweet_female": TTSPreset(
+        voice="冰糖",
+        style_prompt="甜美女声，轻快亲切，语速略快但吐字清晰",
+    ),
+    "soft_female": TTSPreset(
+        voice="Chloe",
+        style_prompt="柔和女声，安静温暖，语速适中偏慢，适合陪伴式回答",
+    ),
+    "bright_female": TTSPreset(
+        voice="Mia",
+        style_prompt="明亮女声，清爽活泼，语气自然，短句有停顿",
+    ),
+    "calm_male": TTSPreset(
+        voice="白桦",
+        style_prompt="沉稳男声，清晰可靠，语速适中，语气平和",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +75,12 @@ class AppConfig:
     tool_model: ModelConfig
     vision_model: ModelConfig
     vision_highres_model: ModelConfig
+    asr_model: ModelConfig
     tts_model: ModelConfig
+    context_embedding: EmbeddingConfig
+    asr_language: str
     tts_voice: str
+    tts_style_prompt: str
     generic_agent_root: Path
     generic_agent_python: Path
     project_root: Path
@@ -45,6 +91,20 @@ class AppConfig:
     tool_api: ToolApiConfig
     subconscious_half_life_hours: float = 72.0
     qq_summary_max_chars: int = 160
+    shared_session_id: str = "shared-context:main"
+    context_recent_turns: int = 8
+    context_rag_hits: int = 5
+    memory_hot_turns: int = 8
+    memory_summary_min_turns: int = 6
+    memory_summary_batch_turns: int = 12
+    conversation_cache_size: int = 128
+    image_reply_relevance_threshold: int = 18
+    offline_gap_analysis_enabled: bool = True
+    offline_gap_threshold_minutes: int = 10
+    offline_gap_recent_entries: int = 8
+    high_risk_approval_enabled: bool = True
+    mcp_facade_enabled: bool = True
+    mcp_mount_path: str = "/mcp"
 
 
 def _detect_python(agent_root: Path) -> Path:
@@ -77,10 +137,10 @@ def _detect_python(agent_root: Path) -> Path:
             return False
 
     candidates = [
+        str(BASE_DIR / "venv" / "Scripts" / "python.exe"),
         str(agent_root / "venv" / "Scripts" / "python.exe"),
         str(agent_root / ".venv" / "Scripts" / "python.exe"),
         sys.executable,
-        r"D:\python2\python.exe",
     ]
 
     for raw in candidates:
@@ -124,24 +184,48 @@ def _pick_value(env_names: list[str], fallback: dict[str, Any], fallback_names: 
 
 def load_config() -> AppConfig:
     generic_agent_root = Path(os.getenv("GENERIC_AGENT_ROOT", r"D:\esp32\GenericAgent")).resolve()
+    mcp_robot_keys = _load_python_module(BASE_DIR / "local_keys.py")
     generic_agent_keys = _load_python_module(generic_agent_root / "mykey.py")
 
     mimo_api_key = _pick_value(
+        ["MIMO_API_KEY"],
+        mcp_robot_keys,
+        ["MIMO_API_KEY", "mimo_api_key"],
+    ) or _pick_value(
         ["MIMO_API_KEY"],
         generic_agent_keys,
         ["MIMO_API_KEY", "mimo_api_key"],
     )
     mimo_base_url = os.getenv(
         "MIMO_BASE_URL",
-        generic_agent_keys.get("MIMO_BASE_URL") or generic_agent_keys.get("mimo_base_url") or "https://api.xiaomimimo.com/v1",
+        mcp_robot_keys.get("MIMO_BASE_URL")
+        or mcp_robot_keys.get("mimo_base_url")
+        or generic_agent_keys.get("MIMO_BASE_URL")
+        or generic_agent_keys.get("mimo_base_url")
+        or "https://api.xiaomimimo.com/v1",
     ).strip()
+    tts_preset_name = os.getenv("MIMO_TTS_PRESET", "clear_female").strip()
+    tts_preset = TTS_PRESETS.get(tts_preset_name, TTS_PRESETS["clear_female"])
+    tts_voice = os.getenv("MIMO_TTS_VOICE", tts_preset.voice).strip()
+    tts_style_prompt = os.getenv("MIMO_TTS_STYLE_PROMPT", tts_preset.style_prompt).strip()
 
     qwen_api_key = _pick_value(
+        ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        mcp_robot_keys,
+        ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+    ) or _pick_value(
         ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         generic_agent_keys,
         ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
     )
-    qwen_base_url = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+    qwen_base_url = os.getenv(
+        "QWEN_BASE_URL",
+        mcp_robot_keys.get("QWEN_BASE_URL")
+        or mcp_robot_keys.get("qwen_base_url")
+        or generic_agent_keys.get("QWEN_BASE_URL")
+        or generic_agent_keys.get("qwen_base_url")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    ).strip()
 
     data_dir = Path(os.getenv("MCP_ROBOT_DATA_DIR", str(BASE_DIR / "data"))).resolve()
     subconscious_file = data_dir / "subconscious_memory.jsonl"
@@ -154,13 +238,13 @@ def load_config() -> AppConfig:
         language_model=ModelConfig(
             api_key=mimo_api_key,
             base_url=mimo_base_url,
-            model=os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2-pro").strip(),
+            model=os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro").strip(),
             timeout_seconds=float(os.getenv("MIMO_TIMEOUT_SECONDS", "120")),
         ),
         tool_model=ModelConfig(
             api_key=mimo_api_key,
             base_url=mimo_base_url,
-            model=os.getenv("MIMO_TOOL_MODEL", "mimo-v2-pro").strip(),
+            model=os.getenv("MIMO_TOOL_MODEL", "mimo-v2.5-pro").strip(),
             timeout_seconds=float(os.getenv("MIMO_TIMEOUT_SECONDS", "120")),
         ),
         # 视觉链路默认切到 Qwen VL。
@@ -174,18 +258,35 @@ def load_config() -> AppConfig:
         vision_highres_model=ModelConfig(
             api_key=os.getenv("VISION_HIGHRES_API_KEY", qwen_api_key).strip(),
             base_url=os.getenv("VISION_HIGHRES_BASE_URL", os.getenv("VISION_LOWRES_BASE_URL", qwen_base_url)).strip(),
-            model=os.getenv("VISION_HIGHRES_MODEL", "qwen3-vl-plus").strip(),
+            model=os.getenv("VISION_HIGHRES_MODEL", "qwen3.6-plus").strip(),
             timeout_seconds=float(os.getenv("VISION_HIGHRES_TIMEOUT_SECONDS", "120")),
         ),
-        # 2026-04-14 DashScope 公开文档里可直接调用的 Qwen3.5-Omni 文本/音频模型
-        # 使用的是 qwen3.5-omni-plus；如果你有别名或自建路由，可继续用环境变量覆盖。
-        tts_model=ModelConfig(
-            api_key=qwen_api_key,
-            base_url=qwen_base_url,
-            model=os.getenv("QWEN_TTS_MODEL", "qwen3.5-omni-plus").strip(),
-            timeout_seconds=float(os.getenv("QWEN_TIMEOUT_SECONDS", "120")),
+        asr_model=ModelConfig(
+            api_key=os.getenv("ASR_API_KEY", qwen_api_key).strip(),
+            base_url=os.getenv("ASR_BASE_URL", qwen_base_url).strip(),
+            model=os.getenv("ASR_MODEL", "qwen3-asr-flash").strip(),
+            timeout_seconds=float(os.getenv("ASR_TIMEOUT_SECONDS", "120")),
         ),
-        tts_voice=os.getenv("QWEN_TTS_VOICE", "Cherry").strip(),
+        # 默认使用 Xiaomi MiMo 2.5 TTS，走 OpenAI-compatible /chat/completions 路由。
+        tts_model=ModelConfig(
+            api_key=os.getenv("MIMO_TTS_API_KEY", mimo_api_key).strip(),
+            base_url=os.getenv("MIMO_TTS_BASE_URL", mimo_base_url).strip(),
+            model=os.getenv("MIMO_TTS_MODEL", "mimo-v2.5-tts").strip(),
+            timeout_seconds=float(os.getenv("MIMO_TTS_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120"))),
+        ),
+        context_embedding=EmbeddingConfig(
+            api_key=os.getenv("CONTEXT_EMBEDDING_API_KEY", qwen_api_key).strip(),
+            endpoint=os.getenv(
+                "CONTEXT_EMBEDDING_ENDPOINT",
+                "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+            ).strip(),
+            model=os.getenv("CONTEXT_EMBEDDING_MODEL", "qwen3-vl-embedding").strip(),
+            dimension=int(os.getenv("CONTEXT_EMBEDDING_DIMENSION", "1024")),
+            timeout_seconds=float(os.getenv("CONTEXT_EMBEDDING_TIMEOUT_SECONDS", "60")),
+        ),
+        asr_language=os.getenv("ASR_LANGUAGE", "zh").strip(),
+        tts_voice=tts_voice,
+        tts_style_prompt=tts_style_prompt,
         generic_agent_root=generic_agent_root,
         generic_agent_python=generic_agent_python,
         project_root=project_root,
@@ -194,10 +295,67 @@ def load_config() -> AppConfig:
         trace_log_file=trace_log_file,
         runtime_log_file=runtime_log_file,
         tool_api=ToolApiConfig(
-            seniverse_key=os.getenv("SENIVERSE_API_KEY", "").strip(),
-            tavily_key=os.getenv("TAVILY_API_KEY", "").strip(),
-            amap_key=os.getenv("AMAP_API_KEY", "").strip(),
+            seniverse_key=_pick_value(["SENIVERSE_API_KEY"], mcp_robot_keys, ["SENIVERSE_API_KEY", "seniverse_api_key"])
+            or _pick_value(["SENIVERSE_API_KEY"], generic_agent_keys, ["SENIVERSE_API_KEY", "seniverse_api_key"]),
+            amap_key=_pick_value(["AMAP_API_KEY"], mcp_robot_keys, ["AMAP_API_KEY", "amap_api_key"])
+            or _pick_value(["AMAP_API_KEY"], generic_agent_keys, ["AMAP_API_KEY", "amap_api_key"]),
+            quark_search_api_key=_pick_value(
+                ["BAILIAN_SEARCH_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+                mcp_robot_keys,
+                ["BAILIAN_SEARCH_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+            )
+            or _pick_value(
+                ["BAILIAN_SEARCH_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+                generic_agent_keys,
+                ["BAILIAN_SEARCH_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+            )
+            or qwen_api_key,
+            quark_search_agent_id=_pick_value(
+                ["BAILIAN_SEARCH_AGENT_ID", "QUARK_SEARCH_AGENT_ID"],
+                mcp_robot_keys,
+                ["BAILIAN_SEARCH_AGENT_ID", "QUARK_SEARCH_AGENT_ID"],
+            )
+            or _pick_value(
+                ["BAILIAN_SEARCH_AGENT_ID", "QUARK_SEARCH_AGENT_ID"],
+                generic_agent_keys,
+                ["BAILIAN_SEARCH_AGENT_ID", "QUARK_SEARCH_AGENT_ID"],
+            ),
+            quark_search_agent_version=_pick_value(
+                ["BAILIAN_SEARCH_AGENT_VERSION", "QUARK_SEARCH_AGENT_VERSION"],
+                mcp_robot_keys,
+                ["BAILIAN_SEARCH_AGENT_VERSION", "QUARK_SEARCH_AGENT_VERSION"],
+            )
+            or _pick_value(
+                ["BAILIAN_SEARCH_AGENT_VERSION", "QUARK_SEARCH_AGENT_VERSION"],
+                generic_agent_keys,
+                ["BAILIAN_SEARCH_AGENT_VERSION", "QUARK_SEARCH_AGENT_VERSION"],
+            )
+            or "release",
+            quark_search_workspace_id=_pick_value(
+                ["BAILIAN_WORKSPACE_ID", "DASHSCOPE_WORKSPACE_ID", "QUARK_SEARCH_WORKSPACE_ID"],
+                mcp_robot_keys,
+                ["BAILIAN_WORKSPACE_ID", "DASHSCOPE_WORKSPACE_ID", "QUARK_SEARCH_WORKSPACE_ID"],
+            )
+            or _pick_value(
+                ["BAILIAN_WORKSPACE_ID", "DASHSCOPE_WORKSPACE_ID", "QUARK_SEARCH_WORKSPACE_ID"],
+                generic_agent_keys,
+                ["BAILIAN_WORKSPACE_ID", "DASHSCOPE_WORKSPACE_ID", "QUARK_SEARCH_WORKSPACE_ID"],
+            ),
         ),
         subconscious_half_life_hours=float(os.getenv("SUBCONSCIOUS_HALF_LIFE_HOURS", "72")),
         qq_summary_max_chars=int(os.getenv("QQ_SUMMARY_MAX_CHARS", "160")),
+        shared_session_id=os.getenv("SHARED_CONTEXT_SESSION_ID", "shared-context:main").strip(),
+        context_recent_turns=int(os.getenv("CONTEXT_RECENT_TURNS", "8")),
+        context_rag_hits=int(os.getenv("CONTEXT_RAG_HITS", "5")),
+        memory_hot_turns=int(os.getenv("MEMORY_HOT_TURNS", "8")),
+        memory_summary_min_turns=int(os.getenv("MEMORY_SUMMARY_MIN_TURNS", "6")),
+        memory_summary_batch_turns=int(os.getenv("MEMORY_SUMMARY_BATCH_TURNS", "12")),
+        conversation_cache_size=int(os.getenv("CONVERSATION_CACHE_SIZE", "128")),
+        image_reply_relevance_threshold=max(0, min(100, int(os.getenv("IMAGE_REPLY_RELEVANCE_THRESHOLD", "18")))),
+        offline_gap_analysis_enabled=os.getenv("OFFLINE_GAP_ANALYSIS_ENABLED", "1").strip().lower() not in {"0", "false", "no"},
+        offline_gap_threshold_minutes=max(1, int(os.getenv("OFFLINE_GAP_THRESHOLD_MINUTES", "10"))),
+        offline_gap_recent_entries=max(4, int(os.getenv("OFFLINE_GAP_RECENT_ENTRIES", "8"))),
+        high_risk_approval_enabled=os.getenv("HIGH_RISK_APPROVAL_ENABLED", "1").strip().lower() not in {"0", "false", "no"},
+        mcp_facade_enabled=os.getenv("MCP_FACADE_ENABLED", "1").strip().lower() not in {"0", "false", "no"},
+        mcp_mount_path=os.getenv("MCP_MOUNT_PATH", "/mcp").strip() or "/mcp",
     )

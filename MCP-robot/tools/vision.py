@@ -10,6 +10,17 @@ from tools.base import BaseTool, ToolResult
 class HighResVisionTool(BaseTool):
     name = "vision.inspect_highres"
     description = "对最近一张或指定 frame_id 的图片做高清细节检查。"
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "frame_id": {"type": "string"},
+            "timestamp": {"type": "string"},
+            "answer": {"type": "string"},
+            "confidence": {"type": ["number", "null"]},
+        },
+    }
+    background_capable = True
+    tags = ("vision", "image", "inspection")
     input_schema = {
         "type": "object",
         "properties": {

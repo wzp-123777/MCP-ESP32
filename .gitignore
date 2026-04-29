@@ -11,19 +11,29 @@ venv/
 data/
 temp/
 memory/
+debug_logs/
 *.log
 *.out
 *.err
 
+# ESP-IDF/ADF build outputs
+build/
+managed_components/
+sdkconfig.old
+
 # OS / editor
 .DS_Store
 Thumbs.db
+.vscode/
 
 # Nested repositories
 .git/
 
 # Secrets
+local_keys.py
 mykey.py
+.env
+.env.*
 sk-*
 *.pem
 *.key

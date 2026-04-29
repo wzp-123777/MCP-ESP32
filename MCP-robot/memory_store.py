@@ -53,6 +53,27 @@ class SubconsciousMemoryStore:
         )
 
     def build_context(self, limit: int = 6) -> str:
+        scored_entries = self.scored_memories(limit=limit)
+        if not scored_entries:
+            return ""
+        lines_out = ["潜意识观察（按时间衰减后的可信度排序）："]
+        for item in scored_entries:
+            score = float(item["score"])
+            memory = SubconsciousMemory(
+                timestamp=str(item["timestamp"]),
+                source=str(item["source"]),
+                summary=str(item["summary"]),
+                confidence=float(item["confidence"]),
+                importance=float(item["importance"]),
+                tags=list(item.get("tags") or []),
+            )
+            tags = f" tags={','.join(memory.tags)}" if memory.tags else ""
+            lines_out.append(
+                f"- [{memory.timestamp}] score={score:.2f} confidence={memory.confidence:.2f}{tags} {memory.summary}"
+            )
+        return "\n".join(lines_out)
+
+    def scored_memories(self, *, limit: int = 20) -> list[dict[str, object]]:
         now = datetime.now(timezone.utc)
         scored_entries: list[tuple[float, SubconsciousMemory]] = []
         with self._lock:
@@ -68,18 +89,33 @@ class SubconsciousMemoryStore:
                     ts = ts.replace(tzinfo=timezone.utc)
                 age_hours = max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds() / 3600)
                 decay = math.exp(-age_hours / self.half_life_hours)
-                score = memory.confidence * memory.importance * decay
+                recency_boost = 1.0
+                image_like = memory.source.startswith(("napcat_image", "napcat_image_enriched", "vision:")) or any(
+                    "image" in tag.lower() or tag in {"comic", "manhwa", "screenshot", "food", "meal"} for tag in memory.tags
+                )
+                if image_like:
+                    if age_hours <= 0.2:
+                        recency_boost = 2.6
+                    elif age_hours <= 1.0:
+                        recency_boost = 1.9
+                    elif age_hours <= 6.0:
+                        recency_boost = 1.35
+                score = memory.confidence * memory.importance * decay * recency_boost
                 scored_entries.append((score, memory))
             except Exception:
                 continue
-        if not scored_entries:
-            return ""
         scored_entries.sort(key=lambda item: item[0], reverse=True)
-        selected = scored_entries[:limit]
-        lines_out = ["潜意识观察（按时间衰减后的可信度排序）："]
-        for score, memory in selected:
-            tags = f" tags={','.join(memory.tags)}" if memory.tags else ""
-            lines_out.append(
-                f"- [{memory.timestamp}] score={score:.2f} confidence={memory.confidence:.2f}{tags} {memory.summary}"
+        output: list[dict[str, object]] = []
+        for score, memory in scored_entries[: max(1, limit)]:
+            output.append(
+                {
+                    "timestamp": memory.timestamp,
+                    "source": memory.source,
+                    "summary": memory.summary,
+                    "confidence": memory.confidence,
+                    "importance": memory.importance,
+                    "tags": list(memory.tags),
+                    "score": round(score, 6),
+                }
             )
-        return "\n".join(lines_out)
+        return output
