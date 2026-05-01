@@ -65,16 +65,10 @@
 #define UI_BLUE_COLOR 0x57A6D8
 #define UI_ERROR_COLOR 0xE34D6F
 
-#if LV_FONT_SIMSUN_16_CJK
-LV_FONT_DECLARE(lv_font_simsun_16_cjk);
-#define UI_FONT_CJK (&lv_font_simsun_16_cjk)
-#define UI_FONT_RECENT (&lv_font_simsun_16_cjk)
-#define UI_FONT_TEXT (&lv_font_simsun_16_cjk)
-#else
-#define UI_FONT_CJK (&lv_font_montserrat_14)
-#define UI_FONT_RECENT (&lv_font_montserrat_14)
-#define UI_FONT_TEXT (&lv_font_montserrat_14)
-#endif
+LV_FONT_DECLARE(app_ui_font_zh_16);
+#define UI_FONT_CJK (&app_ui_font_zh_16)
+#define UI_FONT_RECENT (&app_ui_font_zh_16)
+#define UI_FONT_TEXT (&app_ui_font_zh_16)
 
 static const char *TAG = "APP_UI";
 static esp_periph_set_handle_t s_periph_set;

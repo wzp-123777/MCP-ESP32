@@ -171,8 +171,8 @@ def _analyze_wav_audio(wav_bytes: bytes) -> dict[str, float | int]:
 _TTS_AUDIO_B64_CHUNK_CHARS = 4096
 _TTS_AUDIO_CHUNK_DELAY_SECONDS = 0.005
 _TTS_STRONG_PUNCT_MIN_CHARS = 2
-_TTS_SOFT_PUNCT_MIN_CHARS = 14
-_TTS_MAX_SEGMENT_CHARS = 30
+_TTS_SOFT_PUNCT_MIN_CHARS = 8
+_TTS_MAX_SEGMENT_CHARS = 18
 _ESP32_TTS_SAMPLE_RATE = 16000
 _ESP32_TTS_MAX_SECONDS = 12.0
 _ESP32_TTS_TARGET_PEAK = 12000
@@ -591,6 +591,11 @@ class StreamingTTSDispatcher:
             segments.append(self._buffer.strip())
             self._buffer = ""
         return segments
+
+    async def force_flush(self) -> None:
+        for segment in self._drain_segments(final=True):
+            await self._queue.put((self._segment_no, segment))
+            self._segment_no += 1
 
     async def _run(self) -> None:
         while True:
@@ -1570,11 +1575,15 @@ class RobotRuntime:
         )
         recent_frame = self._get_recent_frame_for_request(request)
         referential_followup = recent_frame is not None and self._looks_like_referential_followup(request_text)
-        temporal_context, temporal_gap_minutes = await self._build_temporal_return_context(
-            session_id=session_id,
-            source=request.source,
-            request_text=request_text,
-        )
+        realtime_esp32 = request.source == "ESP32" and self.config.esp32_realtime_mode
+        if realtime_esp32 and self.config.esp32_realtime_skip_temporal_context:
+            temporal_context, temporal_gap_minutes = "", 0.0
+        else:
+            temporal_context, temporal_gap_minutes = await self._build_temporal_return_context(
+                session_id=session_id,
+                source=request.source,
+                request_text=request_text,
+            )
         subconscious_context = self.memory_store.build_context()
         structured_context = self.structured_memory_store.build_context(
             session_id=session_id,
@@ -1584,6 +1593,7 @@ class RobotRuntime:
         if (
             self.context_embedding is not None
             and self.context_embedding.enabled
+            and not (realtime_esp32 and self.config.esp32_realtime_skip_semantic_rag)
             and self.conversation_store.should_use_semantic_rag(request_text)
             and self.conversation_store.has_embeddings(session_id=session_id)
         ):
@@ -2830,6 +2840,7 @@ class RobotRuntime:
                 text=request_text,
             )
 
+        last_tts_flush_len = 0
         async for chunk in self.language_model.stream_reply(
             source=request.source,
             user_text=request_text,
@@ -2857,6 +2868,9 @@ class RobotRuntime:
                 )
             if tts_dispatcher is not None:
                 await tts_dispatcher.push_text(chunk)
+                if len("".join(reply_chunks)) - last_tts_flush_len >= 12 and chunk.strip().endswith(("。", "！", "？", "!", "?")):
+                    await tts_dispatcher.force_flush()
+                    last_tts_flush_len = len("".join(reply_chunks))
 
         final_reply = "".join(reply_chunks).strip()
         if not final_reply and request.source == "NapCatQQ":
@@ -3067,7 +3081,12 @@ class RobotRuntime:
                 semantic_plan = self._detect_fast_tool_route(request_text)
                 if semantic_plan is not None:
                     fast_route = f"tool:{semantic_plan.intent}"
-                elif self._is_fast_chat_candidate(request_text):
+                elif self._is_fast_chat_candidate(request_text) or (
+                    request.source == "ESP32"
+                    and self.config.esp32_realtime_mode
+                    and "\n" not in request_text
+                    and len(request_text.strip()) <= self.config.esp32_realtime_fast_chat_max_chars
+                ):
                     semantic_plan = SemanticPlan(
                         intent="chat",
                         needs_tools=False,

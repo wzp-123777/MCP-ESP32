@@ -105,6 +105,10 @@ class AppConfig:
     high_risk_approval_enabled: bool = True
     mcp_facade_enabled: bool = True
     mcp_mount_path: str = "/mcp"
+    esp32_realtime_mode: bool = True
+    esp32_realtime_skip_temporal_context: bool = True
+    esp32_realtime_skip_semantic_rag: bool = True
+    esp32_realtime_fast_chat_max_chars: int = 120
 
 
 def _detect_python(agent_root: Path) -> Path:
@@ -182,6 +186,13 @@ def _pick_value(env_names: list[str], fallback: dict[str, Any], fallback_names: 
     return ""
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
 def load_config() -> AppConfig:
     generic_agent_root = Path(os.getenv("GENERIC_AGENT_ROOT", r"D:\esp32\GenericAgent")).resolve()
     mcp_robot_keys = _load_python_module(BASE_DIR / "local_keys.py")
@@ -226,6 +237,33 @@ def load_config() -> AppConfig:
         or generic_agent_keys.get("qwen_base_url")
         or "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ).strip()
+    ark_api_key = _pick_value(
+        ["ARK_API_KEY", "DOUBAO_API_KEY"],
+        mcp_robot_keys,
+        ["ARK_API_KEY", "DOUBAO_API_KEY", "ark_api_key", "doubao_api_key"],
+    ) or _pick_value(
+        ["ARK_API_KEY", "DOUBAO_API_KEY"],
+        generic_agent_keys,
+        ["ARK_API_KEY", "DOUBAO_API_KEY", "ark_api_key", "doubao_api_key"],
+    )
+    ark_base_url = os.getenv(
+        "ARK_BASE_URL",
+        mcp_robot_keys.get("ARK_BASE_URL")
+        or mcp_robot_keys.get("ark_base_url")
+        or generic_agent_keys.get("ARK_BASE_URL")
+        or generic_agent_keys.get("ark_base_url")
+        or "https://ark.cn-beijing.volces.com/api/v3",
+    ).strip()
+    default_language_api_key = ark_api_key or mimo_api_key
+    default_language_base_url = ark_base_url if ark_api_key else mimo_base_url
+    default_language_model = os.getenv(
+        "ARK_LANGUAGE_MODEL" if ark_api_key else "MIMO_LANGUAGE_MODEL",
+        os.getenv("DOUBAO_LANGUAGE_MODEL", "doubao-seed-1-6-flash-250715" if ark_api_key else "mimo-v2.5-pro"),
+    ).strip()
+    default_tool_model = os.getenv(
+        "ARK_TOOL_MODEL" if ark_api_key else "MIMO_TOOL_MODEL",
+        os.getenv("DOUBAO_TOOL_MODEL", default_language_model if ark_api_key else "mimo-v2.5-pro"),
+    ).strip()
 
     data_dir = Path(os.getenv("MCP_ROBOT_DATA_DIR", str(BASE_DIR / "data"))).resolve()
     subconscious_file = data_dir / "subconscious_memory.jsonl"
@@ -236,16 +274,16 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         language_model=ModelConfig(
-            api_key=mimo_api_key,
-            base_url=mimo_base_url,
-            model=os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro").strip(),
-            timeout_seconds=float(os.getenv("MIMO_TIMEOUT_SECONDS", "120")),
+            api_key=os.getenv("LANGUAGE_API_KEY", default_language_api_key).strip(),
+            base_url=os.getenv("LANGUAGE_BASE_URL", default_language_base_url).strip(),
+            model=os.getenv("LANGUAGE_MODEL", default_language_model).strip(),
+            timeout_seconds=float(os.getenv("LANGUAGE_TIMEOUT_SECONDS", os.getenv("ARK_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120")))),
         ),
         tool_model=ModelConfig(
-            api_key=mimo_api_key,
-            base_url=mimo_base_url,
-            model=os.getenv("MIMO_TOOL_MODEL", "mimo-v2.5-pro").strip(),
-            timeout_seconds=float(os.getenv("MIMO_TIMEOUT_SECONDS", "120")),
+            api_key=os.getenv("TOOL_MODEL_API_KEY", default_language_api_key).strip(),
+            base_url=os.getenv("TOOL_MODEL_BASE_URL", default_language_base_url).strip(),
+            model=os.getenv("TOOL_MODEL", default_tool_model).strip(),
+            timeout_seconds=float(os.getenv("TOOL_MODEL_TIMEOUT_SECONDS", os.getenv("ARK_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120")))),
         ),
         # 视觉链路默认切到 Qwen VL。
         # 低频环境观察优先速度，高清检查优先细节；都保留环境变量覆盖入口。
@@ -262,8 +300,8 @@ def load_config() -> AppConfig:
             timeout_seconds=float(os.getenv("VISION_HIGHRES_TIMEOUT_SECONDS", "120")),
         ),
         asr_model=ModelConfig(
-            api_key=os.getenv("ASR_API_KEY", qwen_api_key).strip(),
-            base_url=os.getenv("ASR_BASE_URL", qwen_base_url).strip(),
+            api_key=os.getenv("ASR_API_KEY", qwen_api_key or ark_api_key).strip(),
+            base_url=os.getenv("ASR_BASE_URL", qwen_base_url if qwen_api_key else ark_base_url).strip(),
             model=os.getenv("ASR_MODEL", "qwen3-asr-flash").strip(),
             timeout_seconds=float(os.getenv("ASR_TIMEOUT_SECONDS", "120")),
         ),
@@ -271,10 +309,10 @@ def load_config() -> AppConfig:
         # 若切到 mimo-v2.5-tts-voicedesign，MIMO_TTS_STYLE_PROMPT 会作为 user 音色设计描述，
         # 服务端不会再传内置 voice 参数；assistant content 只保留实际朗读文本。
         tts_model=ModelConfig(
-            api_key=os.getenv("MIMO_TTS_API_KEY", mimo_api_key).strip(),
-            base_url=os.getenv("MIMO_TTS_BASE_URL", mimo_base_url).strip(),
-            model=os.getenv("MIMO_TTS_MODEL", "mimo-v2.5-tts").strip(),
-            timeout_seconds=float(os.getenv("MIMO_TTS_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120"))),
+            api_key=os.getenv("TTS_API_KEY", os.getenv("MIMO_TTS_API_KEY", mimo_api_key)).strip(),
+            base_url=os.getenv("TTS_BASE_URL", os.getenv("MIMO_TTS_BASE_URL", mimo_base_url)).strip(),
+            model=os.getenv("TTS_MODEL", os.getenv("MIMO_TTS_MODEL", "mimo-v2.5-tts")).strip(),
+            timeout_seconds=float(os.getenv("TTS_TIMEOUT_SECONDS", os.getenv("MIMO_TTS_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120")))),
         ),
         context_embedding=EmbeddingConfig(
             api_key=os.getenv("CONTEXT_EMBEDDING_API_KEY", qwen_api_key).strip(),
@@ -354,10 +392,14 @@ def load_config() -> AppConfig:
         memory_summary_batch_turns=int(os.getenv("MEMORY_SUMMARY_BATCH_TURNS", "12")),
         conversation_cache_size=int(os.getenv("CONVERSATION_CACHE_SIZE", "128")),
         image_reply_relevance_threshold=max(0, min(100, int(os.getenv("IMAGE_REPLY_RELEVANCE_THRESHOLD", "18")))),
-        offline_gap_analysis_enabled=os.getenv("OFFLINE_GAP_ANALYSIS_ENABLED", "1").strip().lower() not in {"0", "false", "no"},
+        offline_gap_analysis_enabled=_env_bool("OFFLINE_GAP_ANALYSIS_ENABLED", True),
         offline_gap_threshold_minutes=max(1, int(os.getenv("OFFLINE_GAP_THRESHOLD_MINUTES", "10"))),
         offline_gap_recent_entries=max(4, int(os.getenv("OFFLINE_GAP_RECENT_ENTRIES", "8"))),
-        high_risk_approval_enabled=os.getenv("HIGH_RISK_APPROVAL_ENABLED", "1").strip().lower() not in {"0", "false", "no"},
-        mcp_facade_enabled=os.getenv("MCP_FACADE_ENABLED", "1").strip().lower() not in {"0", "false", "no"},
+        high_risk_approval_enabled=_env_bool("HIGH_RISK_APPROVAL_ENABLED", True),
+        mcp_facade_enabled=_env_bool("MCP_FACADE_ENABLED", True),
         mcp_mount_path=os.getenv("MCP_MOUNT_PATH", "/mcp").strip() or "/mcp",
+        esp32_realtime_mode=_env_bool("ESP32_REALTIME_MODE", True),
+        esp32_realtime_skip_temporal_context=_env_bool("ESP32_REALTIME_SKIP_TEMPORAL_CONTEXT", True),
+        esp32_realtime_skip_semantic_rag=_env_bool("ESP32_REALTIME_SKIP_SEMANTIC_RAG", True),
+        esp32_realtime_fast_chat_max_chars=max(24, int(os.getenv("ESP32_REALTIME_FAST_CHAT_MAX_CHARS", "120"))),
     )
