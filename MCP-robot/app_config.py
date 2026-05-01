@@ -268,6 +268,8 @@ def load_config() -> AppConfig:
             timeout_seconds=float(os.getenv("ASR_TIMEOUT_SECONDS", "120")),
         ),
         # 默认使用 Xiaomi MiMo 2.5 TTS，走 OpenAI-compatible /chat/completions 路由。
+        # 若切到 mimo-v2.5-tts-voicedesign，MIMO_TTS_STYLE_PROMPT 会作为 user 音色设计描述，
+        # 服务端不会再传内置 voice 参数；assistant content 只保留实际朗读文本。
         tts_model=ModelConfig(
             api_key=os.getenv("MIMO_TTS_API_KEY", mimo_api_key).strip(),
             base_url=os.getenv("MIMO_TTS_BASE_URL", mimo_base_url).strip(),

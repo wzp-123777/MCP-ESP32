@@ -43,6 +43,44 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.2.0
+  espressif/esp_lcd_touch:
+    component_hash: 3f85a7d95af876f1a6ecca8eb90a81614890d0f03a038390804e5a77e2caf862
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4.2'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.2.1
+  espressif/esp_lcd_touch_gt911:
+    component_hash: 6029febef66eefd0910d527d7f30292779ccbf22a8dedd2bd69466acf0068a7b
+    dependencies:
+    - name: espressif/esp_lcd_touch
+      registry_url: https://components.espressif.com
+      require: public
+      version: ^1.2.0
+    - name: idf
+      require: private
+      version: '>=5.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0~2
+  espressif/esp_lcd_touch_tt21100:
+    component_hash: 2177cdba2d86d555bd8fa76c842a65d60d0e7df0f68f301e5ef296e5c0863d35
+    dependencies:
+    - name: espressif/esp_lcd_touch
+      registry_url: https://components.espressif.com
+      require: public
+      version: ^1.2.0
+    - name: idf
+      require: private
+      version: '>=5.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0~1
   espressif/esp_websocket_client:
     component_hash: c5a067a9fddea370c478017e66fac302f4b79c3d4027e9bdd42a019786cceb92
     dependencies:
@@ -87,15 +125,25 @@ dependencies:
     source:
       type: idf
     version: 5.5.3
+  lvgl/lvgl:
+    component_hash: d7c1ac037ae6e85d94897f807d6e7ba0946a83e720074fc95a4f6241da9f9f53
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 8.4.0
 direct_dependencies:
 - espressif/dl_fft
 - espressif/esp-dsp
 - espressif/esp_lcd_ili9341
+- espressif/esp_lcd_touch_gt911
+- espressif/esp_lcd_touch_tt21100
 - espressif/esp_websocket_client
 - espressif/jsmn
 - espressif/nghttp
 - espressif/zlib
 - idf
-manifest_hash: 11970a16037abbe97acbb917ed1eaf85f224270143736ef7648c96be188cccc7
+- lvgl/lvgl
+manifest_hash: e44bcef4f5e50110b15f08c275d87f6b05663b9d684f3e7b63abc04f1e8496e1
 target: esp32s3
 version: 2.0.0

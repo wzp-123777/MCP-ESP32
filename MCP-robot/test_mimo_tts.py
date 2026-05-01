@@ -15,7 +15,7 @@ async def main() -> None:
     out_dir = config.data_dir / "esp32_tts"
     out_dir.mkdir(parents=True, exist_ok=True)
     text = "小乐测试语音，当前使用二点五版本模型。"
-    print(f"model={config.tts_model.model} voice={config.tts_voice}")
+    print(f"model={config.tts_model.model} voice={config.tts_voice} style={config.tts_style_prompt}")
     async for audio in service.stream_audio(text):
         audio_b64 = str(audio.get("audio_b64") or "")
         if not audio_b64:

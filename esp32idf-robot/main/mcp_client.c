@@ -21,6 +21,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/apps/sntp.h"
 #include "mbedtls/base64.h"
 #include "nvs_flash.h"
 
@@ -40,18 +41,36 @@ typedef struct {
     size_t wav_len;
 } tts_play_item_t;
 
+typedef enum {
+    MCP_UI_EVENT_STATUS,
+    MCP_UI_EVENT_TEXT,
+    MCP_UI_EVENT_ERROR,
+    MCP_UI_EVENT_CONNECTED,
+    MCP_UI_EVENT_DISCONNECTED,
+} mcp_ui_event_type_t;
+
+typedef struct {
+    mcp_ui_event_type_t type;
+    app_ui_assistant_state_t state;
+    char text[128];
+} mcp_ui_event_t;
+
 static const char *TAG = "MCP_CLIENT";
 static char s_endpoint[160] = ROBOT_MCP_URI;
 static mcp_status_t s_status = MCP_STATUS_NOT_CONFIGURED;
 static EventGroupHandle_t s_event_group;
 static SemaphoreHandle_t s_send_lock;
 static QueueHandle_t s_tts_play_queue;
+static QueueHandle_t s_ui_event_queue;
 static esp_websocket_client_handle_t s_ws;
 static bool s_netif_ready;
 static bool s_wifi_connected;
 static bool s_ws_connected;
 static bool s_started;
 static bool s_ws_restart_requested;
+static bool s_ws_recreate_requested;
+static bool s_ws_stopping;
+static bool s_sntp_started;
 static TickType_t s_last_ws_start_tick;
 static char *s_rx_buffer;
 static size_t s_rx_cap;
@@ -64,17 +83,150 @@ static char s_tts_b64_pending[4];
 static size_t s_tts_b64_pending_len;
 static size_t s_tts_chunk_count;
 static size_t s_tts_b64_chars;
+static char s_current_session_id[32];
+static app_ui_assistant_state_t s_last_ui_state = APP_UI_STATE_IDLE;
+static TickType_t s_last_ui_state_tick;
 
 #define MCP_WIFI_CONNECTED_BIT BIT0
 #define MCP_SEND_TIMEOUT pdMS_TO_TICKS(3000)
 #define MCP_MAX_RX_MESSAGE (256 * 1024)
 #define MCP_MAX_TTS_BYTES (384 * 1024)
 #define MCP_MIN_TTS_BYTES 1024
-#define MCP_TTS_PLAY_QUEUE_LEN 2
+#define MCP_TTS_PLAY_QUEUE_LEN 4
+#define MCP_UI_EVENT_QUEUE_LEN 8
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static void websocket_restart(void);
+static esp_err_t websocket_create_and_start(void);
+static void websocket_request_restart(void);
+static void websocket_request_recreate(void);
 static void tts_play_task(void *arg);
+static void ui_event_task(void *arg);
+static const char *json_get_string(const char *json, const char *key, char *out, size_t out_size);
+
+static void start_sntp_once(void)
+{
+    if (s_sntp_started) {
+        return;
+    }
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+    s_sntp_started = true;
+    ESP_LOGI(TAG, "sntp started");
+}
+
+static app_ui_assistant_state_t assistant_state_from_status(const char *status)
+{
+    if (!status) {
+        return APP_UI_STATE_IDLE;
+    }
+    if (strcmp(status, "listening") == 0 || strcmp(status, "recording") == 0) {
+        return APP_UI_STATE_RECORDING;
+    }
+    if (strcmp(status, "uploading") == 0) {
+        return APP_UI_STATE_UPLOADING;
+    }
+    if (strcmp(status, "asr") == 0 || strcmp(status, "asr_started") == 0) {
+        return APP_UI_STATE_ASR;
+    }
+    if (strcmp(status, "thinking") == 0) {
+        return APP_UI_STATE_THINKING;
+    }
+    if (strcmp(status, "tts") == 0) {
+        return APP_UI_STATE_TTS;
+    }
+    if (strcmp(status, "playing") == 0) {
+        return APP_UI_STATE_PLAYING;
+    }
+    if (strcmp(status, "error") == 0) {
+        return APP_UI_STATE_ERROR;
+    }
+    return APP_UI_STATE_IDLE;
+}
+
+static void ui_post_event(mcp_ui_event_type_t type, app_ui_assistant_state_t state, const char *text)
+{
+    if (!s_ui_event_queue) {
+        return;
+    }
+    mcp_ui_event_t event = {
+        .type = type,
+        .state = state,
+    };
+    if (text) {
+        strlcpy(event.text, text, sizeof(event.text));
+    }
+    if (xQueueSend(s_ui_event_queue, &event, 0) != pdTRUE) {
+        mcp_ui_event_t dropped = {0};
+        xQueueReceive(s_ui_event_queue, &dropped, 0);
+        xQueueSend(s_ui_event_queue, &event, 0);
+    }
+}
+
+static bool message_is_for_current_session(const char *message)
+{
+    char session_id[32];
+    if (!json_get_string(message, "session_id", session_id, sizeof(session_id))) {
+        return true;
+    }
+    if (session_id[0] == '\0' || s_current_session_id[0] == '\0') {
+        return true;
+    }
+    return strcmp(session_id, s_current_session_id) == 0;
+}
+
+static bool message_is_for_this_device(const char *message)
+{
+    char device_id[48];
+    if (!json_get_string(message, "device_id", device_id, sizeof(device_id))) {
+        return true;
+    }
+    return device_id[0] == '\0' || strcmp(device_id, ROBOT_DEVICE_ID) == 0;
+}
+
+static int assistant_state_priority(app_ui_assistant_state_t state)
+{
+    switch (state) {
+        case APP_UI_STATE_ERROR:
+            return 90;
+        case APP_UI_STATE_RECORDING:
+            return 80;
+        case APP_UI_STATE_PLAYING:
+            return 70;
+        case APP_UI_STATE_TTS:
+            return 60;
+        case APP_UI_STATE_THINKING:
+            return 50;
+        case APP_UI_STATE_ASR:
+            return 40;
+        case APP_UI_STATE_UPLOADING:
+            return 30;
+        case APP_UI_STATE_OFFLINE:
+            return 20;
+        case APP_UI_STATE_IDLE:
+        default:
+            return 10;
+    }
+}
+
+static bool should_apply_ui_state(app_ui_assistant_state_t next)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (next == APP_UI_STATE_ERROR || next == APP_UI_STATE_RECORDING || next == APP_UI_STATE_OFFLINE) {
+        return true;
+    }
+    if (next == APP_UI_STATE_IDLE &&
+        (s_last_ui_state == APP_UI_STATE_PLAYING || s_last_ui_state == APP_UI_STATE_TTS) &&
+        now - s_last_ui_state_tick < pdMS_TO_TICKS(2500)) {
+        return false;
+    }
+    if (assistant_state_priority(next) < assistant_state_priority(s_last_ui_state) &&
+        now - s_last_ui_state_tick < pdMS_TO_TICKS(800)) {
+        return false;
+    }
+    return true;
+}
 
 static const char *json_get_string(const char *json, const char *key, char *out, size_t out_size)
 {
@@ -214,10 +366,21 @@ static esp_err_t ws_send_json(const char *payload)
     if (sent < 0) {
         ESP_LOGW(TAG, "send failed");
         s_ws_connected = false;
-        s_ws_restart_requested = true;
+        websocket_request_restart();
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static void websocket_request_restart(void)
+{
+    s_ws_restart_requested = true;
+}
+
+static void websocket_request_recreate(void)
+{
+    s_ws_recreate_requested = true;
+    s_ws_restart_requested = true;
 }
 
 static bool rx_reserve(size_t needed)
@@ -433,11 +596,11 @@ static void tts_finish(void)
     if (!s_tts_play_queue || xQueueSend(s_tts_play_queue, &item, 0) != pdTRUE) {
         ESP_LOGW(TAG, "tts play queue full, dropped len=%u", (unsigned)item.wav_len);
         heap_caps_free(item.wav);
-        app_ui_set_voice_state("VOICE READY");
+        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
         return;
     }
     ESP_LOGI(TAG, "tts queued len=%u", (unsigned)item.wav_len);
-    app_ui_set_voice_state("TTS QUEUED");
+    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_TTS, NULL);
 }
 
 static void tts_play_task(void *arg)
@@ -451,34 +614,90 @@ static void tts_play_task(void *arg)
         if (!item.wav || item.wav_len == 0) {
             continue;
         }
-        app_ui_set_voice_state("TTS PLAY");
+        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_PLAYING, NULL);
         esp_err_t ret = audio_player_play_wav(item.wav, item.wav_len, "tts");
         ESP_LOGI(TAG, "tts play finished len=%u ret=%s", (unsigned)item.wav_len, esp_err_to_name(ret));
         heap_caps_free(item.wav);
         item.wav = NULL;
         item.wav_len = 0;
-        app_ui_set_voice_state("VOICE READY");
+        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+    }
+}
+
+static void ui_event_task(void *arg)
+{
+    (void)arg;
+    mcp_ui_event_t event = {0};
+    while (true) {
+        if (xQueueReceive(s_ui_event_queue, &event, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        switch (event.type) {
+            case MCP_UI_EVENT_CONNECTED:
+                app_ui_set_mcp_connected(true);
+                app_ui_set_assistant_state(APP_UI_STATE_IDLE);
+                s_last_ui_state = APP_UI_STATE_IDLE;
+                s_last_ui_state_tick = xTaskGetTickCount();
+                break;
+            case MCP_UI_EVENT_DISCONNECTED:
+                app_ui_set_mcp_connected(false);
+                s_last_ui_state = APP_UI_STATE_OFFLINE;
+                s_last_ui_state_tick = xTaskGetTickCount();
+                break;
+            case MCP_UI_EVENT_STATUS:
+                app_ui_note_mcp_activity();
+                if (should_apply_ui_state(event.state)) {
+                    app_ui_set_assistant_state(event.state);
+                    s_last_ui_state = event.state;
+                    s_last_ui_state_tick = xTaskGetTickCount();
+                }
+                if (event.text[0]) {
+                    app_ui_set_recent_text(event.text);
+                }
+                break;
+            case MCP_UI_EVENT_TEXT:
+                app_ui_note_mcp_activity();
+                app_ui_set_recent_text(event.text);
+                break;
+            case MCP_UI_EVENT_ERROR:
+                app_ui_note_mcp_activity();
+                app_ui_set_assistant_state(APP_UI_STATE_ERROR);
+                s_last_ui_state = APP_UI_STATE_ERROR;
+                s_last_ui_state_tick = xTaskGetTickCount();
+                if (event.text[0]) {
+                    app_ui_set_recent_text(event.text);
+                }
+                break;
+            default:
+                break;
+        }
     }
 }
 
 static void handle_ws_text(const char *message)
 {
     char type[40];
+    char status[32];
     char text[256];
     json_get_string(message, "type", type, sizeof(type));
+    app_ui_note_mcp_activity();
+
+    if (!message_is_for_this_device(message) || !message_is_for_current_session(message)) {
+        return;
+    }
 
     if (strcmp(type, "assistant_done") == 0) {
         json_get_string(message, "text", text, sizeof(text));
         ESP_LOGI(TAG, "assistant_done: %s", text);
-        app_ui_set_mcp_status("MCP REPLIED");
-        app_ui_set_voice_state("REPLY TEXT");
+        ui_post_event(MCP_UI_EVENT_TEXT, APP_UI_STATE_IDLE, text);
         return;
     }
 
     if (strcmp(type, "assistant_status") == 0) {
+        json_get_string(message, "status", status, sizeof(status));
         json_get_string(message, "text", text, sizeof(text));
-        ESP_LOGI(TAG, "assistant_status: %s", text);
-        app_ui_set_mcp_status("MCP WORKING");
+        ESP_LOGI(TAG, "assistant_status: %s %s", status, text);
+        ui_post_event(MCP_UI_EVENT_STATUS, assistant_state_from_status(status), text);
         return;
     }
 
@@ -491,9 +710,8 @@ static void handle_ws_text(const char *message)
         ESP_LOGW(TAG, "%s: %s", type, text);
         if (strcmp(type, "tts_error") == 0) {
             tts_reset();
-            app_ui_set_voice_state("VOICE READY");
         }
-        app_ui_set_mcp_status("MCP ERROR");
+        ui_post_event(MCP_UI_EVENT_ERROR, APP_UI_STATE_ERROR, text);
         return;
     }
 
@@ -507,7 +725,7 @@ static void handle_ws_text(const char *message)
         }
         s_tts_chunk_count = 0;
         s_tts_b64_chars = 0;
-        app_ui_set_voice_state("TTS BUFFER");
+        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_TTS, NULL);
         return;
     }
 
@@ -551,14 +769,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         s_status = MCP_STATUS_WIFI_CONNECTING;
+        app_ui_set_wifi_connected(false);
         app_ui_set_mcp_status(mcp_client_get_status_text());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         s_wifi_connected = false;
         s_ws_connected = false;
-        s_ws_restart_requested = true;
+        websocket_request_restart();
         xEventGroupClearBits(s_event_group, MCP_WIFI_CONNECTED_BIT);
         s_status = MCP_STATUS_WIFI_CONNECTING;
+        app_ui_set_wifi_connected(false);
+        ui_post_event(MCP_UI_EVENT_DISCONNECTED, APP_UI_STATE_OFFLINE, NULL);
         app_ui_set_mcp_status("WIFI RETRY");
         ESP_LOGW(TAG, "wifi disconnected reason=%d, reconnecting", event ? event->reason : -1);
         esp_wifi_connect();
@@ -566,10 +787,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_wifi_connected = true;
         xEventGroupSetBits(s_event_group, MCP_WIFI_CONNECTED_BIT);
         s_status = MCP_STATUS_WIFI_CONNECTED;
-        s_ws_restart_requested = true;
+        websocket_request_restart();
+        app_ui_set_wifi_connected(true);
         app_ui_set_mcp_status(mcp_client_get_status_text());
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "wifi connected ip=" IPSTR, IP2STR(&event->ip_info.ip));
+        start_sntp_once();
     }
 }
 
@@ -615,7 +838,7 @@ static esp_err_t wifi_start(void)
     return ESP_OK;
 }
 
-static esp_err_t websocket_start(void)
+static esp_err_t websocket_create_and_start(void)
 {
     if (!s_endpoint[0]) {
         s_status = MCP_STATUS_NOT_CONFIGURED;
@@ -653,19 +876,35 @@ static void websocket_restart(void)
 {
     if (s_ws) {
         ESP_LOGW(TAG, "websocket restart");
+        s_ws_stopping = true;
         esp_websocket_client_stop(s_ws);
+        s_ws_stopping = false;
+        if (s_ws_recreate_requested) {
+            esp_websocket_client_destroy(s_ws);
+            s_ws = NULL;
+            s_ws_recreate_requested = false;
+        }
     }
     s_ws_connected = false;
     s_ws_restart_requested = false;
     s_status = s_wifi_connected ? MCP_STATUS_CONNECTING : MCP_STATUS_WIFI_CONNECTING;
     app_ui_set_mcp_status(mcp_client_get_status_text());
-    if (s_wifi_connected && s_ws) {
-        esp_err_t err = esp_websocket_client_start(s_ws);
-        s_last_ws_start_tick = xTaskGetTickCount();
+    if (!s_wifi_connected) {
+        return;
+    }
+    if (!s_ws) {
+        esp_err_t err = websocket_create_and_start();
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "websocket restart failed: %s", esp_err_to_name(err));
-            s_ws_restart_requested = true;
+            ESP_LOGW(TAG, "websocket recreate failed: %s", esp_err_to_name(err));
+            websocket_request_restart();
         }
+        return;
+    }
+    esp_err_t err = esp_websocket_client_start(s_ws);
+    s_last_ws_start_tick = xTaskGetTickCount();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "websocket restart failed: %s", esp_err_to_name(err));
+        websocket_request_restart();
     }
 }
 
@@ -684,7 +923,9 @@ static void mcp_service_task(void *arg)
         EventBits_t bits = xEventGroupWaitBits(s_event_group, MCP_WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
         if (bits & MCP_WIFI_CONNECTED_BIT) {
             if (!s_ws) {
-                websocket_start();
+                websocket_create_and_start();
+            } else if (s_ws_recreate_requested || (s_ws_connected && s_ws_restart_requested)) {
+                websocket_restart();
             } else if (!s_ws_connected) {
                 TickType_t now = xTaskGetTickCount();
                 if (s_ws_restart_requested || (now - s_last_ws_start_tick) >= pdMS_TO_TICKS(6000)) {
@@ -710,25 +951,33 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             s_ws_connected = true;
+            s_ws_stopping = false;
             s_ws_restart_requested = false;
             s_status = MCP_STATUS_CONNECTED;
             app_ui_set_mcp_status(mcp_client_get_status_text());
+            ui_post_event(MCP_UI_EVENT_CONNECTED, APP_UI_STATE_IDLE, NULL);
             ESP_LOGI(TAG, "websocket connected");
             mcp_client_send_telemetry();
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_CLOSED:
             s_ws_connected = false;
-            s_ws_restart_requested = true;
+            if (!s_ws_stopping) {
+                websocket_request_restart();
+            }
             s_status = MCP_STATUS_DISCONNECTED;
             app_ui_set_mcp_status(mcp_client_get_status_text());
+            ui_post_event(MCP_UI_EVENT_DISCONNECTED, APP_UI_STATE_OFFLINE, NULL);
             ESP_LOGW(TAG, "websocket disconnected");
             break;
         case WEBSOCKET_EVENT_ERROR:
             s_ws_connected = false;
-            s_ws_restart_requested = true;
+            if (!s_ws_stopping) {
+                websocket_request_restart();
+            }
             s_status = MCP_STATUS_ERROR;
             app_ui_set_mcp_status(mcp_client_get_status_text());
+            ui_post_event(MCP_UI_EVENT_DISCONNECTED, APP_UI_STATE_OFFLINE, NULL);
             ESP_LOGW(TAG, "websocket error");
             break;
         case WEBSOCKET_EVENT_DATA:
@@ -783,10 +1032,12 @@ esp_err_t mcp_client_init(void)
     s_event_group = xEventGroupCreate();
     s_send_lock = xSemaphoreCreateMutex();
     s_tts_play_queue = xQueueCreate(MCP_TTS_PLAY_QUEUE_LEN, sizeof(tts_play_item_t));
-    if (!s_event_group || !s_send_lock || !s_tts_play_queue) {
+    s_ui_event_queue = xQueueCreate(MCP_UI_EVENT_QUEUE_LEN, sizeof(mcp_ui_event_t));
+    if (!s_event_group || !s_send_lock || !s_tts_play_queue || !s_ui_event_queue) {
         return ESP_ERR_NO_MEM;
     }
     xTaskCreate(tts_play_task, "tts_play", 6144, NULL, 5, NULL);
+    xTaskCreate(ui_event_task, "mcp_ui_events", 3072, NULL, 3, NULL);
     s_status = s_endpoint[0] ? MCP_STATUS_CONFIGURED : MCP_STATUS_NOT_CONFIGURED;
     ESP_LOGI(TAG, "status=%s", mcp_client_get_status_text());
     return ESP_OK;
@@ -804,6 +1055,9 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
     strlcpy(s_endpoint, endpoint, sizeof(s_endpoint));
     s_status = MCP_STATUS_CONFIGURED;
     ESP_LOGI(TAG, "endpoint=%s", s_endpoint);
+    if (s_ws) {
+        websocket_request_recreate();
+    }
     return ESP_OK;
 }
 
@@ -824,10 +1078,13 @@ esp_err_t mcp_client_connect(void)
 void mcp_client_disconnect(void)
 {
     if (s_ws) {
+        s_ws_stopping = true;
         esp_websocket_client_stop(s_ws);
+        s_ws_stopping = false;
     }
     s_ws_connected = false;
     s_status = s_endpoint[0] ? MCP_STATUS_DISCONNECTED : MCP_STATUS_NOT_CONFIGURED;
+    ui_post_event(MCP_UI_EVENT_DISCONNECTED, APP_UI_STATE_OFFLINE, NULL);
     ESP_LOGI(TAG, "disconnected");
 }
 
@@ -885,6 +1142,7 @@ esp_err_t mcp_client_send_text_request(const char *text)
     snprintf(payload, sizeof(payload), "{\"type\":\"audio_text\",\"device_id\":\"%s\",\"content\":\"%s\"}", ROBOT_DEVICE_ID, escaped);
     ESP_LOGI(TAG, "send text request: %s", text);
     app_ui_set_mcp_status("MCP SEND");
+    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_THINKING, text);
     return ws_send_json(payload);
 }
 
@@ -900,6 +1158,8 @@ esp_err_t mcp_client_audio_stream_begin(const char *session_id)
              ROBOT_AUDIO_BITS,
              ROBOT_AUDIO_CHANNELS);
     ESP_LOGI(TAG, "audio stream begin session=%s", session_id);
+    strlcpy(s_current_session_id, session_id ? session_id : "", sizeof(s_current_session_id));
+    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_RECORDING, NULL);
     return ws_send_json(payload);
 }
 
@@ -951,6 +1211,7 @@ esp_err_t mcp_client_audio_stream_end(const char *session_id, uint32_t duration_
              (unsigned)duration_ms,
              reason ? reason : "set_release");
     ESP_LOGI(TAG, "audio stream end session=%s duration=%ums", session_id, (unsigned)duration_ms);
+    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_UPLOADING, NULL);
     return ws_send_json(payload);
 }
 

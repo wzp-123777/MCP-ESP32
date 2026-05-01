@@ -50,6 +50,24 @@ class ConnectionManagerProtocol(Protocol):
     async def send_to_esp32(self, message: dict[str, Any]) -> None: ...
 
 
+async def _send_esp32_status(
+    connection_manager: ConnectionManagerProtocol,
+    *,
+    status: str,
+    device_id: str = "",
+    session_id: str = "",
+    text: str = "",
+) -> None:
+    payload: dict[str, Any] = {"type": "assistant_status", "status": status}
+    if device_id:
+        payload["device_id"] = device_id
+    if session_id:
+        payload["session_id"] = session_id
+    if text:
+        payload["text"] = text[:120]
+    await connection_manager.send_to_esp32(payload)
+
+
 @dataclass(slots=True)
 class TextRequest:
     source: str
@@ -151,7 +169,10 @@ def _analyze_wav_audio(wav_bytes: bytes) -> dict[str, float | int]:
 
 
 _TTS_AUDIO_B64_CHUNK_CHARS = 4096
-_TTS_AUDIO_CHUNK_DELAY_SECONDS = 0.03
+_TTS_AUDIO_CHUNK_DELAY_SECONDS = 0.005
+_TTS_STRONG_PUNCT_MIN_CHARS = 2
+_TTS_SOFT_PUNCT_MIN_CHARS = 14
+_TTS_MAX_SEGMENT_CHARS = 30
 _ESP32_TTS_SAMPLE_RATE = 16000
 _ESP32_TTS_MAX_SECONDS = 12.0
 _ESP32_TTS_TARGET_PEAK = 12000
@@ -363,14 +384,17 @@ def _normalize_wav_for_esp32(audio_bytes: bytes) -> bytes:
 
 async def _emit_esp32_tts_audio_chunks(emit_chunk, *, segment_no: int, segment_text: str, audio: dict[str, Any], audio_b64: str) -> None:
     for offset in range(0, len(audio_b64), _TTS_AUDIO_B64_CHUNK_CHARS):
+        payload: dict[str, Any] = {
+            "type": "tts_audio_chunk",
+            "segment_no": segment_no,
+            "audio_b64": audio_b64[offset : offset + _TTS_AUDIO_B64_CHUNK_CHARS],
+        }
+        for key in ("audio_id", "format", "voice"):
+            value = audio.get(key)
+            if value:
+                payload[key] = value
         await emit_chunk(
-            {
-                "type": "tts_audio_chunk",
-                "segment_no": segment_no,
-                "text": segment_text,
-                **audio,
-                "audio_b64": audio_b64[offset : offset + _TTS_AUDIO_B64_CHUNK_CHARS],
-            }
+            payload
         )
         await asyncio.sleep(_TTS_AUDIO_CHUNK_DELAY_SECONDS)
 
@@ -505,12 +529,25 @@ async def _send_single_tts_segment(tts_service: TTSModelService, emit_chunk, tex
 
 
 class StreamingTTSDispatcher:
-    def __init__(self, tts_service: TTSModelService, emit_chunk) -> None:
+    def __init__(
+        self,
+        tts_service: TTSModelService,
+        emit_chunk,
+        *,
+        device_id: str = "",
+        session_id: str = "",
+        segment_stream_end: bool = False,
+    ) -> None:
         self.tts_service = tts_service
         self.emit_chunk = emit_chunk
-        self._queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue(maxsize=4)
         self._buffer = ""
         self._segment_no = 0
+        self._device_id = device_id
+        self._session_id = session_id
+        self._segment_stream_end = segment_stream_end
+        self._sent_tts_status = False
+        self.sent_audio_segments = 0
         self._worker = asyncio.create_task(self._run())
 
     async def push_text(self, text_chunk: str) -> None:
@@ -531,7 +568,10 @@ class StreamingTTSDispatcher:
         while True:
             cut_index = -1
             for index, char in enumerate(self._buffer):
-                if char in "。！？!?；;\n" and index >= 6:
+                if char in "。！？!?；;\n" and index >= _TTS_STRONG_PUNCT_MIN_CHARS:
+                    cut_index = index
+                    break
+                if char in "，,、" and index >= _TTS_SOFT_PUNCT_MIN_CHARS:
                     cut_index = index
                     break
             if cut_index >= 0:
@@ -540,9 +580,9 @@ class StreamingTTSDispatcher:
                 if segment:
                     segments.append(segment)
                 continue
-            if not final and len(self._buffer) >= 48:
-                segment = self._buffer[:48].strip()
-                self._buffer = self._buffer[48:]
+            if not final and len(self._buffer) >= _TTS_MAX_SEGMENT_CHARS:
+                segment = self._buffer[:_TTS_MAX_SEGMENT_CHARS].strip()
+                self._buffer = self._buffer[_TTS_MAX_SEGMENT_CHARS:]
                 if segment:
                     segments.append(segment)
                 continue
@@ -556,24 +596,31 @@ class StreamingTTSDispatcher:
         while True:
             item = await self._queue.get()
             if item is None:
-                await self.emit_chunk({"type": "tts_stream_end"})
+                if not self._segment_stream_end:
+                    await self._emit_tts_event({"type": "tts_stream_end"})
                 return
             segment_no, segment_text = item
             segment_text = _sanitize_spoken_text(segment_text)
             if not segment_text:
                 continue
-            await self.emit_chunk({"type": "tts_segment_start", "segment_no": segment_no, "text": segment_text})
+            segment_ok = False
+            if self._segment_stream_end and not self._sent_tts_status:
+                await self._emit_tts_event({"type": "assistant_status", "status": "tts", "text": segment_text[:120]})
+                self._sent_tts_status = True
+            await self._emit_tts_event({"type": "tts_segment_start", "segment_no": segment_no, "text": segment_text})
             try:
                 async for audio in self.tts_service.stream_audio(segment_text):
                     audio_b64 = _select_single_wav_from_base64(str(audio.get("audio_b64") or ""))
                     if audio_b64:
                         await _emit_esp32_tts_audio_chunks(
-                            self.emit_chunk,
+                            self._emit_tts_event,
                             segment_no=segment_no,
                             segment_text=segment_text,
                             audio=audio,
                             audio_b64=audio_b64,
                         )
+                        segment_ok = True
+                        self.sent_audio_segments += 1
                     else:
                         payload = {
                             "type": "tts_error",
@@ -581,10 +628,10 @@ class StreamingTTSDispatcher:
                             "text": segment_text,
                             "error": "TTS did not return a complete WAV payload",
                         }
-                        await self.emit_chunk(payload)
+                        await self._emit_tts_event(payload)
             except Exception as exc:
                 logger.warning("语音合成流式输出失败: %s", exc)
-                await self.emit_chunk(
+                await self._emit_tts_event(
                     {
                         "type": "tts_error",
                         "segment_no": segment_no,
@@ -592,6 +639,16 @@ class StreamingTTSDispatcher:
                         "error": str(exc),
                     }
                 )
+            finally:
+                if self._segment_stream_end and segment_ok:
+                    await self._emit_tts_event({"type": "tts_stream_end", "segment_no": segment_no})
+
+    async def _emit_tts_event(self, payload: dict[str, Any]) -> None:
+        if self._device_id:
+            payload.setdefault("device_id", self._device_id)
+        if self._session_id:
+            payload.setdefault("session_id", self._session_id)
+        await self.emit_chunk(payload)
 
 
 class RobotRuntime:
@@ -690,6 +747,12 @@ class RobotRuntime:
                 "device_id": "ESP32_KORVO_2",
                 "text": text,
             }
+        )
+        await _send_esp32_status(
+            self.connection_manager,
+            status="idle",
+            device_id="ESP32_KORVO_2",
+            text=text,
         )
 
     def _trace(self, event: str, **payload: Any) -> None:
@@ -1959,6 +2022,12 @@ class RobotRuntime:
             content = str(payload.get("content") or "").strip()
             if not content:
                 return
+            await _send_esp32_status(
+                self.connection_manager,
+                status="thinking",
+                device_id=device_id,
+                text="收到文本，正在思考。",
+            )
             request = TextRequest(source="ESP32", text=content, device_id=device_id, extra=payload)
             self._trace("chat.incoming", source=request.source, device_id=device_id, text=content)
             self._track_task(self._run_text_conversation(request), task_type="chat.turn", source=request.source, metadata={"device_id": device_id})
@@ -1990,6 +2059,12 @@ class RobotRuntime:
         session_id = str(payload.get("session_id") or "").strip()
         if not session_id:
             self._trace("audio.capture.error", source="ESP32", device_id=device_id, error="missing session_id")
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                text="录音上传缺少会话编号。",
+            )
             return
         pcm_path = self.audio_capture_dir / f"{session_id}.pcm"
         pcm_path.write_bytes(b"")
@@ -2012,6 +2087,13 @@ class RobotRuntime:
             sample_bits=stream.sample_bits,
             channels=stream.channels,
             encoding=stream.encoding,
+        )
+        await _send_esp32_status(
+            self.connection_manager,
+            status="uploading",
+            device_id=device_id,
+            session_id=session_id,
+            text="正在上传录音。",
         )
 
     async def _handle_esp32_audio_stream_chunk(self, payload: dict[str, Any], *, device_id: str) -> None:
@@ -2046,6 +2128,13 @@ class RobotRuntime:
         stream = self._pending_audio_streams.pop(session_id, None)
         if stream is None:
             self._trace("audio.capture.error", source="ESP32", device_id=device_id, session_id=session_id, error="audio end without start")
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text="录音结束事件没有匹配的开始事件。",
+            )
             return
         wav_path = self.audio_capture_dir / f"{session_id}.wav"
         try:
@@ -2088,6 +2177,13 @@ class RobotRuntime:
         except Exception as exc:
             logger.exception("ESP32 录音收尾失败")
             self._trace("audio.capture.error", source="ESP32", device_id=device_id, session_id=session_id, error=str(exc))
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text=f"录音收尾失败: {exc}",
+            )
 
     async def _run_esp32_audio_pipeline(
         self,
@@ -2105,6 +2201,13 @@ class RobotRuntime:
                 session_id=session_id,
                 error="ASR model not configured",
             )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text="ASR 模型没有配置。",
+            )
             return
         try:
             wav_bytes = wav_path.read_bytes()
@@ -2116,6 +2219,13 @@ class RobotRuntime:
                 device_id=device_id,
                 session_id=session_id,
                 error=f"read wav failed: {exc}",
+            )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text=f"读取录音失败: {exc}",
             )
             return
         if int(audio_stats.get("nonzero_samples") or 0) == 0 or int(audio_stats.get("peak") or 0) == 0:
@@ -2139,6 +2249,13 @@ class RobotRuntime:
                     "error": "这段录音几乎是静音，服务端收到的 PCM 全是空白。请检查麦克风/I2S 接线、采样通道和增益。",
                 }
             )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text="这段录音几乎是静音。",
+            )
             return
 
         self._trace(
@@ -2150,13 +2267,12 @@ class RobotRuntime:
             duration_ms=duration_ms,
             model=self.asr_model.model_name,
         )
-        await self.connection_manager.send_to_esp32(
-            {
-                "type": "assistant_status",
-                "device_id": device_id,
-                "stage": "asr_started",
-                "text": "我先听听你刚刚说了什么。",
-            }
+        await _send_esp32_status(
+            self.connection_manager,
+            status="asr",
+            device_id=device_id,
+            session_id=session_id,
+            text="正在识别语音。",
         )
         try:
             result = await self.asr_model.transcribe_wav(
@@ -2190,6 +2306,13 @@ class RobotRuntime:
                     "error": f"语音识别失败: {exc}",
                 }
             )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text=f"语音识别失败: {exc}",
+            )
             return
 
         if not transcript:
@@ -2200,14 +2323,20 @@ class RobotRuntime:
                     "error": "刚刚这段语音我没听清，你再说一次试试。",
                 }
             )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text="刚刚这段语音没有识别出文本。",
+            )
             return
-        await self.connection_manager.send_to_esp32(
-            {
-                "type": "assistant_status",
-                "device_id": device_id,
-                "stage": "asr_done",
-                "text": f"我听到的是：{transcript}",
-            }
+        await _send_esp32_status(
+            self.connection_manager,
+            status="thinking",
+            device_id=device_id,
+            session_id=session_id,
+            text=transcript,
         )
 
         request = TextRequest(
@@ -2670,10 +2799,16 @@ class RobotRuntime:
         offline_gap_candidate: OfflineGapAnalysisCandidate | None = None,
     ) -> None:
         esp32_ready = bool(getattr(self.connection_manager, "is_esp32_connected", True))
-        use_final_esp32_tts = bool(self.tts_model and esp32_ready and request.source == "ESP32")
+        audio_session_id = str(request.extra.get("audio_session_id") or "")
         tts_dispatcher = (
-            StreamingTTSDispatcher(self.tts_model, self.connection_manager.send_to_esp32)
-            if self.tts_model and esp32_ready and not use_final_esp32_tts
+            StreamingTTSDispatcher(
+                self.tts_model,
+                self.connection_manager.send_to_esp32,
+                device_id=request.device_id if request.source == "ESP32" else "",
+                session_id=audio_session_id if request.source == "ESP32" else "",
+                segment_stream_end=request.source == "ESP32",
+            )
+            if self.tts_model and esp32_ready
             else None
         )
         reply_chunks: list[str] = []
@@ -2684,6 +2819,15 @@ class RobotRuntime:
                 "以下内容是内部视觉线索，只能作为回答依据，请重新组织成自然口语，不要逐字复述。\n"
                 f"场景摘要: {vision_analysis.scene_summary}\n"
                 f"建议方向: {vision_analysis.suggested_reply}"
+            )
+
+        if request.source == "ESP32":
+            await _send_esp32_status(
+                self.connection_manager,
+                status="thinking",
+                device_id=request.device_id,
+                session_id=audio_session_id,
+                text=request_text,
             )
 
         async for chunk in self.language_model.stream_reply(
@@ -2742,9 +2886,13 @@ class RobotRuntime:
         )
         if tts_dispatcher is not None:
             await tts_dispatcher.finish()
-        if use_final_esp32_tts and self.tts_model is not None:
+        if (
+            request.source == "ESP32"
+            and self.tts_model is not None
+            and esp32_ready
+            and (tts_dispatcher is None or tts_dispatcher.sent_audio_segments == 0)
+        ):
             await _send_single_tts_segment(self.tts_model, self.connection_manager.send_to_esp32, final_reply)
-
         self.conversation_store.append_turn(
             session_id=session_id,
             source=request.source,
@@ -2779,6 +2927,13 @@ class RobotRuntime:
                     "text": final_reply,
                     "tool_context": tool_context,
                 }
+            )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="idle",
+                device_id=request.device_id,
+                session_id=audio_session_id,
+                text=final_reply,
             )
 
     async def _execute_tool_plan(
@@ -3037,6 +3192,13 @@ class RobotRuntime:
             if request.source == "NapCatQQ":
                 await self._send_qq_reply(request, f"本轮处理失败: {exc}")
             else:
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status="error",
+                    device_id=request.device_id,
+                    session_id=str(request.extra.get("audio_session_id") or ""),
+                    text=f"本轮处理失败: {exc}",
+                )
                 await self.connection_manager.send_to_esp32(
                     {
                         "type": "assistant_error",
@@ -3053,6 +3215,12 @@ class RobotRuntime:
             await self._send_qq_reply(request, text)
         else:
             esp32_ready = bool(getattr(self.connection_manager, "is_esp32_connected", True))
+            await _send_esp32_status(
+                self.connection_manager,
+                status="thinking",
+                device_id=request.device_id,
+                text=text,
+            )
             if self.tts_model and esp32_ready:
                 await _send_single_tts_segment(self.tts_model, self.connection_manager.send_to_esp32, text)
             await self.connection_manager.send_to_esp32(
@@ -3061,6 +3229,12 @@ class RobotRuntime:
                     "device_id": request.device_id,
                     "text": text,
                 }
+            )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="idle",
+                device_id=request.device_id,
+                text=text,
             )
 
     async def _send_qq_reply(self, request: TextRequest, text: str) -> None:

@@ -25,6 +25,7 @@ extern const uint8_t xiaole_pcm_end[] asm("_binary_xiaole_16k_stereo_pcm_end");
 #define PLAYER_CHUNK_BYTES 2048
 #define PLAYER_INITIAL_VOLUME 45
 #define PLAYER_SOFT_LIMIT 26000
+#define PLAYER_PREROLL_MS 100
 
 typedef struct {
     uint16_t audio_format;
@@ -219,6 +220,12 @@ static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const ch
     return ESP_OK;
 }
 
+static esp_err_t audio_player_write_preroll(const char *tag)
+{
+    static const uint8_t silence[(PLAYER_SAMPLE_RATE * PLAYER_BITS / 8 * PLAYER_CHANNELS * PLAYER_PREROLL_MS) / 1000] = {0};
+    return audio_player_write_pcm(silence, sizeof(silence), tag ? tag : "preroll");
+}
+
 void audio_player_set_volume(int volume)
 {
     s_volume = clamp_volume(volume);
@@ -305,10 +312,32 @@ esp_err_t audio_player_play_xiaole(void)
 {
     const uint8_t *pcm = xiaole_pcm_start;
     size_t bytes_total = xiaole_pcm_end - xiaole_pcm_start;
+    size_t stereo_frames = bytes_total / (sizeof(int16_t) * 2);
+    size_t mono_bytes = stereo_frames * sizeof(int16_t);
+    int16_t *mono = calloc(stereo_frames, sizeof(int16_t));
+    if (!mono) {
+        return ESP_ERR_NO_MEM;
+    }
 
-    ESP_LOGI(TAG, "play xiaole pcm bytes=%u frames=%u volume=%d", (unsigned)bytes_total, (unsigned)(bytes_total / 4), s_volume);
+    const int16_t *stereo = (const int16_t *)pcm;
+    for (size_t i = 0; i < stereo_frames; ++i) {
+        int left = stereo[i * 2];
+        int right = stereo[i * 2 + 1];
+        mono[i] = soft_limit16((left + right) / 2);
+    }
 
-    esp_err_t ret = audio_player_write_pcm(pcm, bytes_total, "xiaole");
+    ESP_LOGI(TAG,
+             "play xiaole stereo pcm bytes=%u frames=%u -> 16k mono bytes=%u volume=%d",
+             (unsigned)bytes_total,
+             (unsigned)stereo_frames,
+             (unsigned)mono_bytes,
+             s_volume);
+
+    esp_err_t ret = audio_player_write_preroll("xiaole_preroll");
+    if (ret == ESP_OK) {
+        ret = audio_player_write_pcm((const uint8_t *)mono, mono_bytes, "xiaole");
+    }
+    free(mono);
     vTaskDelay(pdMS_TO_TICKS(180));
     ESP_LOGI(TAG, "play done");
     return ret;
@@ -346,7 +375,10 @@ esp_err_t audio_player_play_wav(const uint8_t *wav, size_t wav_len, const char *
              (unsigned)pcm_len,
              (unsigned)out_bytes);
 
-    esp_err_t ret = audio_player_write_pcm((const uint8_t *)mono16, out_bytes, tag ? tag : "wav");
+    esp_err_t ret = audio_player_write_preroll("tts_preroll");
+    if (ret == ESP_OK) {
+        ret = audio_player_write_pcm((const uint8_t *)mono16, out_bytes, tag ? tag : "wav");
+    }
     free(mono16);
     vTaskDelay(pdMS_TO_TICKS(180));
     return ret;

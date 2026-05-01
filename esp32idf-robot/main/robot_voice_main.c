@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "mcp_client.h"
 #include "mic_diag.h"
+#include "sdkconfig.h"
 
 #define VOICE_LOOP_GAP_MS 500
 #define CAPTURE_CHUNK_BYTES 4096
@@ -66,9 +67,64 @@ static void send_cmd(voice_cmd_type_t type, int value)
     }
 }
 
+static void send_cmd_nonblocking(voice_cmd_type_t type, int value)
+{
+    if (!s_cmd_queue) {
+        return;
+    }
+    voice_cmd_t cmd = {
+        .type = type,
+        .value = value,
+    };
+    if (xQueueSend(s_cmd_queue, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "command queue full, dropped ui type=%d", type);
+    }
+}
+
 static void send_cmd_from_isr_safe(voice_cmd_type_t type, int value)
 {
     send_cmd(type, value);
+}
+
+static void on_ui_action(app_ui_action_t action, void *ctx)
+{
+    (void)ctx;
+    switch (action) {
+        case APP_UI_ACTION_TALK_PRESS:
+            send_cmd_nonblocking(VOICE_CMD_SET_PRESS, 0);
+            break;
+        case APP_UI_ACTION_TALK_RELEASE:
+            send_cmd_nonblocking(VOICE_CMD_SET_RELEASE, 0);
+            break;
+        case APP_UI_ACTION_MCP_CONNECT:
+            send_cmd_nonblocking(VOICE_CMD_MCP_CONNECT, 0);
+            break;
+        case APP_UI_ACTION_MCP_DISCONNECT:
+            send_cmd_nonblocking(VOICE_CMD_MCP_DISCONNECT, 0);
+            break;
+        case APP_UI_ACTION_MCP_RECONNECT:
+            send_cmd_nonblocking(VOICE_CMD_MCP_DISCONNECT, 0);
+            send_cmd_nonblocking(VOICE_CMD_MCP_CONNECT, 0);
+            break;
+        case APP_UI_ACTION_VOL_UP:
+            send_cmd_nonblocking(VOICE_CMD_VOL_UP, 0);
+            break;
+        case APP_UI_ACTION_VOL_DOWN:
+            send_cmd_nonblocking(VOICE_CMD_VOL_DOWN, 0);
+            break;
+        case APP_UI_ACTION_PLAY_TEST:
+            send_cmd_nonblocking(VOICE_CMD_PLAY_ONCE, 0);
+            break;
+        case APP_UI_ACTION_BLUETOOTH_TOGGLE:
+#if CONFIG_BT_ENABLED
+            app_ui_set_bluetooth_enabled(true);
+            app_ui_set_voice_state("BT TODO");
+#else
+            app_ui_set_bluetooth_enabled(false);
+            app_ui_set_voice_state("BT DISABLED");
+#endif
+            break;
+    }
 }
 
 static void on_mic_level(int peak, int avg_abs)
@@ -117,7 +173,7 @@ static void start_set_capture(void)
     if (!mcp_client_is_connected()) {
         ESP_LOGW(TAG, "SET ignored: MCP not connected");
         app_ui_set_mcp_status(mcp_client_get_status_text());
-        app_ui_set_voice_state("MCP OFFLINE");
+        app_ui_set_assistant_state(APP_UI_STATE_OFFLINE);
         return;
     }
     if (mic_diag_is_capturing()) {
@@ -146,7 +202,7 @@ static void start_set_capture(void)
         return;
     }
 
-    app_ui_set_voice_state("LISTENING");
+    app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
     app_ui_set_mic_state("REC SET");
 }
 
@@ -159,7 +215,7 @@ static void stop_set_capture(void)
     uint32_t duration_ms = mic_diag_capture_stop();
     flush_capture_chunk();
     mcp_client_audio_stream_end(s_capture_session_id, duration_ms, "set_release");
-    app_ui_set_voice_state("MCP THINK");
+    app_ui_set_assistant_state(APP_UI_STATE_UPLOADING);
     app_ui_set_mic_state("MIC READY");
 }
 
@@ -183,10 +239,10 @@ static void on_button_event(app_button_event_t event, void *ctx)
             send_cmd_from_isr_safe(VOICE_CMD_PLAY_ONCE, 0);
             break;
         case APP_BUTTON_MODE:
-            send_cmd_from_isr_safe(VOICE_CMD_MCP_CONNECT, 0);
+            app_ui_prev_page();
             break;
         case APP_BUTTON_REC:
-            send_cmd_from_isr_safe(VOICE_CMD_MIC_ON, 0);
+            app_ui_next_page();
             break;
     }
 }
@@ -209,9 +265,9 @@ static void playback_task(void *arg)
 
         switch (cmd.type) {
             case VOICE_CMD_PLAY_ONCE:
-                app_ui_set_voice_state("PLAYING");
+                app_ui_set_assistant_state(APP_UI_STATE_PLAYING);
                 audio_player_play_xiaole();
-                app_ui_set_voice_state(loop_enabled ? "VOICE LOOP" : "VOICE READY");
+                app_ui_set_assistant_state(APP_UI_STATE_IDLE);
                 if (loop_enabled) {
                     vTaskDelay(pdMS_TO_TICKS(VOICE_LOOP_GAP_MS));
                 }
@@ -328,7 +384,8 @@ static void command_task(void *arg)
                 app_ui_set_mcp_status(mcp_client_get_status_text());
             } else {
                 ESP_LOGI(TAG, "ASK debug text: %s", text);
-                app_ui_set_voice_state("MCP THINK");
+                app_ui_set_recent_text(text);
+                app_ui_set_assistant_state(APP_UI_STATE_THINKING);
                 mcp_client_send_text_request(text);
             }
         } else if (strncmp(line, "REC ", 4) == 0) {
@@ -371,8 +428,15 @@ void app_main(void)
     if (app_ui_init() != ESP_OK) {
         ESP_LOGW(TAG, "ui init failed; continue without lcd");
     }
+    app_ui_set_action_callback(on_ui_action, NULL);
     app_ui_set_volume(audio_player_get_volume());
     app_ui_set_voice_state("VOICE READY");
+#if CONFIG_BT_ENABLED
+    app_ui_set_bluetooth_available(true);
+    app_ui_set_bluetooth_enabled(false);
+#else
+    app_ui_set_bluetooth_available(false);
+#endif
 
     if (mic_diag_init(on_mic_level) != ESP_OK) {
         ESP_LOGW(TAG, "mic diag init failed; MIC commands unavailable");

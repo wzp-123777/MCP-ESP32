@@ -1371,7 +1371,7 @@ class TTSModelService:
         messages = self._mimo_tts_messages(text)
         extra_kwargs = {
             "modalities": ["audio"],
-            "audio": {"voice": self.voice, "format": "wav"},
+            "audio": self._mimo_audio_options("wav"),
         }
         response = await self._client._create_chat_completion(
             messages=messages,
@@ -1395,14 +1395,14 @@ class TTSModelService:
             "transcript": _safe_get(audio_obj, "transcript", ""),
             "audio_id": _safe_get(audio_obj, "id", ""),
             "format": _safe_get(audio_obj, "format", "wav") or "wav",
-            "voice": self.voice,
+            "voice": self._effective_voice_label(),
         }
 
     async def _complete_mimo_audio_stream(self, text: str) -> dict[str, Any] | None:
         messages = self._mimo_tts_messages(text)
         extra_kwargs = {
             "modalities": ["audio"],
-            "audio": {"voice": self.voice, "format": "wav"},
+            "audio": self._mimo_audio_options("wav"),
         }
         stream = await self._client._create_chat_completion(
             messages=messages,
@@ -1414,7 +1414,7 @@ class TTSModelService:
         meta_by_id: dict[str, dict[str, Any]] = {}
         id_order: list[str] = []
         ordered_audio: list[bytes] = []
-        last_audio_meta: dict[str, Any] = {"transcript": "", "audio_id": "", "format": "wav", "voice": self.voice}
+        last_audio_meta: dict[str, Any] = {"transcript": "", "audio_id": "", "format": "wav", "voice": self._effective_voice_label()}
         async for chunk in stream:
             choices = _safe_get(chunk, "choices", []) or []
             if not choices:
@@ -1434,7 +1434,7 @@ class TTSModelService:
                 "transcript": _safe_get(audio_delta, "transcript", ""),
                 "audio_id": audio_id,
                 "format": _safe_get(audio_delta, "format", "wav") or "wav",
-                "voice": self.voice,
+                "voice": self._effective_voice_label(),
             }
             if audio_id:
                 if audio_id not in chunks_by_id:
@@ -1509,6 +1509,20 @@ class TTSModelService:
     def _is_mimo_tts_model(self) -> bool:
         return "mimo" in (self.model_name or "").lower() and "tts" in (self.model_name or "").lower()
 
+    def _is_mimo_voice_design_model(self) -> bool:
+        return "voicedesign" in (self.model_name or "").lower()
+
+    def _mimo_audio_options(self, audio_format: str) -> dict[str, str]:
+        audio = {"format": audio_format}
+        if not self._is_mimo_voice_design_model() and self.voice:
+            audio["voice"] = self.voice
+        return audio
+
+    def _effective_voice_label(self) -> str:
+        if self._is_mimo_voice_design_model():
+            return "voicedesign"
+        return self.voice
+
     def _tts_system_prompt(self) -> str:
         base = (
             "你是语音合成模型。请严格朗读待合成的中文纯文本，不要补充、不改写；"
@@ -1519,7 +1533,18 @@ class TTSModelService:
         return f"{base}\n音色与朗读风格要求：{self.style_prompt}"
 
     def _mimo_tts_messages(self, text: str) -> list[dict[str, str]]:
-        return [{"role": "assistant", "content": text}]
+        messages: list[dict[str, str]] = []
+        if self.style_prompt:
+            messages.append({"role": "user", "content": self.style_prompt})
+        elif self._is_mimo_voice_design_model():
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Warm, clear, natural conversational voice with moderate speed and friendly tone.",
+                }
+            )
+        messages.append({"role": "assistant", "content": text})
+        return messages
 
 
 class ASRModelService:
