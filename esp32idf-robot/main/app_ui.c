@@ -67,11 +67,14 @@
 
 #if LV_FONT_SIMSUN_16_CJK
 LV_FONT_DECLARE(lv_font_simsun_16_cjk);
+#define UI_FONT_CJK (&lv_font_simsun_16_cjk)
 #define UI_FONT_RECENT (&lv_font_simsun_16_cjk)
+#define UI_FONT_TEXT (&lv_font_simsun_16_cjk)
 #else
+#define UI_FONT_CJK (&lv_font_montserrat_14)
 #define UI_FONT_RECENT (&lv_font_montserrat_14)
-#endif
 #define UI_FONT_TEXT (&lv_font_montserrat_14)
+#endif
 
 static const char *TAG = "APP_UI";
 static esp_periph_set_handle_t s_periph_set;
@@ -163,24 +166,24 @@ static const char *state_text(app_ui_assistant_state_t state)
 {
     switch (state) {
         case APP_UI_STATE_RECORDING:
-            return "RECORDING";
+            return "录音中";
         case APP_UI_STATE_UPLOADING:
-            return "UPLOAD";
+            return "上传中";
         case APP_UI_STATE_ASR:
-            return "ASR";
+            return "识别中";
         case APP_UI_STATE_THINKING:
-            return "THINKING";
+            return "思考中";
         case APP_UI_STATE_TTS:
-            return "TTS";
+            return "合成中";
         case APP_UI_STATE_PLAYING:
-            return "PLAYING";
+            return "播放中";
         case APP_UI_STATE_ERROR:
-            return "ERROR";
+            return "错误";
         case APP_UI_STATE_OFFLINE:
-            return "OFFLINE";
+            return "离线";
         case APP_UI_STATE_IDLE:
         default:
-            return "IDLE";
+            return "待机";
     }
 }
 
@@ -188,24 +191,24 @@ static const char *state_caption(app_ui_assistant_state_t state)
 {
     switch (state) {
         case APP_UI_STATE_RECORDING:
-            return "Hold SET, release to send";
+            return "按住 SET，松开发送";
         case APP_UI_STATE_UPLOADING:
-            return "Uploading audio to MCP";
+            return "正在上传音频";
         case APP_UI_STATE_ASR:
-            return "Speech recognition";
+            return "正在语音识别";
         case APP_UI_STATE_THINKING:
-            return "LLM is thinking";
+            return "大模型思考中";
         case APP_UI_STATE_TTS:
-            return "Synthesizing voice";
+            return "正在合成语音";
         case APP_UI_STATE_PLAYING:
-            return "Playing 16k mono";
+            return "播放 16k 单声道";
         case APP_UI_STATE_ERROR:
-            return "Error, check DEBUG";
+            return "出错，查看调试页";
         case APP_UI_STATE_OFFLINE:
-            return "Network or MCP offline";
+            return "网络或 MCP 离线";
         case APP_UI_STATE_IDLE:
         default:
-            return "Idle, hold SET to talk";
+            return "待机，按住说话";
     }
 }
 
@@ -213,16 +216,16 @@ static const char *page_title(uint8_t page)
 {
     switch (page) {
         case 1:
-            return "CHAT";
+            return "对话";
         case 2:
-            return "NET";
+            return "网络";
         case 3:
-            return "SETTINGS";
+            return "设置";
         case 4:
-            return "DEBUG";
+            return "调试";
         case 0:
         default:
-            return "HOME";
+            return "首页";
     }
 }
 
@@ -230,25 +233,112 @@ static const char *home_state_hint(app_ui_assistant_state_t state)
 {
     switch (state) {
         case APP_UI_STATE_RECORDING:
-            return "Recording from SET or touch";
+            return "正在录音";
         case APP_UI_STATE_UPLOADING:
-            return "Sending audio to MCP";
+            return "发送音频到 MCP";
         case APP_UI_STATE_ASR:
-            return "Recognizing speech";
+            return "正在识别语音";
         case APP_UI_STATE_THINKING:
-            return "Waiting for model";
+            return "等待模型回复";
         case APP_UI_STATE_TTS:
-            return "Voice is being generated";
+            return "正在生成语音";
         case APP_UI_STATE_PLAYING:
-            return "Assistant is speaking";
+            return "助手正在说话";
         case APP_UI_STATE_ERROR:
-            return "Open DEBUG for details";
+            return "打开调试页查看";
         case APP_UI_STATE_OFFLINE:
-            return "Open NET to reconnect";
+            return "打开网络页重连";
         case APP_UI_STATE_IDLE:
         default:
-            return "Tap Chat to talk";
+            return "点击对话开始";
     }
+}
+
+static const char *mcp_status_zh(const char *status)
+{
+    if (!status || status[0] == '\0') {
+        return "未知";
+    }
+    if (strcmp(status, "MCP CONFIGURED") == 0) {
+        return "MCP 已配置";
+    }
+    if (strcmp(status, "WIFI CONNECT") == 0) {
+        return "Wi-Fi 连接中";
+    }
+    if (strcmp(status, "WIFI OK") == 0) {
+        return "Wi-Fi 正常";
+    }
+    if (strcmp(status, "WIFI RETRY") == 0) {
+        return "Wi-Fi 重试";
+    }
+    if (strcmp(status, "MCP CONNECTING") == 0) {
+        return "MCP 连接中";
+    }
+    if (strcmp(status, "MCP CONNECTED") == 0) {
+        return "MCP 已连接";
+    }
+    if (strcmp(status, "MCP DISCONNECTED") == 0) {
+        return "MCP 已断开";
+    }
+    if (strcmp(status, "MCP ERROR") == 0) {
+        return "MCP 错误";
+    }
+    if (strcmp(status, "MCP NOT CONFIGURED") == 0) {
+        return "MCP 未配置";
+    }
+    if (strcmp(status, "MCP SEND") == 0) {
+        return "MCP 发送中";
+    }
+    if (strcmp(status, "MCP SEND FAIL") == 0) {
+        return "MCP 发送失败";
+    }
+    return status;
+}
+
+static const char *voice_state_zh(const char *state)
+{
+    if (!state || state[0] == '\0') {
+        return "语音未知";
+    }
+    if (strcmp(state, "VOICE READY") == 0) {
+        return "语音就绪";
+    }
+    if (strcmp(state, "VOICE LOOP") == 0) {
+        return "循环播放";
+    }
+    if (strcmp(state, "VOICE STOP") == 0) {
+        return "播放停止";
+    }
+    if (strcmp(state, "BT DISABLED") == 0) {
+        return "蓝牙未启用";
+    }
+    if (strcmp(state, "BT TODO") == 0) {
+        return "蓝牙待接入";
+    }
+    return state;
+}
+
+static const char *mic_state_zh(const char *state)
+{
+    if (!state || state[0] == '\0') {
+        return "麦克风未知";
+    }
+    if (strcmp(state, "MIC READY") == 0) {
+        return "麦克风就绪";
+    }
+    if (strcmp(state, "MIC ON") == 0) {
+        return "麦克风开启";
+    }
+    if (strcmp(state, "MIC OFF") == 0) {
+        return "麦克风关闭";
+    }
+    if (strcmp(state, "MIC ERROR") == 0) {
+        return "麦克风错误";
+    }
+    if (strcmp(state, "REC SET") == 0) {
+        return "按键录音";
+    }
+    return state;
 }
 
 static lv_color_t state_color(app_ui_assistant_state_t state)
@@ -834,7 +924,7 @@ static lv_obj_t *make_app_button(lv_obj_t *parent, int x, int y, const char *ico
     button_style(btn, lv_color_hex(UI_PANEL_COLOR), lv_color_hex(UI_BORDER_COLOR));
     lv_obj_add_event_cb(btn, page_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)page);
 
-    lv_obj_t *icon_label = make_label(btn, &lv_font_montserrat_24, lv_color_hex(UI_ACCENT_COLOR));
+    lv_obj_t *icon_label = make_label(btn, UI_FONT_CJK, lv_color_hex(UI_ACCENT_COLOR));
     lv_label_set_text(icon_label, icon);
     lv_obj_set_width(icon_label, 54);
     lv_obj_set_style_text_align(icon_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -970,8 +1060,8 @@ static void create_top_bar(lv_obj_t *screen)
     lv_obj_align(s_mcp_label, LV_ALIGN_LEFT_MID, 22, 0);
 
     lv_obj_t *vol_pill = make_pill(screen, UI_W - 82, 8, 74);
-    s_volume_label = make_label(vol_pill, &lv_font_montserrat_14, lv_color_hex(UI_TEXT_COLOR));
-    lv_obj_set_width(s_volume_label, 56);
+    s_volume_label = make_label(vol_pill, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_width(s_volume_label, 64);
     lv_obj_center(s_volume_label);
 
     s_page_label = make_label(screen, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
@@ -990,17 +1080,17 @@ static void create_home_page(lv_obj_t *page)
     lv_obj_set_size(s_home_status_label, UI_W - 154, 40);
     lv_obj_set_pos(s_home_status_label, 142, 52);
 
-    make_app_button(page, 18, 108, "C", "Chat", 1);
-    make_app_button(page, 94, 108, "N", "Net", 2);
-    make_app_button(page, 170, 108, "S", "Set", 3);
-    make_app_button(page, 246, 108, "D", "Debug", 4);
+    make_app_button(page, 18, 108, "聊", "对话", 1);
+    make_app_button(page, 94, 108, "网", "网络", 2);
+    make_app_button(page, 170, 108, "设", "设置", 3);
+    make_app_button(page, 246, 108, "调", "调试", 4);
 
     lv_obj_t *quick = make_text_button(page,
                                        18,
                                        188,
                                        UI_W - 36,
                                        38,
-                                       "Hold to Talk",
+                                       "按住说话",
                                        lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                        lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(quick, talk_button_event_cb, LV_EVENT_PRESSED, NULL);
@@ -1010,11 +1100,11 @@ static void create_home_page(lv_obj_t *page)
 
 static void create_chat_page(lv_obj_t *page)
 {
-    lv_obj_t *title = make_label(page, &lv_font_montserrat_24, lv_color_hex(UI_TEXT_COLOR));
-    lv_label_set_text(title, "CHAT");
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "对话");
     lv_obj_set_pos(title, 16, 44);
 
-    s_state_label = make_label(page, &lv_font_montserrat_32, lv_color_hex(UI_ACCENT_COLOR));
+    s_state_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_ACCENT_COLOR));
     lv_obj_set_width(s_state_label, UI_W - 64);
     lv_obj_set_pos(s_state_label, 32, 74);
     lv_obj_set_style_text_align(s_state_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -1059,7 +1149,7 @@ static void create_chat_page(lv_obj_t *page)
                                      194,
                                      78,
                                      32,
-                                     "Hold",
+                                     "按住",
                                      lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                      lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(s_talk_button, talk_button_event_cb, LV_EVENT_PRESSED, NULL);
@@ -1074,8 +1164,8 @@ static void create_chat_page(lv_obj_t *page)
 
 static void create_network_page(lv_obj_t *page)
 {
-    lv_obj_t *title = make_label(page, &lv_font_montserrat_24, lv_color_hex(UI_TEXT_COLOR));
-    lv_label_set_text(title, "NETWORK");
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "网络");
     lv_obj_set_pos(title, 16, 44);
 
     lv_obj_t *wifi_card = make_card(page, 18, 78, UI_W - 36, 38);
@@ -1093,16 +1183,16 @@ static void create_network_page(lv_obj_t *page)
     lv_obj_set_size(s_net_endpoint_label, UI_W - 54, 16);
     lv_obj_align(s_net_endpoint_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    lv_obj_t *connect_btn = make_text_button(page, 18, 204, 92, 32, "Connect", lv_color_hex(UI_ACCENT_SOFT_COLOR),
+    lv_obj_t *connect_btn = make_text_button(page, 18, 204, 92, 32, "连接", lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                              lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(connect_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_MCP_CONNECT);
 
-    lv_obj_t *reconnect_btn = make_text_button(page, 116, 204, 92, 32, "Reconnect", lv_color_hex(UI_PANEL_COLOR),
+    lv_obj_t *reconnect_btn = make_text_button(page, 116, 204, 92, 32, "重连", lv_color_hex(UI_PANEL_COLOR),
                                                lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(reconnect_btn, action_button_event_cb, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)APP_UI_ACTION_MCP_RECONNECT);
 
-    lv_obj_t *off_btn = make_text_button(page, 214, 204, 88, 32, "Offline", lv_color_hex(UI_PANEL_COLOR),
+    lv_obj_t *off_btn = make_text_button(page, 214, 204, 88, 32, "离线", lv_color_hex(UI_PANEL_COLOR),
                                          lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(off_btn, action_button_event_cb, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)APP_UI_ACTION_MCP_DISCONNECT);
@@ -1110,8 +1200,8 @@ static void create_network_page(lv_obj_t *page)
 
 static void create_settings_page(lv_obj_t *page)
 {
-    lv_obj_t *title = make_label(page, &lv_font_montserrat_24, lv_color_hex(UI_TEXT_COLOR));
-    lv_label_set_text(title, "SETTINGS");
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "设置");
     lv_obj_set_pos(title, 16, 44);
 
     lv_obj_t *time_card = make_card(page, 18, 78, UI_W - 36, 34);
@@ -1127,15 +1217,15 @@ static void create_settings_page(lv_obj_t *page)
                         (void *)(uintptr_t)APP_UI_ACTION_BLUETOOTH_TOGGLE);
     lv_obj_add_flag(bt_card, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t *minus_btn = make_text_button(page, 18, 164, 64, 34, "VOL-", lv_color_hex(UI_PANEL_COLOR),
+    lv_obj_t *minus_btn = make_text_button(page, 18, 164, 64, 34, "音量-", lv_color_hex(UI_PANEL_COLOR),
                                            lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(minus_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_VOL_DOWN);
 
-    lv_obj_t *plus_btn = make_text_button(page, 92, 164, 64, 34, "VOL+", lv_color_hex(UI_PANEL_COLOR),
+    lv_obj_t *plus_btn = make_text_button(page, 92, 164, 64, 34, "音量+", lv_color_hex(UI_PANEL_COLOR),
                                           lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(plus_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_VOL_UP);
 
-    lv_obj_t *test_btn = make_text_button(page, 166, 164, 136, 34, "Test Voice", lv_color_hex(UI_ACCENT_SOFT_COLOR),
+    lv_obj_t *test_btn = make_text_button(page, 166, 164, 136, 34, "测试声音", lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                           lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(test_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_PLAY_TEST);
 
@@ -1152,7 +1242,7 @@ static lv_obj_t *make_debug_row(lv_obj_t *page, int y, const char *name, lv_obj_
     lv_obj_set_size(name_label, 52, 16);
     lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    *value_label = make_label(row, &lv_font_montserrat_14, lv_color_hex(UI_TEXT_COLOR));
+    *value_label = make_label(row, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
     lv_obj_set_size(*value_label, UI_W - 124, 18);
     lv_obj_align(*value_label, LV_ALIGN_LEFT_MID, 60, 0);
 
@@ -1164,16 +1254,16 @@ static lv_obj_t *make_debug_row(lv_obj_t *page, int y, const char *name, lv_obj_
 
 static void create_debug_page(lv_obj_t *page)
 {
-    lv_obj_t *title = make_label(page, &lv_font_montserrat_24, lv_color_hex(UI_TEXT_COLOR));
-    lv_label_set_text(title, "DEBUG");
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "调试");
     lv_obj_set_pos(title, 16, 44);
 
-    make_debug_row(page, 76, "NET", &s_dbg_network_label, lv_color_hex(UI_OK_COLOR));
-    make_debug_row(page, 112, "AUDIO", &s_dbg_audio_label, lv_color_hex(UI_BLUE_COLOR));
-    make_debug_row(page, 148, "PHASE", &s_dbg_phase_label, lv_color_hex(UI_ACCENT_COLOR));
-    make_debug_row(page, 184, "ERR", &s_dbg_error_label, lv_color_hex(UI_OK_COLOR));
+    make_debug_row(page, 76, "网络", &s_dbg_network_label, lv_color_hex(UI_OK_COLOR));
+    make_debug_row(page, 112, "音频", &s_dbg_audio_label, lv_color_hex(UI_BLUE_COLOR));
+    make_debug_row(page, 148, "阶段", &s_dbg_phase_label, lv_color_hex(UI_ACCENT_COLOR));
+    make_debug_row(page, 184, "错误", &s_dbg_error_label, lv_color_hex(UI_OK_COLOR));
 
-    s_dbg_mic_label = make_label(page, &lv_font_montserrat_14, lv_color_hex(UI_MUTED_COLOR));
+    s_dbg_mic_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
     lv_obj_set_size(s_dbg_mic_label, UI_W - 130, 18);
     lv_obj_set_pos(s_dbg_mic_label, 20, 224);
 
@@ -1234,15 +1324,15 @@ static void apply_ui_locked(void)
     lv_label_set_text(s_mcp_label, "MCP");
     lv_obj_set_style_bg_color(s_wifi_dot, s_wifi_connected ? lv_color_hex(UI_OK_COLOR) : lv_color_hex(0xC5AABC), 0);
     lv_obj_set_style_bg_color(s_mcp_dot, s_mcp_connected ? lv_color_hex(UI_OK_COLOR) : lv_color_hex(0xC5AABC), 0);
-    lv_label_set_text_fmt(s_volume_label, "VOL %02d", s_volume);
+    lv_label_set_text_fmt(s_volume_label, "音量%02d", s_volume);
 
     if (s_page == 0 || s_clock_dirty) {
         lv_label_set_text(s_home_time_label, clock_text);
     }
     lv_label_set_text_fmt(s_home_status_label, "%s\n%s / %s",
                           home_state_hint(s_assistant_state),
-                          s_wifi_connected ? "Wi-Fi OK" : "Wi-Fi OFF",
-                          s_mcp_connected ? "MCP OK" : "MCP OFF");
+                          s_wifi_connected ? "Wi-Fi 正常" : "Wi-Fi 断开",
+                          s_mcp_connected ? "MCP 正常" : "MCP 断开");
 
     lv_label_set_text(s_state_label, state_text(s_assistant_state));
     lv_obj_set_style_text_color(s_state_label, state_color(s_assistant_state), 0);
@@ -1254,35 +1344,35 @@ static void apply_ui_locked(void)
     }
     lv_obj_set_width(s_status_line, progress_width);
 
-    const char *recent = s_recent_text[0] ? s_recent_text : "No recent text";
-    lv_label_set_text_fmt(s_chat_in_label, "USER: %s", recent);
-    lv_label_set_text_fmt(s_chat_out_label, "BOT: %s", s_voice_state);
-    lv_label_set_text_fmt(s_chat_system_label, "STATE: %s", state_caption(s_assistant_state));
+    const char *recent = s_recent_text[0] ? s_recent_text : "暂无文字";
+    lv_label_set_text_fmt(s_chat_in_label, "我：%s", recent);
+    lv_label_set_text_fmt(s_chat_out_label, "答：%s", voice_state_zh(s_voice_state));
+    lv_label_set_text_fmt(s_chat_system_label, "状态：%s", state_caption(s_assistant_state));
     lv_label_set_text(s_talk_button_label,
-                      s_assistant_state == APP_UI_STATE_RECORDING ? "Send" : "Hold");
+                      s_assistant_state == APP_UI_STATE_RECORDING ? "发送" : "按住");
     lv_obj_set_style_bg_color(s_talk_button,
                               s_assistant_state == APP_UI_STATE_RECORDING ? lv_color_hex(UI_OK_COLOR)
                                                                           : lv_color_hex(UI_ACCENT_SOFT_COLOR),
                               0);
 
-    lv_label_set_text_fmt(s_net_wifi_label, "Wi-Fi: %s", s_wifi_connected ? "connected" : "connecting/offline");
-    lv_label_set_text_fmt(s_net_mcp_label, "MCP: %s", s_mcp_status);
-    lv_label_set_text_fmt(s_net_endpoint_label, "Endpoint: configured in app_config.h");
+    lv_label_set_text_fmt(s_net_wifi_label, "Wi-Fi：%s", s_wifi_connected ? "已连接" : "连接中或离线");
+    lv_label_set_text_fmt(s_net_mcp_label, "MCP：%s", mcp_status_zh(s_mcp_status));
+    lv_label_set_text(s_net_endpoint_label, "地址：app_config.h 配置");
 
     if (s_page == 3 || s_clock_dirty) {
-        lv_label_set_text_fmt(s_set_time_label, "Time: %s", clock_text);
+        lv_label_set_text_fmt(s_set_time_label, "时间：%s", clock_text);
     }
-    lv_label_set_text_fmt(s_set_bt_label, "Bluetooth: %s",
-                          s_bt_available ? (s_bt_enabled ? "on" : "off") : "firmware disabled");
-    lv_label_set_text_fmt(s_set_status_label, "Audio: 16k / 16bit / mono. Volume %02d. Touch buttons use command queue.",
+    lv_label_set_text_fmt(s_set_bt_label, "蓝牙：%s",
+                          s_bt_available ? (s_bt_enabled ? "开启" : "关闭") : "固件未启用");
+    lv_label_set_text_fmt(s_set_status_label, "音频：16k / 16bit / 单声道  音量%02d",
                           s_volume);
 
-    lv_label_set_text_fmt(s_dbg_network_label, "%s / %s", s_wifi_connected ? "Wi-Fi OK" : "Wi-Fi OFF",
-                          s_mcp_connected ? "MCP OK" : "MCP OFF");
-    lv_label_set_text_fmt(s_dbg_audio_label, "16k / 16bit / mono / VOL %02d", s_volume);
-    lv_label_set_text_fmt(s_dbg_phase_label, "%s > ASR > THINK > TTS > PLAY", state_text(s_assistant_state));
-    lv_label_set_text(s_dbg_error_label, s_assistant_state == APP_UI_STATE_ERROR ? s_mcp_status : "NONE");
-    lv_label_set_text_fmt(s_dbg_mic_label, "%s  PEAK %05d AVG %04d", s_mic_state, s_mic_peak, s_mic_avg);
+    lv_label_set_text_fmt(s_dbg_network_label, "%s / %s", s_wifi_connected ? "Wi-Fi 正常" : "Wi-Fi 断开",
+                          s_mcp_connected ? "MCP 正常" : "MCP 断开");
+    lv_label_set_text_fmt(s_dbg_audio_label, "16k / 16bit / 单声道 / 音量%02d", s_volume);
+    lv_label_set_text_fmt(s_dbg_phase_label, "当前：%s", state_text(s_assistant_state));
+    lv_label_set_text(s_dbg_error_label, s_assistant_state == APP_UI_STATE_ERROR ? mcp_status_zh(s_mcp_status) : "无");
+    lv_label_set_text_fmt(s_dbg_mic_label, "%s  峰值%05d 均值%04d", mic_state_zh(s_mic_state), s_mic_peak, s_mic_avg);
     lv_bar_set_value(s_mic_bar, s_mic_peak, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(
         s_mic_bar,
