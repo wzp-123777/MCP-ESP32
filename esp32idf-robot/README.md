@@ -4,11 +4,23 @@ ESP-IDF + ESP-ADF 语音机器人工程，目标硬件为 ESP32-S3-Korvo-2 V3。
 
 当前默认不再循环播放“小乐”。启动后会自动连接 Wi-Fi 和 MCP WebSocket，按住 `SET` 录音，松开发送到 MCP，服务端 TTS WAV 下行后通过 ES8311 播放。
 
-默认配置在 `main/app_config.h` 中使用占位符。请在本地工作副本里改成自己的 Wi-Fi 和 MCP 地址，不要提交真实配置：
+默认配置在 `main/app_config.h` 中设置。发布仓库使用占位符，本地工作副本可以填自己的 Wi-Fi 和 MCP 地址：
 
 - Wi-Fi：`YOUR_WIFI_SSID`
 - MCP：`ws://YOUR_MCP_SERVER_IP:8080/esp32_ws`
 - 设备：`ESP32_KORVO_2`
+
+## 连续聊天和全双工
+
+当前连续聊天仍走 `mic_diag` 的 16 kHz / 16-bit / mono PCM 采集，并使用轻量 VAD 断句。已经加入动态噪声底和连续静音判断，避免单个峰值或播放回声让“说完了”一直不结束。
+
+ESP32-S3-Korvo-2 硬件支持全双工 AEC，但不能只改阈值实现。官方路线是切到 ESP-SR AFE：
+
+- AEC 示例：`$ADF_PATH/examples/advanced_examples/aec/main/aec_examples.c`
+- WakeNet/VAD 示例：`$ADF_PATH/examples/speech_recognition/wwe/main/main.c`
+- 实时通信示例：`$ADF_PATH/examples/ai_agent/volc_rtc/components/audio_processor/`
+
+主工程里 `main/afe_full_duplex_plan.h` 记录了迁移入口，默认 `ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL=0`。真正启用前需要先增加 `model` 分区、选择 ESP-SR/WakeNet 模型，并把采集入口从 mono PCM 替换成带 ES7210 reference channel 的 AFE feed/fetch。
 
 ## 构建和烧录
 

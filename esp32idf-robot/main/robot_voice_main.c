@@ -11,6 +11,7 @@
 #include "app_buttons.h"
 #include "app_ui.h"
 #include "audio_player.h"
+#include "afe_full_duplex_plan.h"
 #include "esp_log.h"
 #include "mcp_client.h"
 #include "mic_diag.h"
@@ -873,6 +874,9 @@ void app_main(void)
         ESP_LOGW(TAG, "mic diag init failed; MIC commands unavailable");
     }
     app_ui_set_mic_state("MIC READY");
+    ESP_LOGI(TAG,
+             "full duplex AFE/AEC experimental path=%d; current capture path is mono PCM",
+             ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL);
 
     mcp_client_init();
     app_ui_set_mcp_status(mcp_client_get_status_text());
