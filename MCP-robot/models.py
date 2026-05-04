@@ -53,10 +53,28 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         candidates.append(brace_match.group(0))
     for candidate in candidates:
         try:
-            return json.loads(candidate)
+            payload = json.loads(candidate)
+            if isinstance(payload, dict):
+                return payload
         except json.JSONDecodeError:
             continue
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
     raise ValueError(f"cannot parse JSON from model output: {text[:200]}")
+
+
+def _merge_extra_kwargs(base: dict[str, Any] | None, updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base or {})
+    merged.update(updates)
+    return merged
 
 
 @dataclass(slots=True)
@@ -157,6 +175,74 @@ class OpenAICompatibleChatClient:
         )
         message = response.choices[0].message
         return _extract_text_from_content(_safe_get(message, "content", ""))
+
+    async def complete_json(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.1,
+        max_tokens: int = 800,
+        schema: dict[str, Any] | None = None,
+        extra_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        json_mode_kwargs = _merge_extra_kwargs(extra_kwargs, {"response_format": {"type": "json_object"}})
+        try:
+            text = await self.complete_text(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_kwargs=json_mode_kwargs,
+            )
+        except Exception as exc:
+            logger.debug("模型 %s 不支持或拒绝 JSON mode，改用普通文本模式: %s", self.config.model, exc)
+            text = await self.complete_text(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_kwargs=extra_kwargs,
+            )
+
+        try:
+            return _extract_json_object(text)
+        except ValueError as parse_exc:
+            repair_payload = {
+                "original_output": text[:4000],
+                "expected_schema": schema or {},
+                "rules": [
+                    "只输出一个合法 JSON object",
+                    "不要 Markdown、代码块、解释文字",
+                    "字段缺失时用安全默认值补齐",
+                    "布尔值必须是 true 或 false，数字必须是 JSON number",
+                ],
+            }
+            repair_messages = [
+                {
+                    "role": "system",
+                    "content": "你是 JSON 修复器。把用户给出的模型输出修复成合法 JSON object。只输出 JSON。",
+                },
+                {"role": "user", "content": json.dumps(repair_payload, ensure_ascii=False)},
+            ]
+            try:
+                repaired = await self.complete_text(
+                    repair_messages,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    extra_kwargs=json_mode_kwargs,
+                )
+            except Exception:
+                repaired = await self.complete_text(
+                    repair_messages,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    extra_kwargs=extra_kwargs,
+                )
+            try:
+                return _extract_json_object(repaired)
+            except ValueError as repair_exc:
+                raise ValueError(
+                    f"cannot parse JSON from model output after repair: {parse_exc}; "
+                    f"repair_error={repair_exc}; output={text[:200]}"
+                ) from repair_exc
 
     async def stream_text(
         self,
@@ -372,15 +458,15 @@ class LanguageModelService:
             },
         }
         try:
-            text = await self._client.complete_text(
+            payload = await self._client.complete_json(
                 [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
                 ],
                 temperature=0.1,
                 max_tokens=220,
+                schema=user_payload["schema"],
             )
-            payload = _extract_json_object(text)
             score = int(payload.get("score") or 0)
             score = max(0, min(100, score))
             should_reply = bool(payload.get("should_reply", score >= score_threshold))

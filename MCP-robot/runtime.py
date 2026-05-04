@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import struct
 import time
@@ -21,6 +22,19 @@ import httpx
 from approval import ApprovalManager
 from app_config import AppConfig
 from conversation_store import ConversationStore
+from doubao_dialog import (
+    EVENT_ASR_ENDED,
+    EVENT_ASR_INFO,
+    EVENT_ASR_RESPONSE,
+    EVENT_CHAT_ENDED,
+    EVENT_CHAT_RESPONSE,
+    EVENT_SESSION_FAILED,
+    EVENT_TTS_ENDED,
+    EVENT_TTS_RESPONSE,
+    EVENT_TTS_SENTENCE_END,
+    EVENT_TTS_SENTENCE_START,
+    DoubaoRealtimeDialogClient,
+)
 from frame_store import FrameStore
 from generic_agent_bridge import GenericAgentBridge
 from memory_store import SubconsciousMemoryStore
@@ -135,6 +149,18 @@ class PendingAudioStream:
     bytes_received: int = 0
 
 
+@dataclass(slots=True)
+class ESP32RuntimeConfig:
+    persona_id: str = "default"
+    persona_label: str = "默认人设"
+    voice_id: str = "default"
+    voice_label: str = "默认音色"
+    continuous_chat: bool = False
+    wake_enabled: bool = False
+    wake_word: str = "doubao"
+    updated_at: float = field(default_factory=time.time)
+
+
 def _analyze_pcm_s16le(pcm_bytes: bytes) -> dict[str, float | int]:
     frame_bytes = len(pcm_bytes) - (len(pcm_bytes) % 2)
     if frame_bytes <= 0:
@@ -177,6 +203,8 @@ _ESP32_TTS_SAMPLE_RATE = 16000
 _ESP32_TTS_MAX_SECONDS = 12.0
 _ESP32_TTS_TARGET_PEAK = 12000
 _ESP32_TTS_SOFT_LIMIT = 26000
+_DIALOG_TTS_TARGET_PEAK = 14000
+_DIALOG_TTS_MAX_GAIN = 8.0
 _TTS_DEBUG_DIR = Path(__file__).resolve().parent / "data" / "esp32_tts"
 _EMOJI_RE = re.compile(
     "["
@@ -326,26 +354,34 @@ def _resample_float_mono(samples: list[float], *, source_rate: int, target_rate:
     return output
 
 
-def _finish_tts_pcm(samples: list[float]) -> bytes:
+def _finish_tts_pcm(samples: list[float], *, target_peak: int = _ESP32_TTS_TARGET_PEAK, max_gain: float = 1.0) -> bytes:
     if not samples:
         return b""
     peak = max(abs(sample) for sample in samples)
     if peak <= 0:
         return b""
-    gain = min(1.0, _ESP32_TTS_TARGET_PEAK / peak)
+    gain = min(max(0.01, max_gain), max(0.01, target_peak) / peak)
     output = bytearray(len(samples) * 2)
     for index, sample in enumerate(samples):
         struct.pack_into("<h", output, index * 2, _soft_limit_sample(sample * gain))
     return bytes(output)
 
 
-def _resample_pcm_s16le_mono(pcm: bytes, *, source_rate: int, source_channels: int, target_rate: int) -> bytes:
+def _resample_pcm_s16le_mono(
+    pcm: bytes,
+    *,
+    source_rate: int,
+    source_channels: int,
+    target_rate: int,
+    target_peak: int = _ESP32_TTS_TARGET_PEAK,
+    max_gain: float = 1.0,
+) -> bytes:
     if source_rate <= 0 or target_rate <= 0 or source_channels not in (1, 2):
         return b""
     mono = _pcm_s16le_to_mono_samples(pcm, source_channels)
     filtered = _remove_dc_and_filter(mono, source_rate)
     resampled = _resample_float_mono(filtered, source_rate=source_rate, target_rate=target_rate)
-    return _finish_tts_pcm(resampled)
+    return _finish_tts_pcm(resampled, target_peak=target_peak, max_gain=max_gain)
 
 
 def _normalize_wav_for_esp32(audio_bytes: bytes) -> bytes:
@@ -389,7 +425,7 @@ async def _emit_esp32_tts_audio_chunks(emit_chunk, *, segment_no: int, segment_t
             "segment_no": segment_no,
             "audio_b64": audio_b64[offset : offset + _TTS_AUDIO_B64_CHUNK_CHARS],
         }
-        for key in ("audio_id", "format", "voice"):
+        for key in ("device_id", "session_id", "audio_id", "format", "voice"):
             value = audio.get(key)
             if value:
                 payload[key] = value
@@ -397,6 +433,27 @@ async def _emit_esp32_tts_audio_chunks(emit_chunk, *, segment_no: int, segment_t
             payload
         )
         await asyncio.sleep(_TTS_AUDIO_CHUNK_DELAY_SECONDS)
+
+
+async def _emit_esp32_tts_pcm_chunk(
+    emit_chunk,
+    *,
+    device_id: str,
+    session_id: str,
+    chunk_no: int,
+    pcm: bytes,
+) -> None:
+    if not pcm:
+        return
+    await emit_chunk(
+        {
+            "type": "tts_pcm_chunk",
+            "device_id": device_id,
+            "session_id": session_id,
+            "chunk_no": chunk_no,
+            "audio_b64": base64.b64encode(pcm).decode("ascii"),
+        }
+    )
 
 
 def _select_single_wav_from_base64(audio_b64: str) -> str:
@@ -481,8 +538,13 @@ def _save_tts_debug_wav(wav_bytes: bytes) -> None:
     try:
         _TTS_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         (_TTS_DEBUG_DIR / "last_tts.wav").write_bytes(wav_bytes)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        (_TTS_DEBUG_DIR / f"tts_{timestamp}.wav").write_bytes(wav_bytes)
+        if os.getenv("MCP_TTS_DEBUG_HISTORY", "").strip().lower() in {"1", "true", "yes", "on"}:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            (_TTS_DEBUG_DIR / f"tts_{timestamp}.wav").write_bytes(wav_bytes)
+            keep = max(1, int(os.getenv("MCP_TTS_DEBUG_KEEP", "20")))
+            history = sorted(_TTS_DEBUG_DIR.glob("tts_*.wav"), key=lambda path: path.stat().st_mtime, reverse=True)
+            for old_path in history[keep:]:
+                old_path.unlink(missing_ok=True)
     except Exception as exc:
         logger.warning("保存 TTS 调试 WAV 失败: %s", exc)
 
@@ -666,6 +728,7 @@ class RobotRuntime:
         self.vision_model = VisionModelService(config.vision_model)
         self.vision_highres_model = VisionModelService(config.vision_highres_model)
         self.asr_model = ASRModelService(config.asr_model, language=config.asr_language) if config.asr_model.api_key else None
+        self.doubao_dialog = DoubaoRealtimeDialogClient(config.doubao_dialog)
         self.tts_model = (
             TTSModelService(config.tts_model, config.tts_voice, config.tts_style_prompt)
             if config.tts_model.api_key
@@ -694,9 +757,13 @@ class RobotRuntime:
         self._queued_memory_sessions: set[str] = set()
         self._pending_image_jobs: dict[str, PendingImageJob] = {}
         self._pending_audio_streams: dict[str, PendingAudioStream] = {}
+        self._esp32_runtime_config: dict[str, ESP32RuntimeConfig] = {}
+        self._voice_presets_cache: dict[str, str] | None = None
+        self._voice_presets_mtime: float = 0.0
         self._offline_gap_analysis_keys: set[str] = set()
         self.audio_capture_dir = self.config.data_dir / "esp32_audio"
         self.audio_capture_dir.mkdir(parents=True, exist_ok=True)
+        self.config.doubao_dialog.persona_dir.mkdir(parents=True, exist_ok=True)
 
     def _cleanup_stale_audio_streams(self) -> None:
         if not self._pending_audio_streams:
@@ -2056,6 +2123,8 @@ class RobotRuntime:
             self._track_task(self._run_image_pipeline(device_id, payload), task_type="esp32.image", source="ESP32", metadata={"device_id": device_id})
         elif event_type == "telemetry":
             logger.info("收到 ESP32 状态上报 [%s]: %s", device_id, json.dumps(payload, ensure_ascii=False))
+        elif event_type == "client_config":
+            await self._handle_esp32_client_config(payload, device_id=device_id)
         elif event_type == "audio_stream_start":
             await self._handle_esp32_audio_stream_start(payload, device_id=device_id)
         elif event_type == "audio_stream_chunk":
@@ -2064,6 +2133,161 @@ class RobotRuntime:
             await self._handle_esp32_audio_stream_end(payload, device_id=device_id)
         else:
             logger.info("收到未处理的 ESP32 事件 %s，设备 %s", event_type, device_id)
+
+    @staticmethod
+    def _safe_config_id(raw: Any, default: str = "default") -> str:
+        text = str(raw or "").strip().lower()
+        text = re.sub(r"[^a-z0-9_-]+", "", text)
+        return text[:48] or default
+
+    @staticmethod
+    def _bool_from_payload(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    async def _handle_esp32_client_config(self, payload: dict[str, Any], *, device_id: str) -> None:
+        persona_id = self._safe_config_id(payload.get("persona_id"))
+        voice_id = self._safe_config_id(payload.get("voice_id"))
+        cfg = ESP32RuntimeConfig(
+            persona_id=persona_id,
+            persona_label=str(payload.get("persona_label") or persona_id)[:48],
+            voice_id=voice_id,
+            voice_label=str(payload.get("voice_label") or voice_id)[:48],
+            continuous_chat=self._bool_from_payload(payload.get("continuous_chat")),
+            wake_enabled=self._bool_from_payload(payload.get("wake_enabled")),
+            wake_word=str(payload.get("wake_word") or "doubao")[:32],
+        )
+        self._esp32_runtime_config[device_id] = cfg
+        self._trace(
+            "esp32.config.updated",
+            source="ESP32",
+            device_id=device_id,
+            persona_id=cfg.persona_id,
+            voice_id=cfg.voice_id,
+            continuous_chat=cfg.continuous_chat,
+            wake_enabled=cfg.wake_enabled,
+        )
+        logger.info(
+            "ESP32 配置更新 [%s]: persona=%s voice=%s continuous=%s wake=%s",
+            device_id,
+            cfg.persona_id,
+            cfg.voice_id,
+            cfg.continuous_chat,
+            cfg.wake_enabled,
+        )
+        await self.connection_manager.send_to_esp32(
+            {
+                "type": "config_ack",
+                "device_id": device_id,
+                "persona_id": cfg.persona_id,
+                "voice_id": cfg.voice_id,
+                "continuous_chat": cfg.continuous_chat,
+                "wake_enabled": cfg.wake_enabled,
+            }
+        )
+
+    @staticmethod
+    def _truncate_text(text: Any, limit: int) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 1)].rstrip() + "…"
+
+    def _load_persona_prompt(self, persona_id: str) -> str:
+        safe_id = self._safe_config_id(persona_id)
+        if safe_id == "default":
+            return ""
+        persona_dir = self.config.doubao_dialog.persona_dir
+        for suffix in (".md", ".txt"):
+            path = persona_dir / f"{safe_id}{suffix}"
+            try:
+                if path.is_file():
+                    return self._truncate_text(path.read_text(encoding="utf-8"), 1200)
+            except Exception as exc:
+                logger.warning("读取 ESP32 人设文件失败 %s: %s", path, exc)
+                return ""
+        return ""
+
+    def _load_voice_presets(self) -> dict[str, str]:
+        path = self.config.doubao_dialog.voice_preset_file
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            self._voice_presets_cache = {}
+            self._voice_presets_mtime = 0.0
+            return {}
+        except Exception as exc:
+            logger.warning("读取音色预设文件状态失败 %s: %s", path, exc)
+            return self._voice_presets_cache or {}
+        if self._voice_presets_cache is not None and mtime == self._voice_presets_mtime:
+            return self._voice_presets_cache
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            presets: dict[str, str] = {}
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    safe_key = self._safe_config_id(key)
+                    if isinstance(value, dict):
+                        speaker = str(value.get("speaker") or value.get("tts_speaker") or "").strip()
+                    else:
+                        speaker = str(value or "").strip()
+                    if safe_key and speaker:
+                        presets[safe_key] = speaker[:120]
+            self._voice_presets_cache = presets
+            self._voice_presets_mtime = mtime
+            return presets
+        except Exception as exc:
+            logger.warning("读取音色预设文件失败 %s: %s", path, exc)
+            self._voice_presets_cache = {}
+            self._voice_presets_mtime = mtime
+            return {}
+
+    def _voice_speaker_for_config(self, cfg: ESP32RuntimeConfig) -> str:
+        if cfg.voice_id == "default":
+            return ""
+        return self._load_voice_presets().get(cfg.voice_id, "")
+
+    def _build_esp32_dialog_system_role(self, *, device_id: str, cfg: ESP32RuntimeConfig) -> str:
+        session_id = self._session_id_for("ESP32", device_id=device_id)
+        blocks = [self.config.doubao_dialog.system_role.strip()]
+        persona_prompt = self._load_persona_prompt(cfg.persona_id)
+        if persona_prompt:
+            blocks.append(f"当前人设设定：\n{persona_prompt}")
+        structured = self.structured_memory_store.build_context(
+            session_id=session_id,
+            profile_scope=session_id,
+            profile_limit=3,
+            memory_limit=3,
+        )
+        if structured:
+            blocks.append("可参考的稳定记忆，按需使用，不要生硬复述：\n" + self._truncate_text(structured, 700))
+        summaries = self.conversation_store.recent_summaries(session_id=session_id, limit=2)
+        summary_lines = [
+            self._truncate_text(item.get("summary") or item.get("text") or "", 120)
+            for item in summaries
+        ]
+        summary_lines = [line for line in summary_lines if line]
+        if summary_lines:
+            blocks.append("近期对话摘要：\n" + "\n".join(f"- {line}" for line in summary_lines))
+        blocks.append("实时语音回复要求：短句、自然、少铺垫。用户没要求详细解释时，优先一到三句话。")
+        return "\n\n".join(block for block in blocks if block)
+
+    def _build_esp32_dialog_history(self, *, device_id: str) -> list[dict[str, str]]:
+        session_id = self._session_id_for("ESP32", device_id=device_id)
+        recent = self.conversation_store.recent_entries(
+            session_id=session_id,
+            limit=min(6, max(2, self.config.context_recent_turns)),
+        )
+        compact: list[dict[str, str]] = []
+        for turn in recent:
+            user_text = self._truncate_text(turn.get("user_text"), 90)
+            assistant_text = self._truncate_text(turn.get("assistant_text"), 90)
+            if user_text or assistant_text:
+                compact.append({"user_text": user_text, "assistant_text": assistant_text})
+        return compact
 
     async def _handle_esp32_audio_stream_start(self, payload: dict[str, Any], *, device_id: str) -> None:
         session_id = str(payload.get("session_id") or "").strip()
@@ -2146,6 +2370,29 @@ class RobotRuntime:
                 text="录音结束事件没有匹配的开始事件。",
             )
             return
+        reason = str(payload.get("reason") or "").strip().lower()
+        if reason in {"manual_stop", "cancel"}:
+            try:
+                stream.pcm_path.unlink(missing_ok=True)
+            except TypeError:
+                if stream.pcm_path.exists():
+                    stream.pcm_path.unlink()
+            self._trace(
+                "audio.capture.cancelled",
+                source="ESP32",
+                device_id=device_id,
+                session_id=session_id,
+                reason=reason,
+                bytes_received=stream.bytes_received,
+            )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="idle",
+                device_id=device_id,
+                session_id=session_id,
+                text="已取消本次录音。",
+            )
+            return
         wav_path = self.audio_capture_dir / f"{session_id}.wav"
         try:
             pcm_bytes = stream.pcm_path.read_bytes()
@@ -2203,6 +2450,41 @@ class RobotRuntime:
         wav_path: Path,
         duration_ms: int,
     ) -> None:
+        if self.config.doubao_dialog.enabled:
+            if not self.doubao_dialog.available:
+                self._trace(
+                    "dialog.config.error",
+                    source="ESP32",
+                    device_id=device_id,
+                    session_id=session_id,
+                    error="Doubao realtime dialog credentials are not configured",
+                )
+                await self.connection_manager.send_to_esp32(
+                    {
+                        "type": "assistant_error",
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "error": "豆包端到端实时语音没有配置完整，请检查 DOUBAO_DIALOG_APP_ID / DOUBAO_DIALOG_APP_KEY / DOUBAO_DIALOG_ACCESS_TOKEN。",
+                    }
+                )
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status="error",
+                    device_id=device_id,
+                    session_id=session_id,
+                    text="豆包实时语音配置不完整。",
+                )
+                return
+            handled = await self._run_esp32_doubao_dialog_pipeline(
+                session_id=session_id,
+                device_id=device_id,
+                wav_path=wav_path,
+                duration_ms=duration_ms,
+            )
+            if handled:
+                return
+            return
+
         if self.asr_model is None:
             self._trace(
                 "audio.asr.error",
@@ -2370,6 +2652,281 @@ class RobotRuntime:
             modality="speech",
         )
         await self._run_text_conversation(request)
+
+    async def _run_esp32_doubao_dialog_pipeline(
+        self,
+        *,
+        session_id: str,
+        device_id: str,
+        wav_path: Path,
+        duration_ms: int,
+    ) -> bool:
+        try:
+            with wave.open(str(wav_path), "rb") as wav_file:
+                source_channels = wav_file.getnchannels()
+                source_rate = wav_file.getframerate()
+                source_bits = wav_file.getsampwidth() * 8
+                pcm = wav_file.readframes(wav_file.getnframes())
+            if source_bits != 16 or source_channels not in (1, 2) or source_rate <= 0:
+                raise RuntimeError(f"unsupported ESP32 capture format: rate={source_rate} ch={source_channels} bits={source_bits}")
+            pcm16 = _resample_pcm_s16le_mono(
+                pcm,
+                source_rate=source_rate,
+                source_channels=source_channels,
+                target_rate=16000,
+            )
+            audio_stats = _analyze_pcm_s16le(pcm16)
+            if int(audio_stats.get("nonzero_samples") or 0) == 0 or int(audio_stats.get("peak") or 0) == 0:
+                await self.connection_manager.send_to_esp32(
+                    {
+                        "type": "assistant_error",
+                        "device_id": device_id,
+                        "error": "这段录音几乎是静音，服务端收到的 PCM 全是空白。",
+                    }
+                )
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status="error",
+                    device_id=device_id,
+                    session_id=session_id,
+                    text="这段录音几乎是静音。",
+                )
+                return True
+        except Exception as exc:
+            logger.exception("ESP32 豆包实时语音准备失败")
+            self._trace("dialog.prepare.error", source="ESP32", device_id=device_id, session_id=session_id, error=str(exc))
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text=f"实时语音准备失败: {exc}",
+            )
+            return True
+
+        runtime_cfg = self._esp32_runtime_config.get(device_id) or ESP32RuntimeConfig()
+        dialog_history = self._build_esp32_dialog_history(device_id=device_id)
+        system_role = self._build_esp32_dialog_system_role(device_id=device_id, cfg=runtime_cfg)
+        tts_speaker = self._voice_speaker_for_config(runtime_cfg)
+        if runtime_cfg.voice_id != "default" and not tts_speaker:
+            logger.warning(
+                "ESP32 请求音色 %s，但未在 %s 找到 speaker，使用实例默认音色。",
+                runtime_cfg.voice_id,
+                self.config.doubao_dialog.voice_preset_file,
+            )
+
+        self._trace(
+            "dialog.incoming",
+            source="ESP32",
+            device_id=device_id,
+            session_id=session_id,
+            wav_path=str(wav_path),
+            duration_ms=duration_ms,
+            audio_peak=audio_stats["peak"],
+            audio_rms=round(float(audio_stats["rms"]), 2),
+            persona_id=runtime_cfg.persona_id,
+            voice_id=runtime_cfg.voice_id,
+            voice_speaker=tts_speaker,
+            history_turns=len(dialog_history),
+        )
+
+        chunk_no = 0
+        audio_pcm_buffer = bytearray()
+        debug_pcm_chunks: list[bytes] = []
+        sent_pcm_start = False
+        final_asr = ""
+        assistant_text_parts: list[str] = []
+        sent_dialog_statuses: set[str] = set()
+
+        async def send_dialog_status_once(status: str, text: str = "") -> None:
+            if status in sent_dialog_statuses:
+                return
+            sent_dialog_statuses.add(status)
+            await _send_esp32_status(
+                self.connection_manager,
+                status=status,
+                device_id=device_id,
+                session_id=session_id,
+                text=text,
+            )
+
+        async def flush_dialog_audio(*, final: bool = False) -> None:
+            nonlocal chunk_no, sent_pcm_start
+            source_rate = self.config.doubao_dialog.tts_sample_rate
+            source_channels = self.config.doubao_dialog.tts_channel
+            min_bytes = source_rate * 2 * source_channels * self.config.doubao_dialog.output_flush_ms // 1000
+            if not audio_pcm_buffer:
+                return
+            if not final and len(audio_pcm_buffer) < min_bytes:
+                return
+            pcm_chunk = bytes(audio_pcm_buffer)
+            audio_pcm_buffer.clear()
+            if self.config.doubao_dialog.tts_format != "pcm_s16le":
+                raise RuntimeError(f"unsupported Doubao dialog TTS format: {self.config.doubao_dialog.tts_format}")
+            if pcm_chunk.startswith(b"OggS"):
+                raise RuntimeError(
+                    "Doubao dialog returned OGG/Opus audio; StartSession tts.audio_config pcm_s16le did not take effect"
+                )
+            if pcm_chunk[:4] == b"RIFF" or pcm_chunk[:3] == b"ID3":
+                raise RuntimeError(f"Doubao dialog returned unexpected encoded audio header: {pcm_chunk[:12]!r}")
+            esp32_pcm = _resample_pcm_s16le_mono(
+                pcm_chunk,
+                source_rate=source_rate,
+                source_channels=source_channels,
+                target_rate=_ESP32_TTS_SAMPLE_RATE,
+                target_peak=_DIALOG_TTS_TARGET_PEAK,
+                max_gain=_DIALOG_TTS_MAX_GAIN,
+            )
+            if not esp32_pcm:
+                return
+            debug_pcm_chunks.append(esp32_pcm)
+            dialog_stats = _analyze_pcm_s16le(esp32_pcm)
+            logger.info(
+                "Doubao dialog PCM ready for ESP32: chunk=%d source_bytes=%d source_rate=%d source_channels=%d "
+                "esp32_bytes=%d esp32_rate=%d peak=%d rms=%.2f gain_limit=%.1f",
+                chunk_no,
+                len(pcm_chunk),
+                source_rate,
+                source_channels,
+                len(esp32_pcm),
+                _ESP32_TTS_SAMPLE_RATE,
+                int(dialog_stats.get("peak") or 0),
+                float(dialog_stats.get("rms") or 0.0),
+                _DIALOG_TTS_MAX_GAIN,
+            )
+            if not sent_pcm_start:
+                await self.connection_manager.send_to_esp32(
+                    {
+                        "type": "tts_pcm_start",
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "sample_rate": _ESP32_TTS_SAMPLE_RATE,
+                        "sample_bits": 16,
+                        "channels": 1,
+                        "format": "pcm_s16le",
+                        "voice": "doubao-dialog",
+                        "text": final_asr[:120],
+                    }
+                )
+                sent_pcm_start = True
+            await _emit_esp32_tts_pcm_chunk(
+                self.connection_manager.send_to_esp32,
+                device_id=device_id,
+                session_id=session_id,
+                chunk_no=chunk_no,
+                pcm=esp32_pcm,
+            )
+            chunk_no += 1
+
+        try:
+            await send_dialog_status_once("asr", "豆包实时语音识别中。")
+            async for event in self.doubao_dialog.run_pcm_dialog(
+                pcm16,
+                input_sample_rate=16000,
+                device_id=device_id,
+                session_id=session_id,
+                history=dialog_history,
+                system_role_override=system_role,
+                tts_speaker_override=tts_speaker,
+                bot_name_override=self.config.doubao_dialog.bot_name,
+            ):
+                payload = event.payload
+                if event.event == EVENT_ASR_INFO:
+                    await send_dialog_status_once("asr", "开始识别。")
+                elif event.event == EVENT_ASR_RESPONSE and isinstance(payload, dict):
+                    results = payload.get("results") or []
+                    if results:
+                        text = str(results[0].get("text") or "").strip()
+                        if text:
+                            final_asr = text
+                            if not bool(results[0].get("is_interim")):
+                                await send_dialog_status_once("thinking", text[:120])
+                elif event.event == EVENT_ASR_ENDED:
+                    await send_dialog_status_once("thinking", final_asr or "正在思考。")
+                elif event.event == EVENT_TTS_SENTENCE_START:
+                    await send_dialog_status_once("tts", "豆包实时合成中。")
+                elif event.event == EVENT_CHAT_RESPONSE and isinstance(payload, dict):
+                    content = str(payload.get("content") or "")
+                    if content:
+                        assistant_text_parts.append(content)
+                elif event.event == EVENT_TTS_RESPONSE:
+                    if isinstance(event.payload, (bytes, bytearray)):
+                        audio_pcm_buffer.extend(bytes(event.payload))
+                        await flush_dialog_audio()
+                elif event.event == EVENT_TTS_SENTENCE_END:
+                    await flush_dialog_audio(final=True)
+                elif event.event == EVENT_CHAT_ENDED:
+                    final_reply = "".join(assistant_text_parts).strip()
+                    if final_reply:
+                        await self.connection_manager.send_to_esp32(
+                            {
+                                "type": "assistant_done",
+                                "device_id": device_id,
+                                "session_id": session_id,
+                                "text": final_reply,
+                            }
+                        )
+                elif event.event == EVENT_TTS_ENDED:
+                    await flush_dialog_audio(final=True)
+                    if debug_pcm_chunks:
+                        _save_tts_debug_wav(
+                            _pcm_to_wav(b"".join(debug_pcm_chunks), sample_rate=_ESP32_TTS_SAMPLE_RATE)
+                        )
+                    if sent_pcm_start:
+                        await self.connection_manager.send_to_esp32(
+                            {
+                                "type": "tts_pcm_end",
+                                "device_id": device_id,
+                                "session_id": session_id,
+                                "chunks": chunk_no,
+                            }
+                        )
+                elif event.event == EVENT_SESSION_FAILED:
+                    raise RuntimeError(f"Doubao dialog session failed: {payload!r}")
+        except Exception as exc:
+            logger.exception("ESP32 豆包实时语音失败")
+            self._trace("dialog.error", source="ESP32", device_id=device_id, session_id=session_id, error=str(exc))
+            await self.connection_manager.send_to_esp32(
+                {
+                    "type": "assistant_error",
+                    "device_id": device_id,
+                    "session_id": session_id,
+                    "error": f"豆包实时语音失败: {exc}",
+                }
+            )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text=f"豆包实时语音失败: {exc}",
+            )
+            return True
+
+        final_reply = "".join(assistant_text_parts).strip()
+        if final_asr or final_reply:
+            self.conversation_store.append_turn(
+                session_id=self._session_id_for("ESP32", device_id=device_id),
+                source="ESP32",
+                user_text=final_asr or "[voice]",
+                assistant_text=final_reply or "",
+            )
+        await _send_esp32_status(
+            self.connection_manager,
+            status="idle",
+            device_id=device_id,
+            session_id=session_id,
+            text=final_reply or final_asr,
+        )
+        self._trace(
+            "dialog.done",
+            source="ESP32",
+            device_id=device_id,
+            session_id=session_id,
+            transcript=final_asr,
+            assistant_text=final_reply,
+        )
+        return True
 
     async def _run_change_command(self, request: TextRequest, command_override: str | None = None) -> None:
         try:

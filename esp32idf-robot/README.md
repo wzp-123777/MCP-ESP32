@@ -4,7 +4,7 @@ ESP-IDF + ESP-ADF 语音机器人工程，目标硬件为 ESP32-S3-Korvo-2 V3。
 
 当前默认不再循环播放“小乐”。启动后会自动连接 Wi-Fi 和 MCP WebSocket，按住 `SET` 录音，松开发送到 MCP，服务端 TTS WAV 下行后通过 ES8311 播放。
 
-默认网络配置在 `main/app_config.h` 中设置。仓库里只保留占位值：
+默认配置在 `main/app_config.h` 中使用占位符。请在本地工作副本里改成自己的 Wi-Fi 和 MCP 地址，不要提交真实配置：
 
 - Wi-Fi：`YOUR_WIFI_SSID`
 - MCP：`ws://YOUR_MCP_SERVER_IP:8080/esp32_ws`

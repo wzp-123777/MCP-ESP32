@@ -26,6 +26,10 @@ typedef enum {
     APP_UI_ACTION_VOL_DOWN,
     APP_UI_ACTION_PLAY_TEST,
     APP_UI_ACTION_BLUETOOTH_TOGGLE,
+    APP_UI_ACTION_CHAT_TOGGLE,
+    APP_UI_ACTION_WAKE_TOGGLE,
+    APP_UI_ACTION_PERSONA_NEXT,
+    APP_UI_ACTION_VOICE_NEXT,
 } app_ui_action_t;
 
 typedef void (*app_ui_action_cb_t)(app_ui_action_t action, void *ctx);
@@ -44,5 +48,9 @@ void app_ui_set_mcp_connected(bool connected);
 void app_ui_note_mcp_activity(void);
 void app_ui_set_assistant_state(app_ui_assistant_state_t state);
 void app_ui_set_recent_text(const char *text);
+void app_ui_set_chat_continuous(bool enabled);
+void app_ui_set_wake_enabled(bool enabled);
+void app_ui_set_persona(const char *label);
+void app_ui_set_voice_profile(const char *label);
 void app_ui_next_page(void);
 void app_ui_prev_page(void);

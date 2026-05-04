@@ -15,8 +15,15 @@ const char *mcp_client_get_status_text(void);
 bool mcp_client_is_configured(void);
 bool mcp_client_is_wifi_connected(void);
 bool mcp_client_is_connected(void);
+bool mcp_client_is_assistant_busy(void);
 esp_err_t mcp_client_send_text_request(const char *text);
 esp_err_t mcp_client_audio_stream_begin(const char *session_id);
 esp_err_t mcp_client_audio_stream_chunk(const char *session_id, const uint8_t *data, size_t len);
 esp_err_t mcp_client_audio_stream_end(const char *session_id, uint32_t duration_ms, const char *reason);
+esp_err_t mcp_client_send_config(const char *persona_id,
+                                 const char *persona_label,
+                                 const char *voice_id,
+                                 const char *voice_label,
+                                 bool continuous_chat,
+                                 bool wake_enabled);
 esp_err_t mcp_client_send_telemetry(void);

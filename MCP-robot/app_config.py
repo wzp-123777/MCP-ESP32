@@ -40,6 +40,28 @@ class ToolApiConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DoubaoDialogConfig:
+    enabled: bool
+    app_id: str
+    app_key: str
+    access_token: str
+    resource_id: str = "volc.speech.dialog"
+    ws_url: str = "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
+    bot_name: str = "豆包"
+    system_role: str = "你是一个简洁、自然的中文语音助手。回答要短，适合直接朗读。"
+    tts_speaker: str = ""
+    tts_format: str = "pcm_s16le"
+    tts_sample_rate: int = 24000
+    tts_channel: int = 1
+    timeout_seconds: float = 30.0
+    audio_chunk_ms: int = 100
+    vad_tail_silence_ms: int = 1800
+    output_flush_ms: int = 250
+    persona_dir: Path = BASE_DIR / "data" / "personas"
+    voice_preset_file: Path = BASE_DIR / "data" / "voice_presets.json"
+
+
+@dataclass(frozen=True, slots=True)
 class TTSPreset:
     voice: str
     style_prompt: str
@@ -89,6 +111,7 @@ class AppConfig:
     trace_log_file: Path
     runtime_log_file: Path
     tool_api: ToolApiConfig
+    doubao_dialog: DoubaoDialogConfig
     subconscious_half_life_hours: float = 72.0
     qq_summary_max_chars: int = 160
     shared_session_id: str = "shared-context:main"
@@ -174,6 +197,35 @@ def _load_python_module(path: Path) -> dict[str, Any]:
     return {name: getattr(module, name) for name in dir(module) if not name.startswith("_")}
 
 
+def _hydrate_windows_persistent_env() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+    except Exception:
+        return
+    keys = (
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+    )
+    for root, path in keys:
+        try:
+            handle = winreg.OpenKey(root, path)
+        except OSError:
+            continue
+        with handle:
+            index = 0
+            while True:
+                try:
+                    name, value, _ = winreg.EnumValue(handle, index)
+                except OSError:
+                    break
+                index += 1
+                if name in os.environ or not isinstance(value, str) or not value:
+                    continue
+                os.environ[name] = value
+
+
 def _pick_value(env_names: list[str], fallback: dict[str, Any], fallback_names: list[str]) -> str:
     for name in env_names:
         value = os.getenv(name, "").strip()
@@ -194,6 +246,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def load_config() -> AppConfig:
+    _hydrate_windows_persistent_env()
     generic_agent_root = Path(os.getenv("GENERIC_AGENT_ROOT", r"D:\esp32\GenericAgent")).resolve()
     mcp_robot_keys = _load_python_module(BASE_DIR / "local_keys.py")
     generic_agent_keys = _load_python_module(generic_agent_root / "mykey.py")
@@ -237,32 +290,23 @@ def load_config() -> AppConfig:
         or generic_agent_keys.get("qwen_base_url")
         or "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ).strip()
-    ark_api_key = _pick_value(
-        ["ARK_API_KEY", "DOUBAO_API_KEY"],
+    default_language_api_key = mimo_api_key
+    default_language_base_url = mimo_base_url
+    default_language_model = os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro").strip()
+    default_tool_model = os.getenv("MIMO_TOOL_MODEL", default_language_model).strip()
+    doubao_dialog_app_id = os.getenv("DOUBAO_DIALOG_APP_ID", os.getenv("DOUBAO_TTS_APP_ID", "")).strip()
+    doubao_dialog_app_key = _pick_value(
+        ["DOUBAO_DIALOG_APP_KEY"],
         mcp_robot_keys,
-        ["ARK_API_KEY", "DOUBAO_API_KEY", "ark_api_key", "doubao_api_key"],
+        ["DOUBAO_DIALOG_APP_KEY", "doubao_dialog_app_key"],
     ) or _pick_value(
-        ["ARK_API_KEY", "DOUBAO_API_KEY"],
+        ["DOUBAO_DIALOG_APP_KEY"],
         generic_agent_keys,
-        ["ARK_API_KEY", "DOUBAO_API_KEY", "ark_api_key", "doubao_api_key"],
+        ["DOUBAO_DIALOG_APP_KEY", "doubao_dialog_app_key"],
     )
-    ark_base_url = os.getenv(
-        "ARK_BASE_URL",
-        mcp_robot_keys.get("ARK_BASE_URL")
-        or mcp_robot_keys.get("ark_base_url")
-        or generic_agent_keys.get("ARK_BASE_URL")
-        or generic_agent_keys.get("ark_base_url")
-        or "https://ark.cn-beijing.volces.com/api/v3",
-    ).strip()
-    default_language_api_key = ark_api_key or mimo_api_key
-    default_language_base_url = ark_base_url if ark_api_key else mimo_base_url
-    default_language_model = os.getenv(
-        "ARK_LANGUAGE_MODEL" if ark_api_key else "MIMO_LANGUAGE_MODEL",
-        os.getenv("DOUBAO_LANGUAGE_MODEL", "doubao-seed-1-6-flash-250715" if ark_api_key else "mimo-v2.5-pro"),
-    ).strip()
-    default_tool_model = os.getenv(
-        "ARK_TOOL_MODEL" if ark_api_key else "MIMO_TOOL_MODEL",
-        os.getenv("DOUBAO_TOOL_MODEL", default_language_model if ark_api_key else "mimo-v2.5-pro"),
+    doubao_dialog_access_token = os.getenv(
+        "DOUBAO_DIALOG_ACCESS_TOKEN",
+        os.getenv("DOUBAO_TTS_ACCESS_TOKEN", ""),
     ).strip()
 
     data_dir = Path(os.getenv("MCP_ROBOT_DATA_DIR", str(BASE_DIR / "data"))).resolve()
@@ -277,13 +321,13 @@ def load_config() -> AppConfig:
             api_key=os.getenv("LANGUAGE_API_KEY", default_language_api_key).strip(),
             base_url=os.getenv("LANGUAGE_BASE_URL", default_language_base_url).strip(),
             model=os.getenv("LANGUAGE_MODEL", default_language_model).strip(),
-            timeout_seconds=float(os.getenv("LANGUAGE_TIMEOUT_SECONDS", os.getenv("ARK_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120")))),
+            timeout_seconds=float(os.getenv("LANGUAGE_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120"))),
         ),
         tool_model=ModelConfig(
             api_key=os.getenv("TOOL_MODEL_API_KEY", default_language_api_key).strip(),
             base_url=os.getenv("TOOL_MODEL_BASE_URL", default_language_base_url).strip(),
             model=os.getenv("TOOL_MODEL", default_tool_model).strip(),
-            timeout_seconds=float(os.getenv("TOOL_MODEL_TIMEOUT_SECONDS", os.getenv("ARK_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120")))),
+            timeout_seconds=float(os.getenv("TOOL_MODEL_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120"))),
         ),
         # 视觉链路默认切到 Qwen VL。
         # 低频环境观察优先速度，高清检查优先细节；都保留环境变量覆盖入口。
@@ -300,8 +344,8 @@ def load_config() -> AppConfig:
             timeout_seconds=float(os.getenv("VISION_HIGHRES_TIMEOUT_SECONDS", "120")),
         ),
         asr_model=ModelConfig(
-            api_key=os.getenv("ASR_API_KEY", qwen_api_key or ark_api_key).strip(),
-            base_url=os.getenv("ASR_BASE_URL", qwen_base_url if qwen_api_key else ark_base_url).strip(),
+            api_key=os.getenv("ASR_API_KEY", qwen_api_key).strip(),
+            base_url=os.getenv("ASR_BASE_URL", qwen_base_url).strip(),
             model=os.getenv("ASR_MODEL", "qwen3-asr-flash").strip(),
             timeout_seconds=float(os.getenv("ASR_TIMEOUT_SECONDS", "120")),
         ),
@@ -381,6 +425,29 @@ def load_config() -> AppConfig:
                 generic_agent_keys,
                 ["BAILIAN_WORKSPACE_ID", "DASHSCOPE_WORKSPACE_ID", "QUARK_SEARCH_WORKSPACE_ID"],
             ),
+        ),
+        doubao_dialog=DoubaoDialogConfig(
+            enabled=_env_bool("ESP32_DOUBAO_DIALOG_ENABLED", True),
+            app_id=doubao_dialog_app_id,
+            app_key=doubao_dialog_app_key,
+            access_token=doubao_dialog_access_token,
+            resource_id=os.getenv("DOUBAO_DIALOG_RESOURCE_ID", "volc.speech.dialog").strip(),
+            ws_url=os.getenv("DOUBAO_DIALOG_WS_URL", "wss://openspeech.bytedance.com/api/v3/realtime/dialogue").strip(),
+            bot_name=os.getenv("DOUBAO_DIALOG_BOT_NAME", "豆包").strip(),
+            system_role=os.getenv(
+                "DOUBAO_DIALOG_SYSTEM_ROLE",
+                "你是一个简洁、自然的中文语音助手。回答要短，适合直接朗读。",
+            ).strip(),
+            tts_speaker=os.getenv("DOUBAO_DIALOG_TTS_SPEAKER", "").strip(),
+            tts_format=os.getenv("DOUBAO_DIALOG_TTS_FORMAT", "pcm_s16le").strip(),
+            tts_sample_rate=max(8000, int(os.getenv("DOUBAO_DIALOG_TTS_SAMPLE_RATE", "24000"))),
+            tts_channel=max(1, int(os.getenv("DOUBAO_DIALOG_TTS_CHANNEL", "1"))),
+            timeout_seconds=float(os.getenv("DOUBAO_DIALOG_TIMEOUT_SECONDS", "30")),
+            audio_chunk_ms=max(20, int(os.getenv("DOUBAO_DIALOG_AUDIO_CHUNK_MS", "100"))),
+            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "1800"))),
+            output_flush_ms=max(200, int(os.getenv("DOUBAO_DIALOG_OUTPUT_FLUSH_MS", "250"))),
+            persona_dir=Path(os.getenv("MCP_PERSONA_DIR", str(data_dir / "personas"))).resolve(),
+            voice_preset_file=Path(os.getenv("MCP_VOICE_PRESET_FILE", str(data_dir / "voice_presets.json"))).resolve(),
         ),
         subconscious_half_life_hours=float(os.getenv("SUBCONSCIOUS_HALF_LIFE_HOURS", "72")),
         qq_summary_max_chars=int(os.getenv("QQ_SUMMARY_MAX_CHARS", "160")),

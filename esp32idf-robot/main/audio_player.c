@@ -1,5 +1,6 @@
 #include "audio_player.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -25,7 +26,7 @@ extern const uint8_t xiaole_pcm_end[] asm("_binary_xiaole_16k_stereo_pcm_end");
 #define PLAYER_CHUNK_BYTES 2048
 #define PLAYER_INITIAL_VOLUME 45
 #define PLAYER_SOFT_LIMIT 26000
-#define PLAYER_PREROLL_MS 100
+#define PLAYER_PREROLL_MS 40
 
 typedef struct {
     uint16_t audio_format;
@@ -39,6 +40,7 @@ static audio_board_handle_t s_board;
 static audio_pipeline_handle_t s_pipeline;
 static audio_element_handle_t s_raw_writer;
 static audio_element_handle_t s_i2s_writer;
+static audio_element_handle_t s_active_raw_writer;
 static int s_volume = PLAYER_INITIAL_VOLUME;
 
 static int clamp_volume(int volume)
@@ -192,6 +194,9 @@ static int16_t *wav_to_16k_mono(const wav_format_t *fmt, const uint8_t *pcm, siz
 
 static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const char *tag)
 {
+    if (!s_active_raw_writer) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const uint8_t *cursor = pcm;
     const uint8_t *end = pcm + len;
     size_t bytes_written = 0;
@@ -202,7 +207,7 @@ static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const ch
             chunk = PLAYER_CHUNK_BYTES;
         }
 
-        int written = raw_stream_write(s_raw_writer, (char *)cursor, chunk);
+        int written = raw_stream_write(s_active_raw_writer, (char *)cursor, chunk);
         if (written < 0) {
             ESP_LOGE(TAG, "%s raw_stream_write failed ret=%d", tag ? tag : "pcm", written);
             return ESP_FAIL;
@@ -226,6 +231,22 @@ static esp_err_t audio_player_write_preroll(const char *tag)
     return audio_player_write_pcm(silence, sizeof(silence), tag ? tag : "preroll");
 }
 
+esp_err_t audio_player_write_silence_ms(uint32_t duration_ms, const char *tag)
+{
+    static const uint8_t silence[PLAYER_CHUNK_BYTES] = {0};
+    size_t total = ((size_t)PLAYER_SAMPLE_RATE * PLAYER_BITS / 8 * PLAYER_CHANNELS * duration_ms) / 1000;
+
+    while (total > 0) {
+        size_t chunk = total > sizeof(silence) ? sizeof(silence) : total;
+        esp_err_t ret = audio_player_write_pcm(silence, chunk, tag ? tag : "silence");
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        total -= chunk;
+    }
+    return ESP_OK;
+}
+
 void audio_player_set_volume(int volume)
 {
     s_volume = clamp_volume(volume);
@@ -244,6 +265,12 @@ void audio_player_adjust_volume(int delta)
 int audio_player_get_volume(void)
 {
     return s_volume;
+}
+
+void audio_player_set_output_target(audio_element_handle_t target)
+{
+    s_active_raw_writer = target ? target : s_raw_writer;
+    ESP_LOGI(TAG, "output target: %s", target ? "BT" : "speaker");
 }
 
 esp_err_t audio_player_init(void)
@@ -269,7 +296,7 @@ esp_err_t audio_player_init(void)
 
     raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
     raw_cfg.type = AUDIO_STREAM_WRITER;
-    raw_cfg.out_rb_size = 16 * 1024;
+    raw_cfg.out_rb_size = 48 * 1024;
     s_raw_writer = raw_stream_init(&raw_cfg);
     if (!s_raw_writer) {
         ESP_LOGE(TAG, "raw_stream_init failed");
@@ -279,7 +306,7 @@ esp_err_t audio_player_init(void)
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(I2S_NUM_0, PLAYER_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, AUDIO_STREAM_WRITER);
     i2s_cfg.type = AUDIO_STREAM_WRITER;
     i2s_cfg.task_stack = 4096;
-    i2s_cfg.out_rb_size = 16 * 1024;
+    i2s_cfg.out_rb_size = 32 * 1024;
     s_i2s_writer = i2s_stream_init(&i2s_cfg);
     if (!s_i2s_writer) {
         ESP_LOGE(TAG, "i2s_stream_init failed");
@@ -303,6 +330,8 @@ esp_err_t audio_player_init(void)
         ESP_LOGE(TAG, "audio_pipeline_run failed");
         return ESP_FAIL;
     }
+
+    s_active_raw_writer = s_raw_writer;
 
     ESP_LOGI(TAG, "ready: raw -> i2s -> es8311, %dHz %dbit %dch", PLAYER_SAMPLE_RATE, PLAYER_BITS, PLAYER_CHANNELS);
     return ESP_OK;
@@ -343,7 +372,7 @@ esp_err_t audio_player_play_xiaole(void)
     return ret;
 }
 
-esp_err_t audio_player_play_wav(const uint8_t *wav, size_t wav_len, const char *tag)
+esp_err_t audio_player_play_wav_ex(const uint8_t *wav, size_t wav_len, const char *tag, bool preroll, uint32_t tail_delay_ms)
 {
     wav_format_t fmt = {0};
     const uint8_t *pcm = NULL;
@@ -375,11 +404,41 @@ esp_err_t audio_player_play_wav(const uint8_t *wav, size_t wav_len, const char *
              (unsigned)pcm_len,
              (unsigned)out_bytes);
 
-    esp_err_t ret = audio_player_write_preroll("tts_preroll");
+    esp_err_t ret = ESP_OK;
+    if (preroll) {
+        ret = audio_player_write_preroll("tts_preroll");
+    }
     if (ret == ESP_OK) {
         ret = audio_player_write_pcm((const uint8_t *)mono16, out_bytes, tag ? tag : "wav");
     }
     free(mono16);
-    vTaskDelay(pdMS_TO_TICKS(180));
+    if (tail_delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(tail_delay_ms));
+    }
+    return ret;
+}
+
+esp_err_t audio_player_play_wav(const uint8_t *wav, size_t wav_len, const char *tag)
+{
+    return audio_player_play_wav_ex(wav, wav_len, tag, true, 180);
+}
+
+esp_err_t audio_player_play_pcm16(const uint8_t *pcm, size_t len, const char *tag, bool preroll)
+{
+    if (!pcm || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    len &= ~(size_t)1;
+    if (len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = ESP_OK;
+    if (preroll) {
+        ret = audio_player_write_preroll(tag ? tag : "pcm16_preroll");
+    }
+    if (ret == ESP_OK) {
+        ret = audio_player_write_pcm(pcm, len, tag ? tag : "pcm16");
+    }
     return ret;
 }

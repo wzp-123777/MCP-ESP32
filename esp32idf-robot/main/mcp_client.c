@@ -1,9 +1,11 @@
 #include "mcp_client.h"
 
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "app_config.h"
 #include "app_ui.h"
@@ -36,9 +38,18 @@ typedef enum {
     MCP_STATUS_ERROR,
 } mcp_status_t;
 
+typedef enum {
+    TTS_PLAY_ITEM_WAV,
+    TTS_PLAY_ITEM_PCM,
+    TTS_PLAY_ITEM_END,
+} tts_play_item_kind_t;
+
 typedef struct {
-    uint8_t *wav;
-    size_t wav_len;
+    tts_play_item_kind_t kind;
+    uint8_t *data;
+    size_t len;
+    uint32_t segment_no;
+    bool preroll;
 } tts_play_item_t;
 
 typedef enum {
@@ -83,16 +94,29 @@ static char s_tts_b64_pending[4];
 static size_t s_tts_b64_pending_len;
 static size_t s_tts_chunk_count;
 static size_t s_tts_b64_chars;
+static uint32_t s_tts_segment_no;
+static bool s_tts_pcm_active;
+static bool s_tts_pcm_first_chunk;
+static uint32_t s_tts_pcm_chunk_no;
 static char s_current_session_id[32];
 static app_ui_assistant_state_t s_last_ui_state = APP_UI_STATE_IDLE;
 static TickType_t s_last_ui_state_tick;
+static volatile bool s_assistant_busy;
+static char s_cfg_persona_id[48] = "default";
+static char s_cfg_persona_label[64] = "默认人设";
+static char s_cfg_voice_id[48] = "default";
+static char s_cfg_voice_label[64] = "默认音色";
+static bool s_cfg_continuous_chat;
+static bool s_cfg_wake_enabled;
+static bool s_cfg_valid;
 
 #define MCP_WIFI_CONNECTED_BIT BIT0
 #define MCP_SEND_TIMEOUT pdMS_TO_TICKS(3000)
 #define MCP_MAX_RX_MESSAGE (256 * 1024)
 #define MCP_MAX_TTS_BYTES (384 * 1024)
 #define MCP_MIN_TTS_BYTES 1024
-#define MCP_TTS_PLAY_QUEUE_LEN 4
+#define MCP_TTS_PLAY_QUEUE_LEN 12
+#define MCP_TTS_QUEUE_WAIT_MS 250
 #define MCP_UI_EVENT_QUEUE_LEN 8
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
@@ -103,17 +127,27 @@ static void websocket_request_recreate(void);
 static void tts_play_task(void *arg);
 static void ui_event_task(void *arg);
 static const char *json_get_string(const char *json, const char *key, char *out, size_t out_size);
+static bool json_get_uint32(const char *json, const char *key, uint32_t *out);
+static esp_err_t send_config_payload(const char *persona_id,
+                                     const char *persona_label,
+                                     const char *voice_id,
+                                     const char *voice_label,
+                                     bool continuous_chat,
+                                     bool wake_enabled);
 
 static void start_sntp_once(void)
 {
     if (s_sntp_started) {
         return;
     }
+    setenv("TZ", "CST-8", 1);
+    tzset();
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
+    sntp_setservername(0, "ntp.aliyun.com");
+    sntp_setservername(1, "cn.pool.ntp.org");
     sntp_init();
     s_sntp_started = true;
-    ESP_LOGI(TAG, "sntp started");
+    ESP_LOGI(TAG, "sntp started tz=UTC+8");
 }
 
 static app_ui_assistant_state_t assistant_state_from_status(const char *status)
@@ -215,6 +249,9 @@ static bool should_apply_ui_state(app_ui_assistant_state_t next)
     TickType_t now = xTaskGetTickCount();
     if (next == APP_UI_STATE_ERROR || next == APP_UI_STATE_RECORDING || next == APP_UI_STATE_OFFLINE) {
         return true;
+    }
+    if (next == APP_UI_STATE_IDLE && s_tts_pcm_active) {
+        return false;
     }
     if (next == APP_UI_STATE_IDLE &&
         (s_last_ui_state == APP_UI_STATE_PLAYING || s_last_ui_state == APP_UI_STATE_TTS) &&
@@ -324,6 +361,37 @@ static bool json_get_string_span(const char *json, const char *key, const char *
         ++p;
     }
     return false;
+}
+
+static bool json_get_uint32(const char *json, const char *key, uint32_t *out)
+{
+    if (!json || !key || !out) {
+        return false;
+    }
+
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) {
+        return false;
+    }
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) {
+        return false;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        ++p;
+    }
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    unsigned long value = strtoul(p, NULL, 10);
+    if (value > UINT32_MAX) {
+        value = UINT32_MAX;
+    }
+    *out = (uint32_t)value;
+    return true;
 }
 
 static void json_escape(const char *in, char *out, size_t out_size)
@@ -466,6 +534,53 @@ static bool tts_reserve(size_t needed)
     return true;
 }
 
+static bool decode_base64_alloc_span(const char *audio_b64, size_t b64_len, uint8_t **out, size_t *out_len)
+{
+    if (!audio_b64 || b64_len == 0 || !out || !out_len) {
+        return false;
+    }
+    *out = NULL;
+    *out_len = 0;
+
+    size_t tmp_cap = ((b64_len + 3) / 4) * 3 + 8;
+    uint8_t *tmp = heap_caps_malloc(tmp_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tmp) {
+        tmp = heap_caps_malloc(tmp_cap, MALLOC_CAP_8BIT);
+    }
+    if (!tmp) {
+        return false;
+    }
+
+    size_t decoded_len = 0;
+    int rc = mbedtls_base64_decode(tmp, tmp_cap, &decoded_len, (const unsigned char *)audio_b64, b64_len);
+    if (rc != 0 || decoded_len == 0) {
+        ESP_LOGW(TAG, "pcm base64 decode failed rc=%d len=%u", rc, (unsigned)b64_len);
+        heap_caps_free(tmp);
+        return false;
+    }
+
+    *out = tmp;
+    *out_len = decoded_len;
+    return true;
+}
+
+static bool tts_queue_item(tts_play_item_t *item, const char *label)
+{
+    TickType_t wait_ticks = pdMS_TO_TICKS(MCP_TTS_QUEUE_WAIT_MS);
+    if (item && item->kind == TTS_PLAY_ITEM_WAV) {
+        wait_ticks = pdMS_TO_TICKS(500);
+    }
+    if (!item || !s_tts_play_queue || xQueueSend(s_tts_play_queue, item, wait_ticks) != pdTRUE) {
+        ESP_LOGW(TAG, "%s queue full, dropped len=%u", label ? label : "tts", item ? (unsigned)item->len : 0);
+        if (item && item->data) {
+            heap_caps_free(item->data);
+            item->data = NULL;
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool tts_decode_base64_block(const char *audio_b64, size_t b64_len)
 {
     if (!audio_b64 || b64_len == 0) {
@@ -570,21 +685,26 @@ static bool tts_flush_base64_pending(void)
 static void tts_finish(void)
 {
     if (!tts_flush_base64_pending()) {
+        s_assistant_busy = false;
         tts_reset();
         return;
     }
     if (!s_tts_buf || s_tts_len <= 44) {
+        s_assistant_busy = false;
         tts_reset();
         return;
     }
     if (s_tts_len < MCP_MIN_TTS_BYTES) {
         ESP_LOGW(TAG, "tts too small, dropped len=%u", (unsigned)s_tts_len);
+        s_assistant_busy = false;
         tts_reset();
         return;
     }
     tts_play_item_t item = {
-        .wav = s_tts_buf,
-        .wav_len = s_tts_len,
+        .kind = TTS_PLAY_ITEM_WAV,
+        .data = s_tts_buf,
+        .len = s_tts_len,
+        .segment_no = s_tts_segment_no,
     };
     s_tts_buf = NULL;
     s_tts_len = 0;
@@ -593,13 +713,12 @@ static void tts_finish(void)
     s_tts_chunk_count = 0;
     s_tts_b64_chars = 0;
 
-    if (!s_tts_play_queue || xQueueSend(s_tts_play_queue, &item, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "tts play queue full, dropped len=%u", (unsigned)item.wav_len);
-        heap_caps_free(item.wav);
+    if (!tts_queue_item(&item, "tts wav")) {
+        s_assistant_busy = false;
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
         return;
     }
-    ESP_LOGI(TAG, "tts queued len=%u", (unsigned)item.wav_len);
+    ESP_LOGI(TAG, "tts queued len=%u", (unsigned)item.len);
     ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_TTS, NULL);
 }
 
@@ -611,15 +730,42 @@ static void tts_play_task(void *arg)
         if (xQueueReceive(s_tts_play_queue, &item, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (!item.wav || item.wav_len == 0) {
+        if (item.kind == TTS_PLAY_ITEM_END) {
+            ESP_LOGI(TAG, "tts pcm stream end chunks=%u", (unsigned)item.segment_no);
+            s_tts_pcm_active = false;
+            s_tts_pcm_first_chunk = false;
+            s_assistant_busy = false;
+            ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
             continue;
         }
+        if (!item.data || item.len == 0) {
+            continue;
+        }
+        s_assistant_busy = true;
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_PLAYING, NULL);
-        esp_err_t ret = audio_player_play_wav(item.wav, item.wav_len, "tts");
-        ESP_LOGI(TAG, "tts play finished len=%u ret=%s", (unsigned)item.wav_len, esp_err_to_name(ret));
-        heap_caps_free(item.wav);
-        item.wav = NULL;
-        item.wav_len = 0;
+        if (item.kind == TTS_PLAY_ITEM_PCM) {
+            esp_err_t ret = audio_player_play_pcm16(item.data, item.len, "tts_pcm", item.preroll);
+            ESP_LOGD(TAG,
+                     "tts pcm played chunk=%u len=%u ret=%s",
+                     (unsigned)item.segment_no,
+                     (unsigned)item.len,
+                     esp_err_to_name(ret));
+            heap_caps_free(item.data);
+            item.data = NULL;
+            item.len = 0;
+            continue;
+        }
+
+        bool first_segment = item.segment_no == 0;
+        esp_err_t ret = audio_player_play_wav_ex(item.data, item.len, "tts", first_segment, first_segment ? 30 : 0);
+        ESP_LOGI(TAG,
+                 "tts play finished segment=%u len=%u ret=%s",
+                 (unsigned)item.segment_no,
+                 (unsigned)item.len,
+                 esp_err_to_name(ret));
+        heap_caps_free(item.data);
+        item.data = NULL;
+        item.len = 0;
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
     }
 }
@@ -636,16 +782,23 @@ static void ui_event_task(void *arg)
             case MCP_UI_EVENT_CONNECTED:
                 app_ui_set_mcp_connected(true);
                 app_ui_set_assistant_state(APP_UI_STATE_IDLE);
+                s_assistant_busy = false;
                 s_last_ui_state = APP_UI_STATE_IDLE;
                 s_last_ui_state_tick = xTaskGetTickCount();
                 break;
             case MCP_UI_EVENT_DISCONNECTED:
                 app_ui_set_mcp_connected(false);
+                s_assistant_busy = false;
                 s_last_ui_state = APP_UI_STATE_OFFLINE;
                 s_last_ui_state_tick = xTaskGetTickCount();
                 break;
             case MCP_UI_EVENT_STATUS:
                 app_ui_note_mcp_activity();
+                if (event.state == APP_UI_STATE_IDLE) {
+                    s_assistant_busy = false;
+                } else if (event.state != APP_UI_STATE_RECORDING) {
+                    s_assistant_busy = true;
+                }
                 if (should_apply_ui_state(event.state)) {
                     app_ui_set_assistant_state(event.state);
                     s_last_ui_state = event.state;
@@ -657,10 +810,12 @@ static void ui_event_task(void *arg)
                 break;
             case MCP_UI_EVENT_TEXT:
                 app_ui_note_mcp_activity();
+                s_assistant_busy = false;
                 app_ui_set_recent_text(event.text);
                 break;
             case MCP_UI_EVENT_ERROR:
                 app_ui_note_mcp_activity();
+                s_assistant_busy = false;
                 app_ui_set_assistant_state(APP_UI_STATE_ERROR);
                 s_last_ui_state = APP_UI_STATE_ERROR;
                 s_last_ui_state_tick = xTaskGetTickCount();
@@ -705,19 +860,104 @@ static void handle_ws_text(const char *message)
         return;
     }
 
+    if (strcmp(type, "config_ack") == 0) {
+        ESP_LOGI(TAG, "config ack");
+        return;
+    }
+
     if (strcmp(type, "assistant_error") == 0 || strcmp(type, "tts_error") == 0 || strcmp(type, "vision_error") == 0) {
         json_get_string(message, "error", text, sizeof(text));
         ESP_LOGW(TAG, "%s: %s", type, text);
         if (strcmp(type, "tts_error") == 0) {
             tts_reset();
         }
+        s_tts_pcm_active = false;
+        s_tts_pcm_first_chunk = false;
+        s_assistant_busy = false;
         ui_post_event(MCP_UI_EVENT_ERROR, APP_UI_STATE_ERROR, text);
+        return;
+    }
+
+    if (strcmp(type, "tts_pcm_start") == 0) {
+        uint32_t sample_rate = 16000;
+        uint32_t sample_bits = 16;
+        uint32_t channels = 1;
+        json_get_string(message, "text", text, sizeof(text));
+        json_get_uint32(message, "sample_rate", &sample_rate);
+        json_get_uint32(message, "sample_bits", &sample_bits);
+        json_get_uint32(message, "channels", &channels);
+        tts_reset();
+        s_tts_pcm_chunk_no = 0;
+        s_tts_pcm_first_chunk = true;
+        s_tts_pcm_active = (sample_rate == 16000 && sample_bits == 16 && channels == 1);
+        s_assistant_busy = true;
+        ESP_LOGI(TAG,
+                 "tts pcm start rate=%u bits=%u ch=%u text=%s",
+                 (unsigned)sample_rate,
+                 (unsigned)sample_bits,
+                 (unsigned)channels,
+                 text);
+        if (!s_tts_pcm_active) {
+            s_assistant_busy = false;
+            ui_post_event(MCP_UI_EVENT_ERROR, APP_UI_STATE_ERROR, "unsupported pcm tts format");
+            return;
+        }
+        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_TTS, text[0] ? text : NULL);
+        return;
+    }
+
+    if (strcmp(type, "tts_pcm_chunk") == 0) {
+        const char *audio_b64 = NULL;
+        size_t audio_b64_len = 0;
+        if (!s_tts_pcm_active) {
+            s_tts_pcm_active = true;
+            s_tts_pcm_first_chunk = true;
+            s_tts_pcm_chunk_no = 0;
+        }
+        s_assistant_busy = true;
+        if (json_get_string_span(message, "audio_b64", &audio_b64, &audio_b64_len)) {
+            uint8_t *pcm = NULL;
+            size_t pcm_len = 0;
+            if (!decode_base64_alloc_span(audio_b64, audio_b64_len, &pcm, &pcm_len)) {
+                return;
+            }
+            tts_play_item_t item = {
+                .kind = TTS_PLAY_ITEM_PCM,
+                .data = pcm,
+                .len = pcm_len,
+                .segment_no = s_tts_pcm_chunk_no++,
+                .preroll = s_tts_pcm_first_chunk,
+            };
+            if (tts_queue_item(&item, "tts pcm")) {
+                s_tts_pcm_first_chunk = false;
+            }
+        } else {
+            ESP_LOGW(TAG, "tts pcm audio_b64 missing or escaped");
+        }
+        return;
+    }
+
+    if (strcmp(type, "tts_pcm_end") == 0) {
+        tts_play_item_t item = {
+            .kind = TTS_PLAY_ITEM_END,
+            .segment_no = s_tts_pcm_chunk_no,
+        };
+        if (!tts_queue_item(&item, "tts pcm end")) {
+            s_tts_pcm_active = false;
+            s_tts_pcm_first_chunk = false;
+            s_assistant_busy = false;
+            ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+        }
         return;
     }
 
     if (strcmp(type, "tts_segment_start") == 0) {
         json_get_string(message, "text", text, sizeof(text));
+        json_get_uint32(message, "segment_no", &s_tts_segment_no);
         ESP_LOGI(TAG, "tts segment: %s", text);
+        s_tts_pcm_active = false;
+        s_tts_pcm_first_chunk = false;
+        s_assistant_busy = true;
         if (s_tts_len > 44 || s_tts_b64_pending_len > 0) {
             tts_finish();
         } else {
@@ -751,6 +991,7 @@ static void handle_ws_text(const char *message)
                  (unsigned)s_tts_chunk_count,
                  (unsigned)s_tts_b64_chars,
                  (unsigned)s_tts_len);
+        s_assistant_busy = true;
         tts_finish();
         return;
     }
@@ -958,6 +1199,14 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             ui_post_event(MCP_UI_EVENT_CONNECTED, APP_UI_STATE_IDLE, NULL);
             ESP_LOGI(TAG, "websocket connected");
             mcp_client_send_telemetry();
+            if (s_cfg_valid) {
+                send_config_payload(s_cfg_persona_id,
+                                    s_cfg_persona_label,
+                                    s_cfg_voice_id,
+                                    s_cfg_voice_label,
+                                    s_cfg_continuous_chat,
+                                    s_cfg_wake_enabled);
+            }
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_CLOSED:
@@ -1131,19 +1380,28 @@ bool mcp_client_is_connected(void)
     return s_ws_connected;
 }
 
+bool mcp_client_is_assistant_busy(void)
+{
+    return s_assistant_busy;
+}
+
 esp_err_t mcp_client_send_text_request(const char *text)
 {
     if (!text || !text[0]) {
         return ESP_ERR_INVALID_ARG;
     }
     char escaped[256];
-    char payload[384];
+    char payload[512];
     json_escape(text, escaped, sizeof(escaped));
     snprintf(payload, sizeof(payload), "{\"type\":\"audio_text\",\"device_id\":\"%s\",\"content\":\"%s\"}", ROBOT_DEVICE_ID, escaped);
     ESP_LOGI(TAG, "send text request: %s", text);
     app_ui_set_mcp_status("MCP SEND");
     ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_THINKING, text);
-    return ws_send_json(payload);
+    esp_err_t err = ws_send_json(payload);
+    if (err == ESP_OK) {
+        app_ui_note_mcp_activity();
+    }
+    return err;
 }
 
 esp_err_t mcp_client_audio_stream_begin(const char *session_id)
@@ -1215,6 +1473,68 @@ esp_err_t mcp_client_audio_stream_end(const char *session_id, uint32_t duration_
     return ws_send_json(payload);
 }
 
+static esp_err_t send_config_payload(const char *persona_id,
+                                     const char *persona_label,
+                                     const char *voice_id,
+                                     const char *voice_label,
+                                     bool continuous_chat,
+                                     bool wake_enabled)
+{
+    char persona_id_escaped[48];
+    char persona_label_escaped[64];
+    char voice_id_escaped[48];
+    char voice_label_escaped[64];
+    char payload[512];
+    json_escape(persona_id, persona_id_escaped, sizeof(persona_id_escaped));
+    json_escape(persona_label, persona_label_escaped, sizeof(persona_label_escaped));
+    json_escape(voice_id, voice_id_escaped, sizeof(voice_id_escaped));
+    json_escape(voice_label, voice_label_escaped, sizeof(voice_label_escaped));
+    snprintf(payload,
+             sizeof(payload),
+             "{\"type\":\"client_config\",\"device_id\":\"%s\",\"persona_id\":\"%s\",\"persona_label\":\"%s\","
+             "\"voice_id\":\"%s\",\"voice_label\":\"%s\",\"continuous_chat\":%s,\"wake_enabled\":%s,"
+             "\"wake_word\":\"doubao\"}",
+             ROBOT_DEVICE_ID,
+             persona_id_escaped,
+             persona_label_escaped,
+             voice_id_escaped,
+             voice_label_escaped,
+             continuous_chat ? "true" : "false",
+             wake_enabled ? "true" : "false");
+    ESP_LOGI(TAG, "send client_config persona=%s voice=%s continuous=%d wake=%d",
+             persona_id ? persona_id : "",
+             voice_id ? voice_id : "",
+             continuous_chat,
+             wake_enabled);
+    return ws_send_json(payload);
+}
+
+esp_err_t mcp_client_send_config(const char *persona_id,
+                                 const char *persona_label,
+                                 const char *voice_id,
+                                 const char *voice_label,
+                                 bool continuous_chat,
+                                 bool wake_enabled)
+{
+    strlcpy(s_cfg_persona_id, persona_id ? persona_id : "default", sizeof(s_cfg_persona_id));
+    strlcpy(s_cfg_persona_label, persona_label ? persona_label : "默认人设", sizeof(s_cfg_persona_label));
+    strlcpy(s_cfg_voice_id, voice_id ? voice_id : "default", sizeof(s_cfg_voice_id));
+    strlcpy(s_cfg_voice_label, voice_label ? voice_label : "默认音色", sizeof(s_cfg_voice_label));
+    s_cfg_continuous_chat = continuous_chat;
+    s_cfg_wake_enabled = wake_enabled;
+    s_cfg_valid = true;
+    if (!s_ws_connected) {
+        ESP_LOGI(TAG, "cache client_config until websocket connected");
+        return ESP_OK;
+    }
+    return send_config_payload(s_cfg_persona_id,
+                               s_cfg_persona_label,
+                               s_cfg_voice_id,
+                               s_cfg_voice_label,
+                               s_cfg_continuous_chat,
+                               s_cfg_wake_enabled);
+}
+
 esp_err_t mcp_client_send_telemetry(void)
 {
     if (!s_ws_connected) {
@@ -1232,5 +1552,10 @@ esp_err_t mcp_client_send_telemetry(void)
              (unsigned)esp_get_free_heap_size(),
              rssi,
              (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS));
-    return ws_send_json(payload);
+    esp_err_t err = ws_send_json(payload);
+    if (err == ESP_OK) {
+        app_ui_set_mcp_connected(true);
+        app_ui_note_mcp_activity();
+    }
+    return err;
 }

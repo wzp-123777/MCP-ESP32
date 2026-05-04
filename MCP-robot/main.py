@@ -1357,15 +1357,15 @@ class ConnectionManager:
             await self.esp32_client.send_text(payload)
             self.note_esp32_activity()
             msg_type = str(message.get("type") or "unknown")
-            if msg_type == "tts_audio_chunk":
+            if msg_type in {"tts_audio_chunk", "tts_pcm_chunk"}:
                 audio_b64 = str(message.get("audio_b64") or "")
                 self._esp32_tts_chunk_count += 1
                 self._esp32_tts_b64_chars += len(audio_b64)
-            elif msg_type == "tts_segment_start":
+            elif msg_type in {"tts_segment_start", "tts_pcm_start"}:
                 self._esp32_tts_chunk_count = 0
                 self._esp32_tts_b64_chars = 0
                 logger.info("ESP32 下行消息已发送: type=%s bytes=%d", msg_type, len(payload.encode("utf-8")))
-            elif msg_type == "tts_stream_end":
+            elif msg_type in {"tts_stream_end", "tts_pcm_end"}:
                 logger.info(
                     "ESP32 下行 TTS 音频发送完成: chunks=%d chars=%d",
                     self._esp32_tts_chunk_count,
@@ -1418,6 +1418,19 @@ async def healthz() -> dict[str, Any]:
             "tts": config.tts_model.model,
             "tts_voice": config.tts_voice,
             "tts_style_prompt": config.tts_style_prompt,
+            "esp32_voice": (
+                "doubao-realtime-dialog"
+                if runtime.doubao_dialog.available
+                else "doubao-dialog-config-missing"
+                if config.doubao_dialog.enabled
+                else "legacy-asr-llm-tts"
+            ),
+            "doubao_dialog_enabled": config.doubao_dialog.enabled,
+            "doubao_dialog_configured": runtime.doubao_dialog.available,
+            "doubao_dialog_resource": config.doubao_dialog.resource_id,
+            "doubao_dialog_tts_format": config.doubao_dialog.tts_format,
+            "doubao_dialog_tts_sample_rate": config.doubao_dialog.tts_sample_rate,
+            "doubao_dialog_tts_speaker": config.doubao_dialog.tts_speaker,
         },
         "generic_agent_python": str(config.generic_agent_python),
         "runtime_log": str(config.runtime_log_file),

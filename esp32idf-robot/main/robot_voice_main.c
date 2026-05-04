@@ -20,6 +20,21 @@
 #define CAPTURE_CHUNK_BYTES 4096
 #define DEBUG_REC_MIN_MS 300
 #define DEBUG_REC_MAX_MS 10000
+#define CONT_VAD_START_AVG 520
+#define CONT_VAD_START_PEAK 2600
+#define CONT_VAD_STOP_AVG 260
+#define CONT_VAD_STOP_PEAK 1400
+#define CONT_VAD_START_HITS 2
+#define CONT_VAD_TAIL_MS 950
+#define CONT_VAD_MIN_SPEECH_MS 320
+#define CONT_VAD_MAX_SPEECH_MS 12000
+#define CONT_REARM_DELAY_MS 900
+
+typedef enum {
+    CAPTURE_MODE_NONE = 0,
+    CAPTURE_MODE_PTT,
+    CAPTURE_MODE_CONTINUOUS,
+} capture_mode_t;
 
 typedef enum {
     VOICE_CMD_PLAY_ONCE,
@@ -34,6 +49,10 @@ typedef enum {
     VOICE_CMD_MCP_DISCONNECT,
     VOICE_CMD_SET_PRESS,
     VOICE_CMD_SET_RELEASE,
+    VOICE_CMD_CHAT_TOGGLE,
+    VOICE_CMD_WAKE_TOGGLE,
+    VOICE_CMD_PERSONA_NEXT,
+    VOICE_CMD_VOICE_NEXT,
 } voice_cmd_type_t;
 
 typedef struct {
@@ -47,10 +66,39 @@ static uint8_t s_capture_chunk[CAPTURE_CHUNK_BYTES];
 static size_t s_capture_chunk_len;
 static char s_capture_session_id[32];
 static uint32_t s_capture_seq;
+static capture_mode_t s_capture_mode;
+static bool s_continuous_chat;
+static bool s_continuous_speaking;
+static bool s_wake_enabled;
+static bool s_audio_busy;
+static TickType_t s_cont_speech_start_tick;
+static TickType_t s_cont_last_voice_tick;
+static TickType_t s_cont_rearm_tick;
+static int s_cont_start_hits;
+
+typedef struct {
+    const char *id;
+    const char *label;
+} config_option_t;
+
+static const config_option_t s_personas[] = {
+    {"default", "默认人设"},
+    {"sweet", "甜妹人设"},
+    {"serious", "认真助手"},
+};
+
+static const config_option_t s_voice_profiles[] = {
+    {"default", "默认音色"},
+    {"female_soft", "柔和女声"},
+    {"female_bright", "明亮女声"},
+};
+
+static size_t s_persona_index;
+static size_t s_voice_index;
 
 static void print_help(void)
 {
-    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>, MCP CONNECT, HELP");
+    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT, WAKE, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>, MCP CONNECT, HELP");
 }
 
 static void send_cmd(voice_cmd_type_t type, int value)
@@ -116,13 +164,20 @@ static void on_ui_action(app_ui_action_t action, void *ctx)
             send_cmd_nonblocking(VOICE_CMD_PLAY_ONCE, 0);
             break;
         case APP_UI_ACTION_BLUETOOTH_TOGGLE:
-#if CONFIG_BT_ENABLED
-            app_ui_set_bluetooth_enabled(true);
-            app_ui_set_voice_state("BT TODO");
-#else
             app_ui_set_bluetooth_enabled(false);
             app_ui_set_voice_state("BT DISABLED");
-#endif
+            break;
+        case APP_UI_ACTION_CHAT_TOGGLE:
+            send_cmd_nonblocking(VOICE_CMD_CHAT_TOGGLE, 0);
+            break;
+        case APP_UI_ACTION_WAKE_TOGGLE:
+            send_cmd_nonblocking(VOICE_CMD_WAKE_TOGGLE, 0);
+            break;
+        case APP_UI_ACTION_PERSONA_NEXT:
+            send_cmd_nonblocking(VOICE_CMD_PERSONA_NEXT, 0);
+            break;
+        case APP_UI_ACTION_VOICE_NEXT:
+            send_cmd_nonblocking(VOICE_CMD_VOICE_NEXT, 0);
             break;
     }
 }
@@ -130,6 +185,60 @@ static void on_ui_action(app_ui_action_t action, void *ctx)
 static void on_mic_level(int peak, int avg_abs)
 {
     app_ui_set_mic_level(peak, avg_abs);
+}
+
+static void send_runtime_config(void)
+{
+    const config_option_t *persona = &s_personas[s_persona_index];
+    const config_option_t *voice = &s_voice_profiles[s_voice_index];
+    app_ui_set_chat_continuous(s_continuous_chat);
+    app_ui_set_wake_enabled(s_wake_enabled);
+    app_ui_set_persona(persona->label);
+    app_ui_set_voice_profile(voice->label);
+    esp_err_t err = mcp_client_send_config(persona->id,
+                                           persona->label,
+                                           voice->id,
+                                           voice->label,
+                                           s_continuous_chat,
+                                           s_wake_enabled);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "send config failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void make_capture_session_id(void)
+{
+    snprintf(s_capture_session_id,
+             sizeof(s_capture_session_id),
+             "esp32-%lu-%lu",
+             (unsigned long)xTaskGetTickCount(),
+             (unsigned long)++s_capture_seq);
+}
+
+static int abs16_sample(int16_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static void analyze_pcm_level(const uint8_t *data, int len, int *peak, int *avg_abs)
+{
+    int sample_count = len / (int)sizeof(int16_t);
+    int max_peak = 0;
+    int64_t sum_abs = 0;
+    const int16_t *samples = (const int16_t *)data;
+    for (int i = 0; i < sample_count; ++i) {
+        int level = abs16_sample(samples[i]);
+        if (level > max_peak) {
+            max_peak = level;
+        }
+        sum_abs += level;
+    }
+    if (peak) {
+        *peak = max_peak;
+    }
+    if (avg_abs) {
+        *avg_abs = sample_count > 0 ? (int)(sum_abs / sample_count) : 0;
+    }
 }
 
 static void flush_capture_chunk(void)
@@ -145,10 +254,14 @@ static void flush_capture_chunk(void)
     s_capture_chunk_len = 0;
 }
 
-static void on_capture_audio(const uint8_t *data, int len, void *ctx)
+static void drop_capture_chunk(void)
 {
-    (void)ctx;
-    if (!data || len <= 0 || !mcp_client_is_connected()) {
+    s_capture_chunk_len = 0;
+}
+
+static void append_capture_audio(const uint8_t *data, int len)
+{
+    if (!data || len <= 0 || !mcp_client_is_connected() || s_capture_session_id[0] == '\0') {
         return;
     }
 
@@ -168,8 +281,110 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
     }
 }
 
+static void finish_continuous_utterance(const char *reason)
+{
+    if (!s_continuous_speaking) {
+        return;
+    }
+    bool abort_upload = reason && strcmp(reason, "manual_stop") == 0;
+    if (abort_upload) {
+        drop_capture_chunk();
+    } else {
+        flush_capture_chunk();
+    }
+    TickType_t now = xTaskGetTickCount();
+    uint32_t duration_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
+    if (s_capture_session_id[0] != '\0') {
+        mcp_client_audio_stream_end(s_capture_session_id, duration_ms, reason ? reason : "vad_silence");
+    }
+    ESP_LOGI(TAG, "continuous utterance end reason=%s duration=%ums", reason ? reason : "vad_silence", (unsigned)duration_ms);
+    s_capture_session_id[0] = '\0';
+    s_capture_chunk_len = 0;
+    s_continuous_speaking = false;
+    s_cont_start_hits = 0;
+    s_audio_busy = !abort_upload;
+    s_cont_rearm_tick = now + pdMS_TO_TICKS(CONT_REARM_DELAY_MS);
+    app_ui_set_assistant_state(abort_upload ? APP_UI_STATE_IDLE : APP_UI_STATE_UPLOADING);
+    app_ui_set_mic_state("MIC READY");
+}
+
+static void on_capture_audio(const uint8_t *data, int len, void *ctx)
+{
+    (void)ctx;
+    if (s_capture_mode == CAPTURE_MODE_CONTINUOUS) {
+        if (!data || len <= 0) {
+            return;
+        }
+        TickType_t now = xTaskGetTickCount();
+        int peak = 0;
+        int avg_abs = 0;
+        analyze_pcm_level(data, len, &peak, &avg_abs);
+
+        if (!s_continuous_chat || !mcp_client_is_connected()) {
+            return;
+        }
+        if (s_audio_busy || mcp_client_is_assistant_busy()) {
+            return;
+        }
+        if (now < s_cont_rearm_tick) {
+            return;
+        }
+        if (!s_continuous_speaking) {
+            bool voice_hit = avg_abs >= CONT_VAD_START_AVG || peak >= CONT_VAD_START_PEAK;
+            if (voice_hit) {
+                ++s_cont_start_hits;
+            } else if (s_cont_start_hits > 0) {
+                --s_cont_start_hits;
+            }
+            if (s_cont_start_hits < CONT_VAD_START_HITS) {
+                return;
+            }
+
+            make_capture_session_id();
+            s_capture_chunk_len = 0;
+            esp_err_t err = mcp_client_audio_stream_begin(s_capture_session_id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "continuous stream begin failed: %s", esp_err_to_name(err));
+                s_capture_session_id[0] = '\0';
+                s_cont_start_hits = 0;
+                app_ui_set_mcp_status("MCP SEND FAIL");
+                return;
+            }
+            s_continuous_speaking = true;
+            s_cont_speech_start_tick = now;
+            s_cont_last_voice_tick = now;
+            app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
+            app_ui_set_mic_state("MIC ON");
+            ESP_LOGI(TAG, "continuous utterance start avg=%d peak=%d", avg_abs, peak);
+        }
+
+        append_capture_audio(data, len);
+        bool voice_active = avg_abs >= CONT_VAD_STOP_AVG || peak >= CONT_VAD_STOP_PEAK;
+        if (voice_active) {
+            s_cont_last_voice_tick = now;
+        }
+        uint32_t speech_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
+        uint32_t silence_ms = (uint32_t)((now - s_cont_last_voice_tick) * portTICK_PERIOD_MS);
+        if ((speech_ms >= CONT_VAD_MIN_SPEECH_MS && silence_ms >= CONT_VAD_TAIL_MS) ||
+            speech_ms >= CONT_VAD_MAX_SPEECH_MS) {
+            finish_continuous_utterance(speech_ms >= CONT_VAD_MAX_SPEECH_MS ? "vad_max" : "vad_silence");
+        }
+        return;
+    }
+
+    append_capture_audio(data, len);
+}
+
 static void start_set_capture(void)
 {
+    if (s_audio_busy) {
+        ESP_LOGW(TAG, "SET ignored: assistant audio busy");
+        return;
+    }
+    if (s_capture_mode == CAPTURE_MODE_CONTINUOUS) {
+        ESP_LOGW(TAG, "SET ignored: continuous chat is active");
+        return;
+    }
     if (!mcp_client_is_connected()) {
         ESP_LOGW(TAG, "SET ignored: MCP not connected");
         app_ui_set_mcp_status(mcp_client_get_status_text());
@@ -180,12 +395,9 @@ static void start_set_capture(void)
         return;
     }
 
-    snprintf(s_capture_session_id,
-             sizeof(s_capture_session_id),
-             "esp32-%lu-%lu",
-             (unsigned long)xTaskGetTickCount(),
-             (unsigned long)++s_capture_seq);
+    make_capture_session_id();
     s_capture_chunk_len = 0;
+    s_capture_mode = CAPTURE_MODE_PTT;
 
     esp_err_t err = mcp_client_audio_stream_begin(s_capture_session_id);
     if (err != ESP_OK) {
@@ -208,15 +420,98 @@ static void start_set_capture(void)
 
 static void stop_set_capture(void)
 {
-    if (!mic_diag_is_capturing()) {
+    if (s_capture_mode != CAPTURE_MODE_PTT || !mic_diag_is_capturing()) {
         return;
     }
 
     uint32_t duration_ms = mic_diag_capture_stop();
     flush_capture_chunk();
     mcp_client_audio_stream_end(s_capture_session_id, duration_ms, "set_release");
+    s_capture_session_id[0] = '\0';
+    s_capture_mode = CAPTURE_MODE_NONE;
     app_ui_set_assistant_state(APP_UI_STATE_UPLOADING);
     app_ui_set_mic_state("MIC READY");
+}
+
+static void start_continuous_chat(void)
+{
+    if (s_continuous_chat) {
+        return;
+    }
+    if (!mcp_client_is_connected()) {
+        app_ui_set_mcp_status(mcp_client_get_status_text());
+        app_ui_set_assistant_state(APP_UI_STATE_OFFLINE);
+        return;
+    }
+    if (mic_diag_is_capturing() && s_capture_mode == CAPTURE_MODE_PTT) {
+        stop_set_capture();
+    }
+    s_continuous_chat = true;
+    s_continuous_speaking = false;
+    s_capture_mode = CAPTURE_MODE_CONTINUOUS;
+    s_audio_busy = false;
+    s_cont_start_hits = 0;
+    s_capture_session_id[0] = '\0';
+    s_capture_chunk_len = 0;
+
+    esp_err_t err = mic_diag_capture_start(on_capture_audio, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "continuous mic start failed: %s", esp_err_to_name(err));
+        s_capture_mode = CAPTURE_MODE_NONE;
+        s_continuous_chat = false;
+        app_ui_set_mic_state("MIC ERROR");
+        app_ui_set_chat_continuous(false);
+        return;
+    }
+    app_ui_set_chat_continuous(true);
+    app_ui_set_assistant_state(APP_UI_STATE_IDLE);
+    app_ui_set_mic_state("MIC ON");
+    app_ui_set_voice_state("VOICE READY");
+    send_runtime_config();
+    ESP_LOGI(TAG, "continuous chat enabled");
+}
+
+static void stop_continuous_chat(void)
+{
+    if (!s_continuous_chat && s_capture_mode != CAPTURE_MODE_CONTINUOUS) {
+        return;
+    }
+    if (s_continuous_speaking) {
+        finish_continuous_utterance("manual_stop");
+    }
+    if (mic_diag_is_capturing() && s_capture_mode == CAPTURE_MODE_CONTINUOUS) {
+        mic_diag_capture_stop();
+    }
+    s_continuous_chat = false;
+    s_continuous_speaking = false;
+    s_capture_mode = CAPTURE_MODE_NONE;
+    s_audio_busy = false;
+    s_cont_start_hits = 0;
+    s_capture_session_id[0] = '\0';
+    s_capture_chunk_len = 0;
+    app_ui_set_chat_continuous(false);
+    app_ui_set_assistant_state(APP_UI_STATE_IDLE);
+    app_ui_set_mic_state("MIC READY");
+    send_runtime_config();
+    ESP_LOGI(TAG, "continuous chat disabled");
+}
+
+static void toggle_continuous_chat(void)
+{
+    if (s_continuous_chat) {
+        stop_continuous_chat();
+    } else {
+        start_continuous_chat();
+    }
+}
+
+static void mark_assistant_audio_busy(bool busy)
+{
+    s_audio_busy = busy;
+    if (!busy && s_continuous_chat) {
+        s_cont_rearm_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONT_REARM_DELAY_MS);
+        s_cont_start_hits = 0;
+    }
 }
 
 static void on_button_event(app_button_event_t event, void *ctx)
@@ -265,9 +560,11 @@ static void playback_task(void *arg)
 
         switch (cmd.type) {
             case VOICE_CMD_PLAY_ONCE:
+                mark_assistant_audio_busy(true);
                 app_ui_set_assistant_state(APP_UI_STATE_PLAYING);
                 audio_player_play_xiaole();
                 app_ui_set_assistant_state(APP_UI_STATE_IDLE);
+                mark_assistant_audio_busy(false);
                 if (loop_enabled) {
                     vTaskDelay(pdMS_TO_TICKS(VOICE_LOOP_GAP_MS));
                 }
@@ -307,6 +604,7 @@ static void playback_task(void *arg)
                 app_ui_set_mcp_status(mcp_client_get_status_text());
                 break;
             case VOICE_CMD_MCP_DISCONNECT:
+                stop_continuous_chat();
                 mcp_client_disconnect();
                 app_ui_set_mcp_status(mcp_client_get_status_text());
                 break;
@@ -315,6 +613,28 @@ static void playback_task(void *arg)
                 break;
             case VOICE_CMD_SET_RELEASE:
                 stop_set_capture();
+                break;
+            case VOICE_CMD_CHAT_TOGGLE:
+                toggle_continuous_chat();
+                break;
+            case VOICE_CMD_WAKE_TOGGLE:
+                s_wake_enabled = !s_wake_enabled;
+                app_ui_set_wake_enabled(s_wake_enabled);
+                app_ui_set_voice_state(s_wake_enabled ? "WAKE TODO" : "VOICE READY");
+                send_runtime_config();
+                ESP_LOGI(TAG, "wake word UI flag=%d; offline WakeNet not linked", s_wake_enabled);
+                break;
+            case VOICE_CMD_PERSONA_NEXT:
+                s_persona_index = (s_persona_index + 1) % (sizeof(s_personas) / sizeof(s_personas[0]));
+                app_ui_set_persona(s_personas[s_persona_index].label);
+                send_runtime_config();
+                ESP_LOGI(TAG, "persona=%s", s_personas[s_persona_index].id);
+                break;
+            case VOICE_CMD_VOICE_NEXT:
+                s_voice_index = (s_voice_index + 1) % (sizeof(s_voice_profiles) / sizeof(s_voice_profiles[0]));
+                app_ui_set_voice_profile(s_voice_profiles[s_voice_index].label);
+                send_runtime_config();
+                ESP_LOGI(TAG, "voice_profile=%s", s_voice_profiles[s_voice_index].id);
                 break;
         }
     }
@@ -354,6 +674,14 @@ static void command_task(void *arg)
 
         if (strcmp(line, "PLAY") == 0 || strcmp(line, "XIAOLE") == 0) {
             send_cmd(VOICE_CMD_PLAY_ONCE, 0);
+        } else if (strcmp(line, "CHAT") == 0) {
+            send_cmd(VOICE_CMD_CHAT_TOGGLE, 0);
+        } else if (strcmp(line, "WAKE") == 0) {
+            send_cmd(VOICE_CMD_WAKE_TOGGLE, 0);
+        } else if (strcmp(line, "PERSONA") == 0) {
+            send_cmd(VOICE_CMD_PERSONA_NEXT, 0);
+        } else if (strcmp(line, "VOICE") == 0) {
+            send_cmd(VOICE_CMD_VOICE_NEXT, 0);
         } else if (strcmp(line, "LOOP") == 0) {
             send_cmd(VOICE_CMD_LOOP, 0);
         } else if (strcmp(line, "STOP") == 0) {
@@ -431,12 +759,11 @@ void app_main(void)
     app_ui_set_action_callback(on_ui_action, NULL);
     app_ui_set_volume(audio_player_get_volume());
     app_ui_set_voice_state("VOICE READY");
-#if CONFIG_BT_ENABLED
-    app_ui_set_bluetooth_available(true);
-    app_ui_set_bluetooth_enabled(false);
-#else
     app_ui_set_bluetooth_available(false);
-#endif
+    app_ui_set_chat_continuous(false);
+    app_ui_set_wake_enabled(false);
+    app_ui_set_persona(s_personas[s_persona_index].label);
+    app_ui_set_voice_profile(s_voice_profiles[s_voice_index].label);
 
     if (mic_diag_init(on_mic_level) != ESP_OK) {
         ESP_LOGW(TAG, "mic diag init failed; MIC commands unavailable");
@@ -445,6 +772,7 @@ void app_main(void)
 
     mcp_client_init();
     app_ui_set_mcp_status(mcp_client_get_status_text());
+    send_runtime_config();
 
     s_cmd_queue = xQueueCreate(16, sizeof(voice_cmd_t));
     if (!s_cmd_queue) {

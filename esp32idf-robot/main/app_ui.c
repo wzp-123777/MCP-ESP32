@@ -27,12 +27,12 @@
 #define UI_H LCD_V_RES
 #define UI_DRAW_LINES 40
 #define UI_LEVEL_REFRESH_MS 200
-#define UI_LOOP_INTERVAL_MS 20
-#define UI_RENDER_INTERVAL_MS 150
+#define UI_LOOP_INTERVAL_MS 50
+#define UI_RENDER_INTERVAL_MS 300
 #define UI_CLOCK_REFRESH_MS 1000
-#define UI_MCP_OFFLINE_TIMEOUT_MS 10000
+#define UI_MCP_OFFLINE_TIMEOUT_MS 45000
 #define UI_LVGL_TICK_MS 5
-#define UI_PAGE_COUNT 5
+#define UI_PAGE_COUNT 6
 #define UI_ACTION_QUEUE_LEN 8
 #define UI_TOUCH_I2C_CLK 100000
 #define UI_TOUCH_TT21100_ADDR 0x24
@@ -53,14 +53,14 @@
 #define UI_TOUCH_MIRROR_X 0
 #define UI_TOUCH_MIRROR_Y 0
 
-#define UI_BG_COLOR 0xFFF5FA
-#define UI_PANEL_COLOR 0xFFFCFE
-#define UI_SOFT_PANEL_COLOR 0xFFF0F7
-#define UI_BORDER_COLOR 0xF0CFE0
-#define UI_TEXT_COLOR 0x51394A
-#define UI_MUTED_COLOR 0x9A7F90
-#define UI_ACCENT_COLOR 0xEF8ABC
-#define UI_ACCENT_SOFT_COLOR 0xFFD9EA
+#define UI_BG_COLOR 0xFFEAF5
+#define UI_PANEL_COLOR 0xFFF8FC
+#define UI_SOFT_PANEL_COLOR 0xFFE3F1
+#define UI_BORDER_COLOR 0xE7AFCB
+#define UI_TEXT_COLOR 0x3D2636
+#define UI_MUTED_COLOR 0x836A7A
+#define UI_ACCENT_COLOR 0xE96EAA
+#define UI_ACCENT_SOFT_COLOR 0xFFC8E3
 #define UI_OK_COLOR 0x35B86D
 #define UI_BLUE_COLOR 0x57A6D8
 #define UI_ERROR_COLOR 0xE34D6F
@@ -84,6 +84,7 @@ static lv_indev_drv_t s_touch_drv;
 static uint8_t s_touch_addr;
 static bool s_touch_is_gt911;
 static bool s_touch_ready;
+static bool s_touch_input_registered;
 static bool s_touch_pressed;
 static int16_t s_touch_x = UI_W / 2;
 static int16_t s_touch_y = UI_H / 2;
@@ -102,7 +103,11 @@ static char s_voice_state[32] = "VOICE READY";
 static char s_mic_state[32] = "MIC OFF";
 static char s_mcp_status[48] = "MCP NOT CONFIGURED";
 static char s_recent_text[128] = "";
+static char s_persona_label[64] = "默认人设";
+static char s_voice_profile_label[64] = "默认音色";
 static int s_volume = 45;
+static bool s_chat_continuous;
+static bool s_wake_enabled;
 static int s_mic_peak;
 static int s_mic_avg;
 static uint8_t s_page;
@@ -110,6 +115,8 @@ static TickType_t s_last_level_render_tick;
 static TickType_t s_last_mcp_activity_tick;
 static TickType_t s_last_render_tick;
 static TickType_t s_last_clock_tick;
+static bool s_first_screen_invalidated;
+static bool s_first_handler_done;
 static app_ui_action_cb_t s_action_cb;
 static void *s_action_ctx;
 static QueueHandle_t s_action_queue;
@@ -129,8 +136,6 @@ static lv_obj_t *s_state_label;
 static lv_obj_t *s_state_caption_label;
 static lv_obj_t *s_status_track;
 static lv_obj_t *s_status_line;
-static lv_obj_t *s_recent_label;
-static lv_obj_t *s_reply_label;
 static lv_obj_t *s_talk_button;
 static lv_obj_t *s_talk_button_label;
 
@@ -144,6 +149,9 @@ static lv_obj_t *s_net_endpoint_label;
 static lv_obj_t *s_set_bt_label;
 static lv_obj_t *s_set_time_label;
 static lv_obj_t *s_set_status_label;
+static lv_obj_t *s_set_persona_label;
+static lv_obj_t *s_set_voice_label;
+static lv_obj_t *s_set_wake_label;
 
 static lv_obj_t *s_dbg_network_label;
 static lv_obj_t *s_dbg_audio_label;
@@ -155,6 +163,7 @@ static lv_obj_t *s_mic_bar;
 static void emit_action(app_ui_action_t action);
 static void action_dispatch_task(void *arg);
 static void set_page_locked(uint8_t page);
+static void apply_ui_locked(void);
 
 static const char *state_text(app_ui_assistant_state_t state)
 {
@@ -185,7 +194,7 @@ static const char *state_caption(app_ui_assistant_state_t state)
 {
     switch (state) {
         case APP_UI_STATE_RECORDING:
-            return "按住 SET，松开发送";
+            return s_chat_continuous ? "常态聊天正在听" : "按住 SET，松开发送";
         case APP_UI_STATE_UPLOADING:
             return "正在上传音频";
         case APP_UI_STATE_ASR:
@@ -202,7 +211,7 @@ static const char *state_caption(app_ui_assistant_state_t state)
             return "网络或 MCP 离线";
         case APP_UI_STATE_IDLE:
         default:
-            return "待机，按住说话";
+            return s_chat_continuous ? "常态聊天待机" : "待机，按住说话";
     }
 }
 
@@ -216,6 +225,8 @@ static const char *page_title(uint8_t page)
         case 3:
             return "设置";
         case 4:
+            return "人设";
+        case 5:
             return "调试";
         case 0:
         default:
@@ -244,7 +255,7 @@ static const char *home_state_hint(app_ui_assistant_state_t state)
             return "打开网络页重连";
         case APP_UI_STATE_IDLE:
         default:
-            return "点击对话开始";
+            return s_chat_continuous ? "常态聊天已开启" : "点击对话开始";
     }
 }
 
@@ -308,6 +319,9 @@ static const char *voice_state_zh(const char *state)
     }
     if (strcmp(state, "BT TODO") == 0) {
         return "蓝牙待接入";
+    }
+    if (strcmp(state, "WAKE TODO") == 0) {
+        return "唤醒待接入";
     }
     return state;
 }
@@ -431,6 +445,16 @@ static void copy_limited_text(char *dst, size_t dst_size, const char *src)
     dst[n] = '\0';
 }
 
+static void join_text2(char *dst, size_t dst_size, const char *a, const char *b)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    strlcpy(dst, a ? a : "", dst_size);
+    strlcat(dst, b ? b : "", dst_size);
+}
+
 static void format_clock(char *dst, size_t dst_size)
 {
     if (!dst || dst_size == 0) {
@@ -456,9 +480,8 @@ static void lv_tick_cb(void *arg)
 
 static void lv_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
-    (void)drv;
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_map);
-    lv_disp_flush_ready(&s_disp_drv);
+    lv_disp_flush_ready(drv);
 }
 
 static uint16_t read_le16(const uint8_t *data)
@@ -779,13 +802,22 @@ static esp_err_t init_touch(void)
     }
     s_touch_ready = true;
 
+    ESP_LOGI(TAG, "%s touch controller ready: addr=0x%02X swap=%d mirror=(%d,%d)",
+             controller, s_touch_addr, UI_TOUCH_SWAP_XY, UI_TOUCH_MIRROR_X, UI_TOUCH_MIRROR_Y);
+    return ESP_OK;
+}
+
+static void register_touch_input(void)
+{
+    if (!s_touch_ready || s_touch_input_registered) {
+        return;
+    }
     lv_indev_drv_init(&s_touch_drv);
     s_touch_drv.type = LV_INDEV_TYPE_POINTER;
     s_touch_drv.read_cb = touch_read_cb;
     lv_indev_drv_register(&s_touch_drv);
-    ESP_LOGI(TAG, "%s touch input ready: addr=0x%02X swap=%d mirror=(%d,%d)",
-             controller, s_touch_addr, UI_TOUCH_SWAP_XY, UI_TOUCH_MIRROR_X, UI_TOUCH_MIRROR_Y);
-    return ESP_OK;
+    s_touch_input_registered = true;
+    ESP_LOGI(TAG, "touch input registered");
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color)
@@ -910,25 +942,39 @@ static lv_obj_t *make_text_button(lv_obj_t *parent,
     return btn;
 }
 
+static lv_obj_t *make_action_button(lv_obj_t *parent,
+                                    int x,
+                                    int y,
+                                    int w,
+                                    int h,
+                                    const char *text,
+                                    lv_color_t bg,
+                                    app_ui_action_t action)
+{
+    lv_obj_t *btn = make_text_button(parent, x, y, w, h, text, bg, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_add_event_cb(btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)action);
+    return btn;
+}
+
 static lv_obj_t *make_app_button(lv_obj_t *parent, int x, int y, const char *icon, const char *name, uint8_t page)
 {
     lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, 64, 64);
+    lv_obj_set_size(btn, 58, 58);
     lv_obj_set_pos(btn, x, y);
     button_style(btn, lv_color_hex(UI_PANEL_COLOR), lv_color_hex(UI_BORDER_COLOR));
     lv_obj_add_event_cb(btn, page_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)page);
 
     lv_obj_t *icon_label = make_label(btn, UI_FONT_CJK, lv_color_hex(UI_ACCENT_COLOR));
     lv_label_set_text(icon_label, icon);
-    lv_obj_set_width(icon_label, 54);
+    lv_obj_set_width(icon_label, 48);
     lv_obj_set_style_text_align(icon_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(icon_label, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_align(icon_label, LV_ALIGN_TOP_MID, 0, 6);
 
     lv_obj_t *name_label = make_label(btn, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
     lv_label_set_text(name_label, name);
-    lv_obj_set_width(name_label, 58);
+    lv_obj_set_width(name_label, 52);
     lv_obj_set_style_text_align(name_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(name_label, LV_ALIGN_BOTTOM_MID, 0, -7);
+    lv_obj_align(name_label, LV_ALIGN_BOTTOM_MID, 0, -5);
     return btn;
 }
 
@@ -1074,17 +1120,21 @@ static void create_home_page(lv_obj_t *page)
     lv_obj_set_size(s_home_status_label, UI_W - 154, 40);
     lv_obj_set_pos(s_home_status_label, 142, 52);
 
-    make_app_button(page, 18, 108, "聊", "对话", 1);
-    make_app_button(page, 94, 108, "网", "网络", 2);
-    make_app_button(page, 170, 108, "设", "设置", 3);
-    make_app_button(page, 246, 108, "调", "调试", 4);
+    make_app_button(page, 16, 104, "聊", "对话", 1);
+    make_app_button(page, 83, 104, "网", "网络", 2);
+    make_app_button(page, 150, 104, "设", "设置", 3);
+    make_app_button(page, 217, 104, "人", "人设", 4);
+
+    make_app_button(page, 16, 170, "音", "音色", 4);
+    make_app_button(page, 83, 170, "调", "调试", 5);
+    make_app_button(page, 150, 170, "麦", "唤醒", 1);
 
     lv_obj_t *quick = make_text_button(page,
-                                       18,
-                                       188,
-                                       UI_W - 36,
-                                       38,
-                                       "按住说话",
+                                       217,
+                                       170,
+                                       82,
+                                       58,
+                                       "按住",
                                        lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                        lv_color_hex(UI_TEXT_COLOR));
     lv_obj_add_event_cb(quick, talk_button_event_cb, LV_EVENT_PRESSED, NULL);
@@ -1095,22 +1145,22 @@ static void create_home_page(lv_obj_t *page)
 static void create_chat_page(lv_obj_t *page)
 {
     lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
-    lv_label_set_text(title, "对话");
+    lv_label_set_text(title, "对话应用");
     lv_obj_set_pos(title, 16, 44);
 
     s_state_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_ACCENT_COLOR));
     lv_obj_set_width(s_state_label, UI_W - 64);
-    lv_obj_set_pos(s_state_label, 32, 74);
+    lv_obj_set_pos(s_state_label, 32, 68);
     lv_obj_set_style_text_align(s_state_label, LV_TEXT_ALIGN_CENTER, 0);
 
     s_state_caption_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
     lv_obj_set_width(s_state_caption_label, UI_W - 64);
-    lv_obj_set_pos(s_state_caption_label, 32, 112);
+    lv_obj_set_pos(s_state_caption_label, 32, 96);
     lv_obj_set_style_text_align(s_state_caption_label, LV_TEXT_ALIGN_CENTER, 0);
 
     s_status_track = lv_obj_create(page);
     lv_obj_set_size(s_status_track, UI_W - 72, 7);
-    lv_obj_set_pos(s_status_track, 36, 138);
+    lv_obj_set_pos(s_status_track, 36, 122);
     lv_obj_set_style_radius(s_status_track, 4, 0);
     lv_obj_set_style_border_width(s_status_track, 0, 0);
     lv_obj_set_style_bg_color(s_status_track, lv_color_hex(0xF4DCE8), 0);
@@ -1119,41 +1169,61 @@ static void create_chat_page(lv_obj_t *page)
 
     s_status_line = lv_obj_create(page);
     lv_obj_set_size(s_status_line, 24, 7);
-    lv_obj_set_pos(s_status_line, 36, 138);
+    lv_obj_set_pos(s_status_line, 36, 122);
     lv_obj_set_style_radius(s_status_line, 4, 0);
     lv_obj_set_style_border_width(s_status_line, 0, 0);
     lv_obj_set_style_bg_opa(s_status_line, LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_status_line, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *recent_card = make_card(page, 18, 154, UI_W - 36, 36);
+    lv_obj_t *recent_card = make_card(page, 18, 136, UI_W - 36, 36);
     s_chat_in_label = make_wrap_label(recent_card, UI_FONT_RECENT, lv_color_hex(UI_TEXT_COLOR));
     lv_obj_set_size(s_chat_in_label, UI_W - 54, 22);
     lv_obj_align(s_chat_in_label, LV_ALIGN_TOP_LEFT, 0, 0);
-    s_recent_label = s_chat_in_label;
 
-    lv_obj_t *reply_card = make_card(page, 18, 194, UI_W - 126, 32);
+    lv_obj_t *reply_card = make_card(page, 18, 176, UI_W - 36, 30);
     lv_obj_set_style_bg_color(reply_card, lv_color_hex(UI_SOFT_PANEL_COLOR), 0);
     s_chat_out_label = make_wrap_label(reply_card, UI_FONT_RECENT, lv_color_hex(UI_TEXT_COLOR));
-    lv_obj_set_size(s_chat_out_label, UI_W - 144, 18);
+    lv_obj_set_size(s_chat_out_label, UI_W - 54, 18);
     lv_obj_align(s_chat_out_label, LV_ALIGN_TOP_LEFT, 0, 0);
-    s_reply_label = s_chat_out_label;
 
     s_talk_button = make_text_button(page,
-                                     UI_W - 96,
-                                     194,
-                                     78,
-                                     32,
-                                     "按住",
+                                     18,
+                                     212,
+                                     112,
+                                     30,
+                                     "开始聊天",
                                      lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                      lv_color_hex(UI_TEXT_COLOR));
-    lv_obj_add_event_cb(s_talk_button, talk_button_event_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(s_talk_button, talk_button_event_cb, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(s_talk_button, talk_button_event_cb, LV_EVENT_PRESS_LOST, NULL);
+    lv_obj_add_event_cb(s_talk_button, action_button_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)APP_UI_ACTION_CHAT_TOGGLE);
     s_talk_button_label = lv_obj_get_child(s_talk_button, 0);
+
+    lv_obj_t *wake_btn = make_text_button(page,
+                                          136,
+                                          212,
+                                          80,
+                                          30,
+                                          "唤醒词",
+                                          lv_color_hex(UI_PANEL_COLOR),
+                                          lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_add_event_cb(wake_btn, action_button_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)APP_UI_ACTION_WAKE_TOGGLE);
+
+    lv_obj_t *ptt_btn = make_text_button(page,
+                                         222,
+                                         212,
+                                         80,
+                                         30,
+                                         "按住说",
+                                         lv_color_hex(UI_PANEL_COLOR),
+                                         lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_add_event_cb(ptt_btn, talk_button_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(ptt_btn, talk_button_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(ptt_btn, talk_button_event_cb, LV_EVENT_PRESS_LOST, NULL);
 
     s_chat_system_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
     lv_obj_set_size(s_chat_system_label, UI_W - 36, 16);
-    lv_obj_set_pos(s_chat_system_label, 18, 229);
+    lv_obj_set_pos(s_chat_system_label, 18, 246);
 }
 
 static void create_network_page(lv_obj_t *page)
@@ -1198,12 +1268,12 @@ static void create_settings_page(lv_obj_t *page)
     lv_label_set_text(title, "设置");
     lv_obj_set_pos(title, 16, 44);
 
-    lv_obj_t *time_card = make_card(page, 18, 78, UI_W - 36, 34);
+    lv_obj_t *time_card = make_card(page, 18, 72, UI_W - 36, 30);
     s_set_time_label = make_label(time_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
     lv_obj_set_size(s_set_time_label, UI_W - 54, 18);
     lv_obj_align(s_set_time_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    lv_obj_t *bt_card = make_card(page, 18, 118, UI_W - 36, 34);
+    lv_obj_t *bt_card = make_card(page, 18, 106, UI_W - 36, 30);
     s_set_bt_label = make_label(bt_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
     lv_obj_set_size(s_set_bt_label, UI_W - 54, 18);
     lv_obj_align(s_set_bt_label, LV_ALIGN_LEFT_MID, 0, 0);
@@ -1211,21 +1281,46 @@ static void create_settings_page(lv_obj_t *page)
                         (void *)(uintptr_t)APP_UI_ACTION_BLUETOOTH_TOGGLE);
     lv_obj_add_flag(bt_card, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t *minus_btn = make_text_button(page, 18, 164, 64, 34, "音量-", lv_color_hex(UI_PANEL_COLOR),
-                                           lv_color_hex(UI_TEXT_COLOR));
-    lv_obj_add_event_cb(minus_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_VOL_DOWN);
+    s_set_wake_label = make_label(make_card(page, 18, 140, UI_W - 36, 30), UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_size(s_set_wake_label, UI_W - 54, 18);
+    lv_obj_align(s_set_wake_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    lv_obj_t *plus_btn = make_text_button(page, 92, 164, 64, 34, "音量+", lv_color_hex(UI_PANEL_COLOR),
-                                          lv_color_hex(UI_TEXT_COLOR));
-    lv_obj_add_event_cb(plus_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_VOL_UP);
-
-    lv_obj_t *test_btn = make_text_button(page, 166, 164, 136, 34, "测试声音", lv_color_hex(UI_ACCENT_SOFT_COLOR),
-                                          lv_color_hex(UI_TEXT_COLOR));
-    lv_obj_add_event_cb(test_btn, action_button_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)APP_UI_ACTION_PLAY_TEST);
+    make_action_button(page, 18, 176, 64, 30, "音量-", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_VOL_DOWN);
+    make_action_button(page, 88, 176, 64, 30, "音量+", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_VOL_UP);
+    make_action_button(page, 158, 176, 68, 30, "唤醒", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_WAKE_TOGGLE);
+    make_action_button(page, 232, 176, 70, 30, "测试", lv_color_hex(UI_ACCENT_SOFT_COLOR), APP_UI_ACTION_PLAY_TEST);
 
     s_set_status_label = make_wrap_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
-    lv_obj_set_size(s_set_status_label, UI_W - 36, 34);
-    lv_obj_set_pos(s_set_status_label, 18, 210);
+    lv_obj_set_size(s_set_status_label, UI_W - 36, 28);
+    lv_obj_set_pos(s_set_status_label, 18, 212);
+}
+
+static void create_profile_page(lv_obj_t *page)
+{
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "人设与音色");
+    lv_obj_set_pos(title, 16, 44);
+
+    lv_obj_t *persona_card = make_card(page, 18, 76, UI_W - 36, 42);
+    s_set_persona_label = make_wrap_label(persona_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_size(s_set_persona_label, UI_W - 54, 28);
+    lv_obj_align(s_set_persona_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_add_event_cb(persona_card, action_button_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)APP_UI_ACTION_PERSONA_NEXT);
+    lv_obj_add_flag(persona_card, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *voice_card = make_card(page, 18, 126, UI_W - 36, 42);
+    s_set_voice_label = make_wrap_label(voice_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_size(s_set_voice_label, UI_W - 54, 28);
+    lv_obj_align(s_set_voice_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_add_event_cb(voice_card, action_button_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)APP_UI_ACTION_VOICE_NEXT);
+    lv_obj_add_flag(voice_card, LV_OBJ_FLAG_CLICKABLE);
+
+    make_action_button(page, 18, 182, 136, 34, "切人设", lv_color_hex(UI_ACCENT_SOFT_COLOR),
+                       APP_UI_ACTION_PERSONA_NEXT);
+    make_action_button(page, 166, 182, 136, 34, "切音色", lv_color_hex(UI_ACCENT_SOFT_COLOR),
+                       APP_UI_ACTION_VOICE_NEXT);
 }
 
 static lv_obj_t *make_debug_row(lv_obj_t *page, int y, const char *name, lv_obj_t **value_label, lv_color_t dot_color)
@@ -1286,6 +1381,7 @@ static void create_ui_objects(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(UI_BG_COLOR), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
     lv_obj_add_event_cb(screen, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     for (uint8_t i = 0; i < UI_PAGE_COUNT; ++i) {
@@ -1296,12 +1392,14 @@ static void create_ui_objects(void)
     create_chat_page(s_pages[1]);
     create_network_page(s_pages[2]);
     create_settings_page(s_pages[3]);
-    create_debug_page(s_pages[4]);
+    create_profile_page(s_pages[4]);
+    create_debug_page(s_pages[5]);
 
     create_top_bar(screen);
     make_nav_button(screen, 4, "<", -1);
     make_nav_button(screen, UI_W - 32, ">", 1);
     create_page_dots(screen);
+    s_page_dirty = true;
     set_page_locked(0);
 }
 
@@ -1338,40 +1436,59 @@ static void apply_ui_locked(void)
     }
     lv_obj_set_width(s_status_line, progress_width);
 
-    const char *recent = s_recent_text[0] ? s_recent_text : "暂无文字";
-    lv_label_set_text_fmt(s_chat_in_label, "我：%s", recent);
-    lv_label_set_text_fmt(s_chat_out_label, "答：%s", voice_state_zh(s_voice_state));
-    lv_label_set_text_fmt(s_chat_system_label, "状态：%s", state_caption(s_assistant_state));
-    lv_label_set_text(s_talk_button_label,
-                      s_assistant_state == APP_UI_STATE_RECORDING ? "发送" : "按住");
-    lv_obj_set_style_bg_color(s_talk_button,
-                              s_assistant_state == APP_UI_STATE_RECORDING ? lv_color_hex(UI_OK_COLOR)
-                                                                          : lv_color_hex(UI_ACCENT_SOFT_COLOR),
-                              0);
-
-    lv_label_set_text_fmt(s_net_wifi_label, "Wi-Fi：%s", s_wifi_connected ? "已连接" : "连接中或离线");
-    lv_label_set_text_fmt(s_net_mcp_label, "MCP：%s", mcp_status_zh(s_mcp_status));
-    lv_label_set_text(s_net_endpoint_label, "地址：app_config.h 配置");
-
-    if (s_page == 3 || s_clock_dirty) {
-        lv_label_set_text_fmt(s_set_time_label, "时间：%s", clock_text);
+    if (s_page == 1) {
+        const char *recent = s_recent_text[0] ? s_recent_text : "暂无文字";
+        lv_label_set_text_fmt(s_chat_in_label, "我：%s", recent);
+        lv_label_set_text_fmt(s_chat_out_label, "答：%s", voice_state_zh(s_voice_state));
+        lv_label_set_text_fmt(s_chat_system_label,
+                              "%s / 唤醒%s / %s",
+                              s_chat_continuous ? "常态聊天" : "手动聊天",
+                              s_wake_enabled ? "开" : "关",
+                              s_persona_label);
+        lv_label_set_text(s_talk_button_label, s_chat_continuous ? "停止聊天" : "开始聊天");
+        lv_obj_set_style_bg_color(s_talk_button,
+                                  s_chat_continuous ? lv_color_hex(UI_OK_COLOR) : lv_color_hex(UI_ACCENT_SOFT_COLOR),
+                                  0);
     }
-    lv_label_set_text_fmt(s_set_bt_label, "蓝牙：%s",
-                          s_bt_available ? (s_bt_enabled ? "开启" : "关闭") : "固件未启用");
-    lv_label_set_text_fmt(s_set_status_label, "音频：16k / 16bit / 单声道  音量%02d",
-                          s_volume);
 
-    lv_label_set_text_fmt(s_dbg_network_label, "%s / %s", s_wifi_connected ? "Wi-Fi 正常" : "Wi-Fi 断开",
-                          s_mcp_connected ? "MCP 正常" : "MCP 断开");
-    lv_label_set_text_fmt(s_dbg_audio_label, "16k / 16bit / 单声道 / 音量%02d", s_volume);
-    lv_label_set_text_fmt(s_dbg_phase_label, "当前：%s", state_text(s_assistant_state));
-    lv_label_set_text(s_dbg_error_label, s_assistant_state == APP_UI_STATE_ERROR ? mcp_status_zh(s_mcp_status) : "无");
-    lv_label_set_text_fmt(s_dbg_mic_label, "%s  峰值%05d 均值%04d", mic_state_zh(s_mic_state), s_mic_peak, s_mic_avg);
-    lv_bar_set_value(s_mic_bar, s_mic_peak, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(
-        s_mic_bar,
-        s_mic_peak > 12000 ? lv_color_hex(UI_ERROR_COLOR) : lv_color_hex(UI_OK_COLOR),
-        LV_PART_INDICATOR);
+    if (s_page == 2) {
+        lv_label_set_text_fmt(s_net_wifi_label, "Wi-Fi：%s", s_wifi_connected ? "已连接" : "连接中或离线");
+        lv_label_set_text_fmt(s_net_mcp_label, "MCP：%s", mcp_status_zh(s_mcp_status));
+        lv_label_set_text(s_net_endpoint_label, "地址：app_config.h 配置");
+    }
+
+    if (s_page == 3) {
+        lv_label_set_text_fmt(s_set_time_label, "时间：%s", clock_text);
+        lv_label_set_text_fmt(s_set_bt_label, "蓝牙：%s",
+                              s_bt_available ? (s_bt_enabled ? "开启" : "关闭") : "固件未启用");
+        lv_label_set_text_fmt(s_set_wake_label, "语音唤醒：%s  词：豆包",
+                              s_wake_enabled ? "开启" : "待接入");
+        lv_label_set_text_fmt(s_set_status_label, "音频：16k / 16bit / 单声道  音量%02d",
+                              s_volume);
+    }
+
+    if (s_page == 4) {
+        char profile_text[96];
+        join_text2(profile_text, sizeof(profile_text), "当前人设：", s_persona_label);
+        lv_label_set_text(s_set_persona_label, profile_text);
+        join_text2(profile_text, sizeof(profile_text), "当前音色：", s_voice_profile_label);
+        lv_label_set_text(s_set_voice_label, profile_text);
+    }
+
+    if (s_page == 5) {
+        lv_label_set_text_fmt(s_dbg_network_label, "%s / %s", s_wifi_connected ? "Wi-Fi 正常" : "Wi-Fi 断开",
+                              s_mcp_connected ? "MCP 正常" : "MCP 断开");
+        lv_label_set_text_fmt(s_dbg_audio_label, "16k / 16bit / 单声道 / 音量%02d", s_volume);
+        lv_label_set_text_fmt(s_dbg_phase_label, "当前：%s", state_text(s_assistant_state));
+        lv_label_set_text(s_dbg_error_label,
+                          s_assistant_state == APP_UI_STATE_ERROR ? mcp_status_zh(s_mcp_status) : "无");
+        lv_label_set_text_fmt(s_dbg_mic_label, "%s  峰值%05d 均值%04d", mic_state_zh(s_mic_state), s_mic_peak,
+                              s_mic_avg);
+        lv_bar_set_value(s_mic_bar, s_mic_peak, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(s_mic_bar,
+                                  s_mic_peak > 12000 ? lv_color_hex(UI_ERROR_COLOR) : lv_color_hex(UI_OK_COLOR),
+                                  LV_PART_INDICATOR);
+    }
 
     if (s_page_dirty) {
         set_page_locked(s_page);
@@ -1421,6 +1538,7 @@ static void ui_task(void *arg)
         if (!s_ready || !s_lock) {
             continue;
         }
+        bool rendered = false;
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
             TickType_t now = xTaskGetTickCount();
             if (s_mcp_connected && s_last_mcp_activity_tick != 0 &&
@@ -1437,9 +1555,18 @@ static void ui_task(void *arg)
             if (s_dirty && now - s_last_render_tick >= pdMS_TO_TICKS(UI_RENDER_INTERVAL_MS)) {
                 s_last_render_tick = now;
                 apply_ui_locked();
+                if (!s_first_screen_invalidated) {
+                    s_first_screen_invalidated = true;
+                    lv_obj_invalidate(lv_scr_act());
+                }
+                rendered = true;
             }
-            lv_timer_handler();
             xSemaphoreGive(s_lock);
+        }
+        lv_timer_handler();
+        if (rendered && !s_first_handler_done) {
+            s_first_handler_done = true;
+            register_touch_input();
         }
     }
 }
@@ -1504,10 +1631,8 @@ esp_err_t app_ui_init(void)
     s_dirty = true;
     s_page_dirty = true;
     s_clock_dirty = true;
-    apply_ui_locked();
-    lv_timer_handler();
-    xTaskCreate(ui_task, "app_ui", 4096, NULL, 4, NULL);
-    xTaskCreate(action_dispatch_task, "ui_actions", 2048, NULL, 4, NULL);
+    xTaskCreate(ui_task, "app_ui", 4096, NULL, 2, NULL);
+    xTaskCreate(action_dispatch_task, "ui_actions", 2048, NULL, 2, NULL);
     ESP_LOGI(TAG, "ready using LVGL %dx%d, page UI, touch=%s", UI_W, UI_H, s_touch_ready ? "yes" : "no");
     return ESP_OK;
 }
@@ -1642,6 +1767,48 @@ void app_ui_set_recent_text(const char *text)
 {
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
         copy_limited_text(s_recent_text, sizeof(s_recent_text), text);
+        mark_dirty();
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void app_ui_set_chat_continuous(bool enabled)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_chat_continuous = enabled;
+        mark_dirty();
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void app_ui_set_wake_enabled(bool enabled)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_wake_enabled = enabled;
+        mark_dirty();
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void app_ui_set_persona(const char *label)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        copy_limited_text(s_persona_label, sizeof(s_persona_label), label);
+        if (s_persona_label[0] == '\0') {
+            strlcpy(s_persona_label, "默认人设", sizeof(s_persona_label));
+        }
+        mark_dirty();
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void app_ui_set_voice_profile(const char *label)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        copy_limited_text(s_voice_profile_label, sizeof(s_voice_profile_label), label);
+        if (s_voice_profile_label[0] == '\0') {
+            strlcpy(s_voice_profile_label, "默认音色", sizeof(s_voice_profile_label));
+        }
         mark_dirty();
         xSemaphoreGive(s_lock);
     }
