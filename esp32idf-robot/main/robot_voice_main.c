@@ -25,10 +25,17 @@
 #define CONT_VAD_STOP_AVG 260
 #define CONT_VAD_STOP_PEAK 1400
 #define CONT_VAD_START_HITS 2
+#define CONT_VAD_SILENCE_HITS 4
 #define CONT_VAD_TAIL_MS 950
 #define CONT_VAD_MIN_SPEECH_MS 320
 #define CONT_VAD_MAX_SPEECH_MS 12000
 #define CONT_REARM_DELAY_MS 900
+#define CONT_VAD_NOISE_FLOOR_INIT 140
+#define CONT_VAD_NOISE_FLOOR_MIN 60
+#define CONT_VAD_NOISE_FLOOR_MAX 460
+#define CONT_VAD_START_MARGIN 380
+#define CONT_VAD_STOP_MARGIN 170
+#define CONT_VAD_LOG_INTERVAL_MS 1000
 
 typedef enum {
     CAPTURE_MODE_NONE = 0,
@@ -74,7 +81,10 @@ static bool s_audio_busy;
 static TickType_t s_cont_speech_start_tick;
 static TickType_t s_cont_last_voice_tick;
 static TickType_t s_cont_rearm_tick;
+static TickType_t s_cont_vad_log_tick;
 static int s_cont_start_hits;
+static int s_cont_silence_hits;
+static int s_cont_noise_floor = CONT_VAD_NOISE_FLOOR_INIT;
 
 typedef struct {
     const char *id;
@@ -220,6 +230,22 @@ static int abs16_sample(int16_t value)
     return value < 0 ? -value : value;
 }
 
+static int clamp_int(int value, int low, int high)
+{
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
+}
+
+static int max_int(int a, int b)
+{
+    return a > b ? a : b;
+}
+
 static void analyze_pcm_level(const uint8_t *data, int len, int *peak, int *avg_abs)
 {
     int sample_count = len / (int)sizeof(int16_t);
@@ -239,6 +265,60 @@ static void analyze_pcm_level(const uint8_t *data, int len, int *peak, int *avg_
     if (avg_abs) {
         *avg_abs = sample_count > 0 ? (int)(sum_abs / sample_count) : 0;
     }
+}
+
+static int cont_vad_start_threshold(void)
+{
+    return max_int(CONT_VAD_START_AVG, s_cont_noise_floor + CONT_VAD_START_MARGIN);
+}
+
+static int cont_vad_stop_threshold(void)
+{
+    return max_int(CONT_VAD_STOP_AVG, s_cont_noise_floor + CONT_VAD_STOP_MARGIN);
+}
+
+static void cont_vad_reset_runtime(void)
+{
+    s_cont_start_hits = 0;
+    s_cont_silence_hits = 0;
+    s_cont_vad_log_tick = 0;
+}
+
+static void cont_vad_reset_noise_floor(void)
+{
+    s_cont_noise_floor = CONT_VAD_NOISE_FLOOR_INIT;
+}
+
+static void cont_vad_update_noise_floor(int avg_abs)
+{
+    int start_threshold = cont_vad_start_threshold();
+    if (avg_abs >= start_threshold) {
+        return;
+    }
+
+    int sample = clamp_int(avg_abs, CONT_VAD_NOISE_FLOOR_MIN, CONT_VAD_NOISE_FLOOR_MAX);
+    s_cont_noise_floor = ((s_cont_noise_floor * 15) + sample) / 16;
+    s_cont_noise_floor = clamp_int(s_cont_noise_floor,
+                                   CONT_VAD_NOISE_FLOOR_MIN,
+                                   CONT_VAD_NOISE_FLOOR_MAX);
+}
+
+static void cont_vad_log_sample(TickType_t now, int avg_abs, int peak, uint32_t silence_ms)
+{
+    if ((uint32_t)((now - s_cont_vad_log_tick) * portTICK_PERIOD_MS) < CONT_VAD_LOG_INTERVAL_MS) {
+        return;
+    }
+    s_cont_vad_log_tick = now;
+    ESP_LOGI(TAG,
+             "cont vad avg=%d peak=%d noise=%d start=%d stop=%d speaking=%d silent_hits=%d silence=%ums",
+             avg_abs,
+             peak,
+             s_cont_noise_floor,
+             cont_vad_start_threshold(),
+             cont_vad_stop_threshold(),
+             s_continuous_speaking,
+             s_cont_silence_hits,
+             (unsigned)silence_ms);
 }
 
 static void flush_capture_chunk(void)
@@ -301,7 +381,7 @@ static void finish_continuous_utterance(const char *reason)
     s_capture_session_id[0] = '\0';
     s_capture_chunk_len = 0;
     s_continuous_speaking = false;
-    s_cont_start_hits = 0;
+    cont_vad_reset_runtime();
     s_audio_busy = !abort_upload;
     s_cont_rearm_tick = now + pdMS_TO_TICKS(CONT_REARM_DELAY_MS);
     app_ui_set_assistant_state(abort_upload ? APP_UI_STATE_IDLE : APP_UI_STATE_UPLOADING);
@@ -330,12 +410,20 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
             return;
         }
         if (!s_continuous_speaking) {
-            bool voice_hit = avg_abs >= CONT_VAD_START_AVG || peak >= CONT_VAD_START_PEAK;
+            int start_threshold = cont_vad_start_threshold();
+            int stop_threshold = cont_vad_stop_threshold();
+            bool avg_hit = avg_abs >= start_threshold;
+            bool peak_hit = peak >= CONT_VAD_START_PEAK && avg_abs >= stop_threshold;
+            bool voice_hit = avg_hit || peak_hit;
             if (voice_hit) {
                 ++s_cont_start_hits;
-            } else if (s_cont_start_hits > 0) {
-                --s_cont_start_hits;
+            } else {
+                cont_vad_update_noise_floor(avg_abs);
+                if (s_cont_start_hits > 0) {
+                    --s_cont_start_hits;
+                }
             }
+            cont_vad_log_sample(now, avg_abs, peak, 0);
             if (s_cont_start_hits < CONT_VAD_START_HITS) {
                 return;
             }
@@ -353,18 +441,33 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
             s_continuous_speaking = true;
             s_cont_speech_start_tick = now;
             s_cont_last_voice_tick = now;
+            s_cont_silence_hits = 0;
             app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
             app_ui_set_mic_state("MIC ON");
-            ESP_LOGI(TAG, "continuous utterance start avg=%d peak=%d", avg_abs, peak);
+            ESP_LOGI(TAG,
+                     "continuous utterance start avg=%d peak=%d noise=%d start=%d stop=%d",
+                     avg_abs,
+                     peak,
+                     s_cont_noise_floor,
+                     cont_vad_start_threshold(),
+                     cont_vad_stop_threshold());
         }
 
         append_capture_audio(data, len);
-        bool voice_active = avg_abs >= CONT_VAD_STOP_AVG || peak >= CONT_VAD_STOP_PEAK;
+        int stop_threshold = cont_vad_stop_threshold();
+        bool voice_active = avg_abs >= stop_threshold;
         if (voice_active) {
+            s_cont_silence_hits = 0;
             s_cont_last_voice_tick = now;
+        } else {
+            ++s_cont_silence_hits;
+            if (s_cont_silence_hits < CONT_VAD_SILENCE_HITS) {
+                s_cont_last_voice_tick = now;
+            }
         }
         uint32_t speech_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
         uint32_t silence_ms = (uint32_t)((now - s_cont_last_voice_tick) * portTICK_PERIOD_MS);
+        cont_vad_log_sample(now, avg_abs, peak, silence_ms);
         if ((speech_ms >= CONT_VAD_MIN_SPEECH_MS && silence_ms >= CONT_VAD_TAIL_MS) ||
             speech_ms >= CONT_VAD_MAX_SPEECH_MS) {
             finish_continuous_utterance(speech_ms >= CONT_VAD_MAX_SPEECH_MS ? "vad_max" : "vad_silence");
@@ -450,7 +553,8 @@ static void start_continuous_chat(void)
     s_continuous_speaking = false;
     s_capture_mode = CAPTURE_MODE_CONTINUOUS;
     s_audio_busy = false;
-    s_cont_start_hits = 0;
+    cont_vad_reset_runtime();
+    cont_vad_reset_noise_floor();
     s_capture_session_id[0] = '\0';
     s_capture_chunk_len = 0;
 
@@ -486,7 +590,7 @@ static void stop_continuous_chat(void)
     s_continuous_speaking = false;
     s_capture_mode = CAPTURE_MODE_NONE;
     s_audio_busy = false;
-    s_cont_start_hits = 0;
+    cont_vad_reset_runtime();
     s_capture_session_id[0] = '\0';
     s_capture_chunk_len = 0;
     app_ui_set_chat_continuous(false);
@@ -510,7 +614,7 @@ static void mark_assistant_audio_busy(bool busy)
     s_audio_busy = busy;
     if (!busy && s_continuous_chat) {
         s_cont_rearm_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONT_REARM_DELAY_MS);
-        s_cont_start_hits = 0;
+        cont_vad_reset_runtime();
     }
 }
 
