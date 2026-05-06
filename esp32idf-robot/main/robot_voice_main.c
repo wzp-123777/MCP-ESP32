@@ -11,8 +11,11 @@
 #include "app_buttons.h"
 #include "app_ui.h"
 #include "audio_player.h"
+#include "afe_capture.h"
 #include "afe_full_duplex_plan.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_vad.h"
 #include "mcp_client.h"
 #include "mic_diag.h"
 #include "sdkconfig.h"
@@ -25,18 +28,36 @@
 #define CONT_VAD_START_PEAK 2600
 #define CONT_VAD_STOP_AVG 260
 #define CONT_VAD_STOP_PEAK 1400
-#define CONT_VAD_START_HITS 2
-#define CONT_VAD_SILENCE_HITS 4
-#define CONT_VAD_TAIL_MS 950
+#define CONT_VAD_START_HITS 6
+#define CONT_VAD_SILENCE_HITS 3
+#define CONT_VAD_TAIL_MS 850
 #define CONT_VAD_MIN_SPEECH_MS 320
 #define CONT_VAD_MAX_SPEECH_MS 12000
-#define CONT_REARM_DELAY_MS 900
+#define CONT_VAD_WATCHDOG_MS 300
+#define CONT_VAD_STALE_AUDIO_MS 1600
+#define CONT_VAD_STALE_SILENCE_MS 1400
+#define CONT_REARM_DELAY_MS 1800
 #define CONT_VAD_NOISE_FLOOR_INIT 140
 #define CONT_VAD_NOISE_FLOOR_MIN 60
 #define CONT_VAD_NOISE_FLOOR_MAX 460
 #define CONT_VAD_START_MARGIN 380
 #define CONT_VAD_STOP_MARGIN 170
 #define CONT_VAD_LOG_INTERVAL_MS 1000
+#define CONT_VAD_RELATIVE_RELEASE_DIV 3
+#define CONT_SR_VAD_RATE 16000
+#define CONT_SR_VAD_FRAME_MS 30
+#define CONT_SR_VAD_FRAME_SAMPLES ((CONT_SR_VAD_RATE * CONT_SR_VAD_FRAME_MS) / 1000)
+#define CONT_AEC_VAD_START_AVG 260
+#define CONT_AEC_VAD_START_PEAK 2600
+#define CONT_AEC_VAD_STOP_AVG 70
+#define CONT_AEC_VAD_START_HITS 10
+#define CONT_AEC_VAD_NOISE_FLOOR_INIT 24
+#define CONT_AEC_VAD_NOISE_FLOOR_MIN 4
+#define CONT_AEC_VAD_NOISE_FLOOR_MAX 160
+#define CONT_AEC_VAD_START_MARGIN 140
+#define CONT_AEC_VAD_STOP_MARGIN 35
+#define CONT_AEC_VAD_RELATIVE_RELEASE_DIV 4
+#define CONT_PREROLL_CHUNKS 12
 
 typedef enum {
     CAPTURE_MODE_NONE = 0,
@@ -81,11 +102,26 @@ static bool s_wake_enabled;
 static bool s_audio_busy;
 static TickType_t s_cont_speech_start_tick;
 static TickType_t s_cont_last_voice_tick;
+static TickType_t s_cont_last_audio_tick;
 static TickType_t s_cont_rearm_tick;
 static TickType_t s_cont_vad_log_tick;
+static TickType_t s_cont_busy_log_tick;
 static int s_cont_start_hits;
 static int s_cont_silence_hits;
 static int s_cont_noise_floor = CONT_VAD_NOISE_FLOOR_INIT;
+static int s_cont_utterance_peak_avg;
+static uint8_t *s_cont_preroll_buf;
+static size_t s_cont_preroll_lens[CONT_PREROLL_CHUNKS];
+static size_t s_cont_preroll_head;
+static size_t s_cont_preroll_count;
+static vad_handle_t s_cont_sr_vad;
+static int16_t s_cont_sr_vad_frame[CONT_SR_VAD_FRAME_SAMPLES];
+static int s_cont_sr_vad_frame_used;
+static bool s_cont_sr_vad_available;
+static bool s_afe_ready;
+static bool s_afe_init_attempted;
+static bool s_mic_diag_ready;
+static bool s_mic_diag_init_attempted;
 
 typedef struct {
     const char *id;
@@ -106,6 +142,9 @@ static const config_option_t s_voice_profiles[] = {
 
 static size_t s_persona_index;
 static size_t s_voice_index;
+
+static void make_capture_session_id(void);
+static void finish_continuous_utterance(const char *reason);
 
 static void print_help(void)
 {
@@ -198,6 +237,58 @@ static void on_mic_level(int peak, int avg_abs)
     app_ui_set_mic_level(peak, avg_abs);
 }
 
+static void on_afe_event(afe_capture_event_t event, void *ctx)
+{
+    (void)ctx;
+    switch (event) {
+        case AFE_CAPTURE_EVENT_VAD_START:
+            ESP_LOGI(TAG, "afe vad start");
+            if (s_capture_mode == CAPTURE_MODE_CONTINUOUS &&
+                s_continuous_chat &&
+                !s_continuous_speaking &&
+                mcp_client_is_connected() &&
+                !s_audio_busy &&
+                !mcp_client_is_assistant_busy()) {
+                TickType_t now = xTaskGetTickCount();
+                if (now >= s_cont_rearm_tick) {
+                    make_capture_session_id();
+                    s_capture_chunk_len = 0;
+                    esp_err_t err = mcp_client_audio_stream_begin(s_capture_session_id);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "afe stream begin failed: %s", esp_err_to_name(err));
+                        s_capture_session_id[0] = '\0';
+                        app_ui_set_mcp_status("MCP SEND FAIL");
+                    } else {
+                        s_continuous_speaking = true;
+                        s_cont_speech_start_tick = now;
+                        s_cont_last_voice_tick = now;
+                        s_cont_last_audio_tick = now;
+                        s_cont_silence_hits = 0;
+                        app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
+                        app_ui_set_mic_state("AFE REC");
+                        ESP_LOGI(TAG, "afe utterance start session=%s", s_capture_session_id);
+                    }
+                }
+            }
+            break;
+        case AFE_CAPTURE_EVENT_VAD_END:
+            if (s_capture_mode == CAPTURE_MODE_CONTINUOUS && s_continuous_speaking) {
+                finish_continuous_utterance("afe_vad_end");
+            }
+            break;
+        case AFE_CAPTURE_EVENT_WAKE:
+            ESP_LOGI(TAG, "afe wake");
+            if (s_wake_enabled && !s_continuous_chat) {
+                send_cmd_nonblocking(VOICE_CMD_CHAT_TOGGLE, 0);
+            }
+            break;
+        case AFE_CAPTURE_EVENT_ERROR:
+            ESP_LOGW(TAG, "afe capture error");
+            app_ui_set_assistant_state(APP_UI_STATE_ERROR);
+            break;
+    }
+}
+
 static void send_runtime_config(void)
 {
     const config_option_t *persona = &s_personas[s_persona_index];
@@ -215,6 +306,42 @@ static void send_runtime_config(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "send config failed: %s", esp_err_to_name(err));
     }
+}
+
+static bool ensure_afe_ready(void)
+{
+    if (s_afe_ready) {
+        return true;
+    }
+    if (!ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL || s_afe_init_attempted) {
+        return false;
+    }
+    s_afe_init_attempted = true;
+    esp_err_t afe_err = afe_capture_init(on_afe_event, NULL);
+    s_afe_ready = afe_err == ESP_OK;
+    if (!s_afe_ready) {
+        ESP_LOGW(TAG, "AFE/AEC init failed: %s; capture falls back to mono PCM",
+                 esp_err_to_name(afe_err));
+    } else {
+        ESP_LOGI(TAG, "AFE/AEC ready; capture path=AFE/AEC");
+    }
+    return s_afe_ready;
+}
+
+static bool ensure_mic_diag_ready(void)
+{
+    if (s_mic_diag_ready) {
+        return true;
+    }
+    if (s_mic_diag_init_attempted) {
+        return false;
+    }
+    s_mic_diag_init_attempted = true;
+    s_mic_diag_ready = mic_diag_init(on_mic_level) == ESP_OK;
+    if (!s_mic_diag_ready) {
+        ESP_LOGW(TAG, "mic diag init failed; MIC commands unavailable");
+    }
+    return s_mic_diag_ready;
 }
 
 static void make_capture_session_id(void)
@@ -247,6 +374,53 @@ static int max_int(int a, int b)
     return a > b ? a : b;
 }
 
+static bool cont_using_aec_path(void)
+{
+    return s_afe_ready && s_capture_mode == CAPTURE_MODE_CONTINUOUS;
+}
+
+static bool cont_preroll_ensure(void)
+{
+    if (s_cont_preroll_buf) {
+        return true;
+    }
+    s_cont_preroll_buf = heap_caps_malloc(CONT_PREROLL_CHUNKS * CAPTURE_CHUNK_BYTES,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_cont_preroll_buf) {
+        ESP_LOGW(TAG, "continuous preroll buffer alloc failed");
+        return false;
+    }
+    s_cont_preroll_head = 0;
+    s_cont_preroll_count = 0;
+    memset(s_cont_preroll_lens, 0, sizeof(s_cont_preroll_lens));
+    return true;
+}
+
+static void cont_preroll_reset(void)
+{
+    s_cont_preroll_head = 0;
+    s_cont_preroll_count = 0;
+    memset(s_cont_preroll_lens, 0, sizeof(s_cont_preroll_lens));
+}
+
+static void cont_preroll_store(const uint8_t *data, int len)
+{
+    if (!data || len <= 0 || !cont_preroll_ensure()) {
+        return;
+    }
+    size_t copy_len = (size_t)len;
+    if (copy_len > CAPTURE_CHUNK_BYTES) {
+        copy_len = CAPTURE_CHUNK_BYTES;
+    }
+    size_t slot = s_cont_preroll_head;
+    memcpy(s_cont_preroll_buf + slot * CAPTURE_CHUNK_BYTES, data, copy_len);
+    s_cont_preroll_lens[slot] = copy_len;
+    s_cont_preroll_head = (s_cont_preroll_head + 1) % CONT_PREROLL_CHUNKS;
+    if (s_cont_preroll_count < CONT_PREROLL_CHUNKS) {
+        ++s_cont_preroll_count;
+    }
+}
+
 static void analyze_pcm_level(const uint8_t *data, int len, int *peak, int *avg_abs)
 {
     int sample_count = len / (int)sizeof(int16_t);
@@ -268,13 +442,68 @@ static void analyze_pcm_level(const uint8_t *data, int len, int *peak, int *avg_
     }
 }
 
+static void cont_sr_vad_reset(void)
+{
+    s_cont_sr_vad_frame_used = 0;
+    if (s_cont_sr_vad) {
+        vad_reset_trigger(s_cont_sr_vad);
+    }
+}
+
+static bool cont_sr_vad_ensure(void)
+{
+    if (s_cont_sr_vad_available) {
+        return s_cont_sr_vad != NULL;
+    }
+    s_cont_sr_vad_available = true;
+    s_cont_sr_vad = vad_create_with_param(VAD_MODE_2,
+                                          CONT_SR_VAD_RATE,
+                                          CONT_SR_VAD_FRAME_MS,
+                                          120,
+                                          650);
+    if (!s_cont_sr_vad) {
+        ESP_LOGW(TAG, "ESP-SR VAD unavailable; use energy VAD only");
+        return false;
+    }
+    ESP_LOGI(TAG, "ESP-SR VAD ready mode=2 frame=%dms", CONT_SR_VAD_FRAME_MS);
+    return true;
+}
+
+static vad_state_t cont_sr_vad_process(const uint8_t *data, int len)
+{
+    if (!cont_using_aec_path() || !cont_sr_vad_ensure() || !data || len <= 0) {
+        return VAD_SILENCE;
+    }
+
+    bool speech_seen = false;
+    const int16_t *samples = (const int16_t *)data;
+    int sample_count = len / (int)sizeof(int16_t);
+    for (int i = 0; i < sample_count; ++i) {
+        s_cont_sr_vad_frame[s_cont_sr_vad_frame_used++] = samples[i];
+        if (s_cont_sr_vad_frame_used >= CONT_SR_VAD_FRAME_SAMPLES) {
+            vad_state_t state = vad_process_with_trigger(s_cont_sr_vad, s_cont_sr_vad_frame);
+            if (state == VAD_SPEECH) {
+                speech_seen = true;
+            }
+            s_cont_sr_vad_frame_used = 0;
+        }
+    }
+    return speech_seen ? VAD_SPEECH : VAD_SILENCE;
+}
+
 static int cont_vad_start_threshold(void)
 {
+    if (cont_using_aec_path()) {
+        return max_int(CONT_AEC_VAD_START_AVG, s_cont_noise_floor + CONT_AEC_VAD_START_MARGIN);
+    }
     return max_int(CONT_VAD_START_AVG, s_cont_noise_floor + CONT_VAD_START_MARGIN);
 }
 
 static int cont_vad_stop_threshold(void)
 {
+    if (cont_using_aec_path()) {
+        return max_int(CONT_AEC_VAD_STOP_AVG, s_cont_noise_floor + CONT_AEC_VAD_STOP_MARGIN);
+    }
     return max_int(CONT_VAD_STOP_AVG, s_cont_noise_floor + CONT_VAD_STOP_MARGIN);
 }
 
@@ -283,11 +512,15 @@ static void cont_vad_reset_runtime(void)
     s_cont_start_hits = 0;
     s_cont_silence_hits = 0;
     s_cont_vad_log_tick = 0;
+    s_cont_busy_log_tick = 0;
+    s_cont_utterance_peak_avg = 0;
+    s_cont_last_audio_tick = 0;
+    cont_sr_vad_reset();
 }
 
 static void cont_vad_reset_noise_floor(void)
 {
-    s_cont_noise_floor = CONT_VAD_NOISE_FLOOR_INIT;
+    s_cont_noise_floor = cont_using_aec_path() ? CONT_AEC_VAD_NOISE_FLOOR_INIT : CONT_VAD_NOISE_FLOOR_INIT;
 }
 
 static void cont_vad_update_noise_floor(int avg_abs)
@@ -297,21 +530,25 @@ static void cont_vad_update_noise_floor(int avg_abs)
         return;
     }
 
-    int sample = clamp_int(avg_abs, CONT_VAD_NOISE_FLOOR_MIN, CONT_VAD_NOISE_FLOOR_MAX);
+    int floor_min = cont_using_aec_path() ? CONT_AEC_VAD_NOISE_FLOOR_MIN : CONT_VAD_NOISE_FLOOR_MIN;
+    int floor_max = cont_using_aec_path() ? CONT_AEC_VAD_NOISE_FLOOR_MAX : CONT_VAD_NOISE_FLOOR_MAX;
+    int sample = clamp_int(avg_abs, floor_min, floor_max);
     s_cont_noise_floor = ((s_cont_noise_floor * 15) + sample) / 16;
-    s_cont_noise_floor = clamp_int(s_cont_noise_floor,
-                                   CONT_VAD_NOISE_FLOOR_MIN,
-                                   CONT_VAD_NOISE_FLOOR_MAX);
+    s_cont_noise_floor = clamp_int(s_cont_noise_floor, floor_min, floor_max);
 }
 
-static void cont_vad_log_sample(TickType_t now, int avg_abs, int peak, uint32_t silence_ms)
+static void cont_vad_log_sample_ex(TickType_t now,
+                                   int avg_abs,
+                                   int peak,
+                                   uint32_t silence_ms,
+                                   vad_state_t sr_vad_state)
 {
     if ((uint32_t)((now - s_cont_vad_log_tick) * portTICK_PERIOD_MS) < CONT_VAD_LOG_INTERVAL_MS) {
         return;
     }
     s_cont_vad_log_tick = now;
     ESP_LOGI(TAG,
-             "cont vad avg=%d peak=%d noise=%d start=%d stop=%d speaking=%d silent_hits=%d silence=%ums",
+             "cont vad avg=%d peak=%d noise=%d start=%d stop=%d speaking=%d silent_hits=%d silence=%ums sr=%d",
              avg_abs,
              peak,
              s_cont_noise_floor,
@@ -319,7 +556,21 @@ static void cont_vad_log_sample(TickType_t now, int avg_abs, int peak, uint32_t 
              cont_vad_stop_threshold(),
              s_continuous_speaking,
              s_cont_silence_hits,
-             (unsigned)silence_ms);
+             (unsigned)silence_ms,
+             sr_vad_state == VAD_SPEECH ? 1 : 0);
+}
+
+static void cont_vad_log_busy_gate(TickType_t now)
+{
+    if ((uint32_t)((now - s_cont_busy_log_tick) * portTICK_PERIOD_MS) < CONT_VAD_LOG_INTERVAL_MS) {
+        return;
+    }
+    s_cont_busy_log_tick = now;
+    ESP_LOGI(TAG,
+             "cont vad gated busy local=%d mcp=%d rearm_left=%dms",
+             s_audio_busy,
+             mcp_client_is_assistant_busy(),
+             now < s_cont_rearm_tick ? (int)((s_cont_rearm_tick - now) * portTICK_PERIOD_MS) : 0);
 }
 
 static void flush_capture_chunk(void)
@@ -362,12 +613,30 @@ static void append_capture_audio(const uint8_t *data, int len)
     }
 }
 
+static void cont_preroll_flush_to_capture(void)
+{
+    if (!s_cont_preroll_buf || s_cont_preroll_count == 0 || s_capture_session_id[0] == '\0') {
+        cont_preroll_reset();
+        return;
+    }
+    size_t start = (s_cont_preroll_head + CONT_PREROLL_CHUNKS - s_cont_preroll_count) % CONT_PREROLL_CHUNKS;
+    for (size_t i = 0; i < s_cont_preroll_count; ++i) {
+        size_t slot = (start + i) % CONT_PREROLL_CHUNKS;
+        size_t len = s_cont_preroll_lens[slot];
+        if (len > 0) {
+            append_capture_audio(s_cont_preroll_buf + slot * CAPTURE_CHUNK_BYTES, (int)len);
+        }
+    }
+    cont_preroll_reset();
+}
+
 static void finish_continuous_utterance(const char *reason)
 {
     if (!s_continuous_speaking) {
         return;
     }
-    bool abort_upload = reason && strcmp(reason, "manual_stop") == 0;
+    bool abort_upload = reason && (strcmp(reason, "manual_stop") == 0 ||
+                                   strcmp(reason, "mcp_disconnect") == 0);
     if (abort_upload) {
         drop_capture_chunk();
     } else {
@@ -383,9 +652,12 @@ static void finish_continuous_utterance(const char *reason)
     s_capture_chunk_len = 0;
     s_continuous_speaking = false;
     cont_vad_reset_runtime();
+    cont_preroll_reset();
     s_audio_busy = !abort_upload;
     s_cont_rearm_tick = now + pdMS_TO_TICKS(CONT_REARM_DELAY_MS);
-    app_ui_set_assistant_state(abort_upload ? APP_UI_STATE_IDLE : APP_UI_STATE_UPLOADING);
+    app_ui_set_assistant_state(strcmp(reason ? reason : "", "mcp_disconnect") == 0
+                                   ? APP_UI_STATE_OFFLINE
+                                   : (abort_upload ? APP_UI_STATE_IDLE : APP_UI_STATE_UPLOADING));
     app_ui_set_mic_state("MIC READY");
 }
 
@@ -397,25 +669,44 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
             return;
         }
         TickType_t now = xTaskGetTickCount();
+        s_cont_last_audio_tick = now;
         int peak = 0;
         int avg_abs = 0;
         analyze_pcm_level(data, len, &peak, &avg_abs);
+        vad_state_t sr_vad_state = cont_sr_vad_process(data, len);
 
-        if (!s_continuous_chat || !mcp_client_is_connected()) {
+        if (!s_continuous_chat) {
             return;
         }
-        if (s_audio_busy || mcp_client_is_assistant_busy()) {
+        if (!mcp_client_is_connected()) {
+            if (s_continuous_speaking) {
+                finish_continuous_utterance("mcp_disconnect");
+            }
             return;
         }
-        if (now < s_cont_rearm_tick) {
+        bool assistant_busy = s_audio_busy || mcp_client_is_assistant_busy();
+        if (!s_continuous_speaking && assistant_busy) {
+            cont_vad_log_busy_gate(now);
             return;
         }
+        if (!s_continuous_speaking && now < s_cont_rearm_tick) {
+            cont_vad_log_busy_gate(now);
+            return;
+        }
+        bool started_now = false;
         if (!s_continuous_speaking) {
+            cont_preroll_store(data, len);
             int start_threshold = cont_vad_start_threshold();
-            int stop_threshold = cont_vad_stop_threshold();
-            bool avg_hit = avg_abs >= start_threshold;
-            bool peak_hit = peak >= CONT_VAD_START_PEAK && avg_abs >= stop_threshold;
-            bool voice_hit = avg_hit || peak_hit;
+            int start_peak = cont_using_aec_path() ? CONT_AEC_VAD_START_PEAK : CONT_VAD_START_PEAK;
+            int min_energy_peak = cont_using_aec_path() ? (start_peak / 2) : 0;
+            bool avg_hit = avg_abs >= start_threshold && (!cont_using_aec_path() || peak >= min_energy_peak);
+            int start_hits = cont_using_aec_path() ? CONT_AEC_VAD_START_HITS : CONT_VAD_START_HITS;
+            bool peak_hit = peak >= start_peak && avg_abs >= start_threshold;
+            bool sr_hit = sr_vad_state == VAD_SPEECH;
+            if (cont_using_aec_path()) {
+                sr_hit = sr_hit && avg_abs >= start_threshold && peak >= min_energy_peak;
+            }
+            bool voice_hit = sr_hit || avg_hit || peak_hit;
             if (voice_hit) {
                 ++s_cont_start_hits;
             } else {
@@ -424,8 +715,8 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
                     --s_cont_start_hits;
                 }
             }
-            cont_vad_log_sample(now, avg_abs, peak, 0);
-            if (s_cont_start_hits < CONT_VAD_START_HITS) {
+            cont_vad_log_sample_ex(now, avg_abs, peak, 0, sr_vad_state);
+            if (s_cont_start_hits < start_hits) {
                 return;
             }
 
@@ -442,7 +733,11 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
             s_continuous_speaking = true;
             s_cont_speech_start_tick = now;
             s_cont_last_voice_tick = now;
+            s_cont_last_audio_tick = now;
             s_cont_silence_hits = 0;
+            s_cont_utterance_peak_avg = avg_abs;
+            cont_preroll_flush_to_capture();
+            started_now = true;
             app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
             app_ui_set_mic_state("MIC ON");
             ESP_LOGI(TAG,
@@ -454,9 +749,25 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
                      cont_vad_stop_threshold());
         }
 
-        append_capture_audio(data, len);
+        if (!started_now) {
+            append_capture_audio(data, len);
+        }
         int stop_threshold = cont_vad_stop_threshold();
-        bool voice_active = avg_abs >= stop_threshold;
+        if (avg_abs > s_cont_utterance_peak_avg) {
+            s_cont_utterance_peak_avg = avg_abs;
+        }
+        int release_floor = cont_using_aec_path() ? CONT_AEC_VAD_STOP_AVG : CONT_VAD_STOP_AVG;
+        int release_div = cont_using_aec_path() ? CONT_AEC_VAD_RELATIVE_RELEASE_DIV : CONT_VAD_RELATIVE_RELEASE_DIV;
+        int relative_release = max_int(release_floor, s_cont_utterance_peak_avg / release_div);
+        bool energy_active = avg_abs >= stop_threshold && avg_abs >= relative_release;
+        bool strong_energy_active = avg_abs >= max_int(stop_threshold + 80, relative_release + 80);
+        bool voice_active = energy_active;
+        if (cont_using_aec_path() && s_cont_sr_vad) {
+            bool sr_energy_active = (sr_vad_state == VAD_SPEECH) &&
+                                    avg_abs >= stop_threshold &&
+                                    peak >= (CONT_AEC_VAD_START_PEAK / 2);
+            voice_active = sr_energy_active || strong_energy_active;
+        }
         if (voice_active) {
             s_cont_silence_hits = 0;
             s_cont_last_voice_tick = now;
@@ -468,7 +779,7 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
         }
         uint32_t speech_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
         uint32_t silence_ms = (uint32_t)((now - s_cont_last_voice_tick) * portTICK_PERIOD_MS);
-        cont_vad_log_sample(now, avg_abs, peak, silence_ms);
+        cont_vad_log_sample_ex(now, avg_abs, peak, silence_ms, sr_vad_state);
         if ((speech_ms >= CONT_VAD_MIN_SPEECH_MS && silence_ms >= CONT_VAD_TAIL_MS) ||
             speech_ms >= CONT_VAD_MAX_SPEECH_MS) {
             finish_continuous_utterance(speech_ms >= CONT_VAD_MAX_SPEECH_MS ? "vad_max" : "vad_silence");
@@ -477,6 +788,35 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
     }
 
     append_capture_audio(data, len);
+}
+
+static void continuous_chat_housekeeping(void)
+{
+    if (!s_continuous_chat || !s_continuous_speaking) {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (!mcp_client_is_connected()) {
+        finish_continuous_utterance("mcp_disconnect");
+        return;
+    }
+
+    uint32_t speech_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
+    uint32_t silence_ms = (uint32_t)((now - s_cont_last_voice_tick) * portTICK_PERIOD_MS);
+    uint32_t stale_audio_ms = s_cont_last_audio_tick
+                                  ? (uint32_t)((now - s_cont_last_audio_tick) * portTICK_PERIOD_MS)
+                                  : speech_ms;
+    if (speech_ms >= CONT_VAD_MIN_SPEECH_MS &&
+        stale_audio_ms >= CONT_VAD_STALE_AUDIO_MS &&
+        (silence_ms >= CONT_VAD_STALE_SILENCE_MS || speech_ms >= CONT_VAD_MAX_SPEECH_MS)) {
+        ESP_LOGW(TAG,
+                 "continuous watchdog end reason=vad_stale duration=%ums silence=%ums stale_audio=%ums",
+                 (unsigned)speech_ms,
+                 (unsigned)silence_ms,
+                 (unsigned)stale_audio_ms);
+        finish_continuous_utterance("vad_stale");
+    }
 }
 
 static void start_set_capture(void)
@@ -495,7 +835,13 @@ static void start_set_capture(void)
         app_ui_set_assistant_state(APP_UI_STATE_OFFLINE);
         return;
     }
-    if (mic_diag_is_capturing()) {
+    ensure_afe_ready();
+    if ((s_afe_ready && afe_capture_is_running()) ||
+        (!s_afe_ready && s_mic_diag_ready && mic_diag_is_capturing())) {
+        return;
+    }
+    if (!s_afe_ready && !ensure_mic_diag_ready()) {
+        app_ui_set_mic_state("MIC ERROR");
         return;
     }
 
@@ -510,7 +856,9 @@ static void start_set_capture(void)
         return;
     }
 
-    err = mic_diag_capture_start(on_capture_audio, NULL);
+    err = s_afe_ready
+              ? afe_capture_start_forced(on_capture_audio, NULL)
+              : mic_diag_capture_start(on_capture_audio, NULL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mic capture start failed: %s", esp_err_to_name(err));
         mcp_client_audio_stream_end(s_capture_session_id, 0, "mic_start_failed");
@@ -519,16 +867,17 @@ static void start_set_capture(void)
     }
 
     app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
-    app_ui_set_mic_state("REC SET");
+    app_ui_set_mic_state(s_afe_ready ? "AFE SET" : "REC SET");
 }
 
 static void stop_set_capture(void)
 {
-    if (s_capture_mode != CAPTURE_MODE_PTT || !mic_diag_is_capturing()) {
+    if (s_capture_mode != CAPTURE_MODE_PTT ||
+        (s_afe_ready ? !afe_capture_is_running() : (!s_mic_diag_ready || !mic_diag_is_capturing()))) {
         return;
     }
 
-    uint32_t duration_ms = mic_diag_capture_stop();
+    uint32_t duration_ms = s_afe_ready ? afe_capture_stop() : mic_diag_capture_stop();
     flush_capture_chunk();
     mcp_client_audio_stream_end(s_capture_session_id, duration_ms, "set_release");
     s_capture_session_id[0] = '\0';
@@ -547,7 +896,9 @@ static void start_continuous_chat(void)
         app_ui_set_assistant_state(APP_UI_STATE_OFFLINE);
         return;
     }
-    if (mic_diag_is_capturing() && s_capture_mode == CAPTURE_MODE_PTT) {
+    ensure_afe_ready();
+    if ((s_afe_ready && afe_capture_is_running() && s_capture_mode == CAPTURE_MODE_PTT) ||
+        (!s_afe_ready && s_mic_diag_ready && mic_diag_is_capturing() && s_capture_mode == CAPTURE_MODE_PTT)) {
         stop_set_capture();
     }
     s_continuous_chat = true;
@@ -556,10 +907,18 @@ static void start_continuous_chat(void)
     s_audio_busy = false;
     cont_vad_reset_runtime();
     cont_vad_reset_noise_floor();
+    cont_preroll_reset();
     s_capture_session_id[0] = '\0';
     s_capture_chunk_len = 0;
 
-    esp_err_t err = mic_diag_capture_start(on_capture_audio, NULL);
+    esp_err_t err = s_afe_ready
+                        ? afe_capture_start(on_capture_audio, NULL)
+                        : mic_diag_capture_start(on_capture_audio, NULL);
+    if (err != ESP_OK) {
+        if (!s_afe_ready && !s_mic_diag_ready && ensure_mic_diag_ready()) {
+            err = mic_diag_capture_start(on_capture_audio, NULL);
+        }
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "continuous mic start failed: %s", esp_err_to_name(err));
         s_capture_mode = CAPTURE_MODE_NONE;
@@ -570,10 +929,10 @@ static void start_continuous_chat(void)
     }
     app_ui_set_chat_continuous(true);
     app_ui_set_assistant_state(APP_UI_STATE_IDLE);
-    app_ui_set_mic_state("MIC ON");
+    app_ui_set_mic_state(s_afe_ready ? "AFE ON" : "MIC ON");
     app_ui_set_voice_state("VOICE READY");
     send_runtime_config();
-    ESP_LOGI(TAG, "continuous chat enabled");
+    ESP_LOGI(TAG, "continuous chat enabled path=%s", s_afe_ready ? "afe_aec" : "mono_pcm");
 }
 
 static void stop_continuous_chat(void)
@@ -584,7 +943,9 @@ static void stop_continuous_chat(void)
     if (s_continuous_speaking) {
         finish_continuous_utterance("manual_stop");
     }
-    if (mic_diag_is_capturing() && s_capture_mode == CAPTURE_MODE_CONTINUOUS) {
+    if (s_afe_ready && afe_capture_is_running() && s_capture_mode == CAPTURE_MODE_CONTINUOUS) {
+        afe_capture_stop();
+    } else if (s_mic_diag_ready && mic_diag_is_capturing() && s_capture_mode == CAPTURE_MODE_CONTINUOUS) {
         mic_diag_capture_stop();
     }
     s_continuous_chat = false;
@@ -592,6 +953,7 @@ static void stop_continuous_chat(void)
     s_capture_mode = CAPTURE_MODE_NONE;
     s_audio_busy = false;
     cont_vad_reset_runtime();
+    cont_preroll_reset();
     s_capture_session_id[0] = '\0';
     s_capture_chunk_len = 0;
     app_ui_set_chat_continuous(false);
@@ -612,11 +974,21 @@ static void toggle_continuous_chat(void)
 
 static void mark_assistant_audio_busy(bool busy)
 {
+    if (s_audio_busy == busy) {
+        return;
+    }
     s_audio_busy = busy;
     if (!busy && s_continuous_chat) {
         s_cont_rearm_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONT_REARM_DELAY_MS);
         cont_vad_reset_runtime();
     }
+    ESP_LOGI(TAG, "assistant audio busy=%d continuous=%d", busy, s_continuous_chat);
+}
+
+static void on_mcp_assistant_busy(bool busy, void *ctx)
+{
+    (void)ctx;
+    mark_assistant_audio_busy(busy);
 }
 
 static void on_button_event(app_button_event_t event, void *ctx)
@@ -659,8 +1031,9 @@ static void playback_task(void *arg)
             if (xQueueReceive(s_cmd_queue, &cmd, 0) != pdTRUE) {
                 cmd.type = VOICE_CMD_PLAY_ONCE;
             }
-        } else {
-            xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY);
+        } else if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(CONT_VAD_WATCHDOG_MS)) != pdTRUE) {
+            continuous_chat_housekeeping();
+            continue;
         }
 
         switch (cmd.type) {
@@ -697,11 +1070,19 @@ static void playback_task(void *arg)
                 app_ui_set_volume(audio_player_get_volume());
                 break;
             case VOICE_CMD_MIC_ON:
-                mic_diag_start();
-                app_ui_set_mic_state("MIC ON");
+                if (s_afe_ready) {
+                    app_ui_set_mic_state("AFE READY");
+                } else if (ensure_mic_diag_ready()) {
+                    mic_diag_start();
+                    app_ui_set_mic_state("MIC ON");
+                } else {
+                    app_ui_set_mic_state("MIC ERROR");
+                }
                 break;
             case VOICE_CMD_MIC_OFF:
-                mic_diag_stop();
+                if (!s_afe_ready && s_mic_diag_ready) {
+                    mic_diag_stop();
+                }
                 app_ui_set_mic_state("MIC OFF");
                 break;
             case VOICE_CMD_MCP_CONNECT:
@@ -725,9 +1106,18 @@ static void playback_task(void *arg)
             case VOICE_CMD_WAKE_TOGGLE:
                 s_wake_enabled = !s_wake_enabled;
                 app_ui_set_wake_enabled(s_wake_enabled);
-                app_ui_set_voice_state(s_wake_enabled ? "WAKE TODO" : "VOICE READY");
+                if (s_afe_ready) {
+                    afe_capture_set_wake_enabled(s_wake_enabled);
+                }
+                app_ui_set_voice_state(s_wake_enabled
+                                           ? (s_afe_ready && afe_capture_has_wake_model() ? "WAKE ON" : "WAKE TODO")
+                                           : "VOICE READY");
                 send_runtime_config();
-                ESP_LOGI(TAG, "wake word UI flag=%d; offline WakeNet not linked", s_wake_enabled);
+                ESP_LOGI(TAG,
+                         "wake word UI flag=%d afe_ready=%d wake_model=%d",
+                         s_wake_enabled,
+                         s_afe_ready,
+                         s_afe_ready ? afe_capture_has_wake_model() : 0);
                 break;
             case VOICE_CMD_PERSONA_NEXT:
                 s_persona_index = (s_persona_index + 1) % (sizeof(s_personas) / sizeof(s_personas[0]));
@@ -847,6 +1237,7 @@ void app_main(void)
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("AUDIO_PLAYER", ESP_LOG_INFO);
     esp_log_level_set("MIC_DIAG", ESP_LOG_INFO);
+    esp_log_level_set("AFE_CAPTURE", ESP_LOG_INFO);
     esp_log_level_set("APP_UI", ESP_LOG_INFO);
     esp_log_level_set("MCP_CLIENT", ESP_LOG_INFO);
 
@@ -870,23 +1261,28 @@ void app_main(void)
     app_ui_set_persona(s_personas[s_persona_index].label);
     app_ui_set_voice_profile(s_voice_profiles[s_voice_index].label);
 
-    if (mic_diag_init(on_mic_level) != ESP_OK) {
-        ESP_LOGW(TAG, "mic diag init failed; MIC commands unavailable");
-    }
-    app_ui_set_mic_state("MIC READY");
-    ESP_LOGI(TAG,
-             "full duplex AFE/AEC experimental path=%d; current capture path is mono PCM",
-             ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL);
-
     mcp_client_init();
+    mcp_client_set_busy_callback(on_mcp_assistant_busy, NULL);
     app_ui_set_mcp_status(mcp_client_get_status_text());
-    send_runtime_config();
 
     s_cmd_queue = xQueueCreate(16, sizeof(voice_cmd_t));
     if (!s_cmd_queue) {
         ESP_LOGE(TAG, "command queue create failed");
         return;
     }
+
+    if (mcp_client_connect() == ESP_OK) {
+        app_ui_set_mcp_status(mcp_client_get_status_text());
+        vTaskDelay(pdMS_TO_TICKS(900));
+    }
+
+    app_ui_set_mic_state("MIC READY");
+    ESP_LOGI(TAG,
+             "full duplex AFE/AEC experimental path=%d lazy_ready=%d; capture path=%s",
+             ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL,
+             s_afe_ready,
+             ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL ? "AFE/AEC lazy" : "mono PCM");
+    send_runtime_config();
 
     xTaskCreate(playback_task, "voice_playback", 4096, NULL, 5, NULL);
     xTaskCreate(command_task, "voice_command", 4096, NULL, 4, NULL);
@@ -895,5 +1291,7 @@ void app_main(void)
         ESP_LOGW(TAG, "button init failed");
     }
 
-    send_cmd(VOICE_CMD_MCP_CONNECT, 0);
+    if (!mcp_client_is_connected()) {
+        send_cmd(VOICE_CMD_MCP_CONNECT, 0);
+    }
 }

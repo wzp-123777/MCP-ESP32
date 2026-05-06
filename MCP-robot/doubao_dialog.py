@@ -238,18 +238,26 @@ class DoubaoRealtimeDialogClient:
                 "dialog": {
                     "bot_name": bot_name_override.strip() or self.config.bot_name,
                     "system_role": system_role,
+                    "extra": {
+                        "input_mod": "audio",
+                    },
                 },
                 "tts": {
+                    "speaker": tts_speaker_override.strip() or self.config.tts_speaker,
                     "audio_config": {
                         "channel": self.config.tts_channel,
                         "format": self.config.tts_format,
                         "sample_rate": self.config.tts_sample_rate,
                     }
                 },
+                "asr": {
+                    "audio_info": {
+                        "format": "pcm",
+                        "sample_rate": input_sample_rate,
+                        "channel": 1,
+                    }
+                },
             }
-            tts_speaker = tts_speaker_override.strip() or self.config.tts_speaker
-            if tts_speaker:
-                start_payload["tts"]["speaker"] = tts_speaker
             await ws.send(
                 _pack_event_frame(
                     EVENT_START_SESSION,
@@ -288,6 +296,13 @@ class DoubaoRealtimeDialogClient:
         chunk_bytes -= chunk_bytes % 2
         tail = b"\x00\x00" * int(16000 * self.config.vad_tail_silence_ms / 1000)
         payload = pcm + tail
+        logger.info(
+            "Doubao dialog audio upload: session=%s pcm=%d tail=%d chunk=%d gzip=1",
+            session_id,
+            len(pcm),
+            len(tail),
+            chunk_bytes,
+        )
         for offset in range(0, len(payload), chunk_bytes):
             chunk = payload[offset : offset + chunk_bytes]
             if not chunk:

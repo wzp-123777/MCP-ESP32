@@ -23,8 +23,10 @@ extern const uint8_t xiaole_pcm_end[] asm("_binary_xiaole_16k_stereo_pcm_end");
 #define PLAYER_SAMPLE_RATE 16000
 #define PLAYER_BITS 16
 #define PLAYER_CHANNELS 1
+#define PLAYER_I2S_BITS CODEC_ADC_BITS_PER_SAMPLE
+#define PLAYER_I2S_CHANNELS 2
 #define PLAYER_CHUNK_BYTES 2048
-#define PLAYER_INITIAL_VOLUME 45
+#define PLAYER_INITIAL_VOLUME 75
 #define PLAYER_SOFT_LIMIT 26000
 #define PLAYER_PREROLL_MS 40
 
@@ -42,6 +44,7 @@ static audio_element_handle_t s_raw_writer;
 static audio_element_handle_t s_i2s_writer;
 static audio_element_handle_t s_active_raw_writer;
 static int s_volume = PLAYER_INITIAL_VOLUME;
+static uint8_t s_i2s_bus_chunk[PLAYER_CHUNK_BYTES * PLAYER_I2S_CHANNELS];
 
 static int clamp_volume(int volume)
 {
@@ -192,6 +195,25 @@ static int16_t *wav_to_16k_mono(const wav_format_t *fmt, const uint8_t *pcm, siz
     return mono16;
 }
 
+static esp_err_t raw_write_all(audio_element_handle_t target, const uint8_t *data, size_t len, const char *tag)
+{
+    const uint8_t *cursor = data;
+    const uint8_t *end = data + len;
+    while (cursor < end) {
+        int written = raw_stream_write(target, (char *)cursor, (int)(end - cursor));
+        if (written < 0) {
+            ESP_LOGE(TAG, "%s raw_stream_write failed ret=%d", tag ? tag : "pcm", written);
+            return ESP_FAIL;
+        }
+        if (written == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        cursor += written;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const char *tag)
 {
     if (!s_active_raw_writer) {
@@ -206,19 +228,33 @@ static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const ch
         if (chunk > PLAYER_CHUNK_BYTES) {
             chunk = PLAYER_CHUNK_BYTES;
         }
-
-        int written = raw_stream_write(s_active_raw_writer, (char *)cursor, chunk);
-        if (written < 0) {
-            ESP_LOGE(TAG, "%s raw_stream_write failed ret=%d", tag ? tag : "pcm", written);
-            return ESP_FAIL;
-        }
-        if (written == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
+        chunk -= chunk % (int)sizeof(int16_t);
+        if (chunk <= 0) {
+            break;
         }
 
-        cursor += written;
-        bytes_written += written;
+        if (s_active_raw_writer == s_raw_writer) {
+            const int16_t *src = (const int16_t *)cursor;
+            int16_t *dst = (int16_t *)s_i2s_bus_chunk;
+            int frames = chunk / (int)sizeof(int16_t);
+            for (int i = 0; i < frames; ++i) {
+                dst[i * 2] = src[i];
+                dst[i * 2 + 1] = src[i];
+            }
+            size_t bus_bytes = (size_t)frames * PLAYER_I2S_CHANNELS * sizeof(int16_t);
+            esp_err_t ret = raw_write_all(s_active_raw_writer, s_i2s_bus_chunk, bus_bytes, tag);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        } else {
+            esp_err_t ret = raw_write_all(s_active_raw_writer, cursor, (size_t)chunk, tag);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        }
+
+        cursor += chunk;
+        bytes_written += (size_t)chunk;
     }
 
     ESP_LOGI(TAG, "%s pcm written bytes=%u", tag ? tag : "pcm", (unsigned)bytes_written);
@@ -303,10 +339,14 @@ esp_err_t audio_player_init(void)
         return ESP_FAIL;
     }
 
-    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(I2S_NUM_0, PLAYER_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, AUDIO_STREAM_WRITER);
+    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(I2S_NUM_0, PLAYER_SAMPLE_RATE, PLAYER_I2S_BITS, AUDIO_STREAM_WRITER);
     i2s_cfg.type = AUDIO_STREAM_WRITER;
     i2s_cfg.task_stack = 4096;
     i2s_cfg.out_rb_size = 32 * 1024;
+    i2s_cfg.need_expand = true;
+    i2s_cfg.expand_src_bits = I2S_DATA_BIT_WIDTH_16BIT;
+    i2s_cfg.buffer_len = 1416;
+    i2s_cfg.chan_cfg.dma_desc_num = 4;
     s_i2s_writer = i2s_stream_init(&i2s_cfg);
     if (!s_i2s_writer) {
         ESP_LOGE(TAG, "i2s_stream_init failed");
@@ -321,11 +361,6 @@ esp_err_t audio_player_init(void)
         return ESP_FAIL;
     }
 
-    if (i2s_stream_set_clk(s_i2s_writer, PLAYER_SAMPLE_RATE, PLAYER_BITS, PLAYER_CHANNELS) != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_stream_set_clk failed");
-        return ESP_FAIL;
-    }
-
     if (audio_pipeline_run(s_pipeline) != ESP_OK) {
         ESP_LOGE(TAG, "audio_pipeline_run failed");
         return ESP_FAIL;
@@ -333,7 +368,14 @@ esp_err_t audio_player_init(void)
 
     s_active_raw_writer = s_raw_writer;
 
-    ESP_LOGI(TAG, "ready: raw -> i2s -> es8311, %dHz %dbit %dch", PLAYER_SAMPLE_RATE, PLAYER_BITS, PLAYER_CHANNELS);
+    ESP_LOGI(TAG,
+             "ready: raw -> i2s -> es8311, source %dHz %dbit %dch, bus %dHz %dbit %dslot",
+             PLAYER_SAMPLE_RATE,
+             PLAYER_BITS,
+             PLAYER_CHANNELS,
+             PLAYER_SAMPLE_RATE,
+             PLAYER_I2S_BITS,
+             PLAYER_I2S_CHANNELS);
     return ESP_OK;
 }
 

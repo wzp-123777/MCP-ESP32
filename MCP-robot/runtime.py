@@ -205,6 +205,7 @@ _ESP32_TTS_TARGET_PEAK = 12000
 _ESP32_TTS_SOFT_LIMIT = 26000
 _DIALOG_TTS_TARGET_PEAK = 14000
 _DIALOG_TTS_MAX_GAIN = 8.0
+_ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "220"))
 _TTS_DEBUG_DIR = Path(__file__).resolve().parent / "data" / "esp32_tts"
 _EMOJI_RE = re.compile(
     "["
@@ -610,6 +611,7 @@ class StreamingTTSDispatcher:
         self._segment_stream_end = segment_stream_end
         self._sent_tts_status = False
         self.sent_audio_segments = 0
+        self.last_error = ""
         self._worker = asyncio.create_task(self._run())
 
     async def push_text(self, text_chunk: str) -> None:
@@ -689,6 +691,7 @@ class StreamingTTSDispatcher:
                         segment_ok = True
                         self.sent_audio_segments += 1
                     else:
+                        self.last_error = "TTS did not return a complete WAV payload"
                         payload = {
                             "type": "tts_error",
                             "segment_no": segment_no,
@@ -698,6 +701,7 @@ class StreamingTTSDispatcher:
                         await self._emit_tts_event(payload)
             except Exception as exc:
                 logger.warning("语音合成流式输出失败: %s", exc)
+                self.last_error = str(exc)
                 await self._emit_tts_event(
                     {
                         "type": "tts_error",
@@ -727,11 +731,15 @@ class RobotRuntime:
         self.context_embedding = ContextEmbeddingService(config.context_embedding) if config.context_embedding.api_key else None
         self.vision_model = VisionModelService(config.vision_model)
         self.vision_highres_model = VisionModelService(config.vision_highres_model)
-        self.asr_model = ASRModelService(config.asr_model, language=config.asr_language) if config.asr_model.api_key else None
+        self.asr_model = (
+            ASRModelService(config.asr_model, language=config.asr_language)
+            if config.asr_model.api_key or config.asr_model.provider == "doubao"
+            else None
+        )
         self.doubao_dialog = DoubaoRealtimeDialogClient(config.doubao_dialog)
         self.tts_model = (
             TTSModelService(config.tts_model, config.tts_voice, config.tts_style_prompt)
-            if config.tts_model.api_key
+            if config.tts_model.api_key or config.tts_model.provider == "doubao"
             else None
         )
         self.memory_store = SubconsciousMemoryStore(
@@ -809,6 +817,8 @@ class RobotRuntime:
     async def send_esp32_tts_test(self, text: str = "小乐测试语音。") -> None:
         if self.tts_model is None:
             raise RuntimeError("TTS model not configured")
+        if getattr(self.tts_model, "config_error", ""):
+            raise RuntimeError(self.tts_model.config_error)
         esp32_ready = bool(getattr(self.connection_manager, "is_esp32_connected", True))
         if not esp32_ready:
             raise RuntimeError("ESP32 is not connected")
@@ -826,6 +836,24 @@ class RobotRuntime:
             device_id="ESP32_KORVO_2",
             text=text,
         )
+
+    def _esp32_voice_config_error(self) -> str:
+        errors: list[str] = []
+        if self.asr_model is None:
+            errors.append("ASR model not configured")
+        else:
+            asr_error = str(getattr(self.asr_model, "config_error", "") or "")
+            if asr_error:
+                errors.append(asr_error)
+        if not self.config.language_model.api_key or not self.config.language_model.model:
+            errors.append("ARK/text model is not configured")
+        if self.tts_model is None:
+            errors.append("TTS model not configured")
+        else:
+            tts_error = str(getattr(self.tts_model, "config_error", "") or "")
+            if tts_error:
+                errors.append(tts_error)
+        return "; ".join(errors)
 
     def _trace(self, event: str, **payload: Any) -> None:
         body = {"event": event, **payload}
@@ -1080,7 +1108,9 @@ class RobotRuntime:
                 "vision_low": self.vision_model.model_name,
                 "vision_high": self.vision_highres_model.model_name,
                 "asr": self.asr_model.model_name if self.asr_model else "",
+                "asr_provider": self.config.asr_model.provider,
                 "tts": self.tts_model.model_name if self.tts_model else "",
+                "tts_provider": self.config.tts_model.provider,
                 "embedding": self.context_embedding.model_name if self.context_embedding else "",
             },
         }
@@ -2450,95 +2480,21 @@ class RobotRuntime:
         wav_path: Path,
         duration_ms: int,
     ) -> None:
-        if self.config.doubao_dialog.enabled:
-            if not self.doubao_dialog.available:
-                self._trace(
-                    "dialog.config.error",
-                    source="ESP32",
-                    device_id=device_id,
-                    session_id=session_id,
-                    error="Doubao realtime dialog credentials are not configured",
-                )
-                await self.connection_manager.send_to_esp32(
-                    {
-                        "type": "assistant_error",
-                        "device_id": device_id,
-                        "session_id": session_id,
-                        "error": "豆包端到端实时语音没有配置完整，请检查 DOUBAO_DIALOG_APP_ID / DOUBAO_DIALOG_APP_KEY / DOUBAO_DIALOG_ACCESS_TOKEN。",
-                    }
-                )
-                await _send_esp32_status(
-                    self.connection_manager,
-                    status="error",
-                    device_id=device_id,
-                    session_id=session_id,
-                    text="豆包实时语音配置不完整。",
-                )
-                return
-            handled = await self._run_esp32_doubao_dialog_pipeline(
-                session_id=session_id,
-                device_id=device_id,
-                wav_path=wav_path,
-                duration_ms=duration_ms,
-            )
-            if handled:
-                return
-            return
-
-        if self.asr_model is None:
+        if not self.config.doubao_dialog.enabled:
+            error_text = "ESP32 语音链路要求豆包 Dialog 一体化，请先启用 ESP32_DOUBAO_DIALOG_ENABLED。"
             self._trace(
-                "audio.asr.error",
+                "dialog.disabled",
                 source="ESP32",
                 device_id=device_id,
                 session_id=session_id,
-                error="ASR model not configured",
-            )
-            await _send_esp32_status(
-                self.connection_manager,
-                status="error",
-                device_id=device_id,
-                session_id=session_id,
-                text="ASR 模型没有配置。",
-            )
-            return
-        try:
-            wav_bytes = wav_path.read_bytes()
-            audio_stats = _analyze_wav_audio(wav_bytes)
-        except Exception as exc:
-            self._trace(
-                "audio.asr.error",
-                source="ESP32",
-                device_id=device_id,
-                session_id=session_id,
-                error=f"read wav failed: {exc}",
-            )
-            await _send_esp32_status(
-                self.connection_manager,
-                status="error",
-                device_id=device_id,
-                session_id=session_id,
-                text=f"读取录音失败: {exc}",
-            )
-            return
-        if int(audio_stats.get("nonzero_samples") or 0) == 0 or int(audio_stats.get("peak") or 0) == 0:
-            silent_message = (
-                "captured audio appears silent: "
-                f"peak={int(audio_stats.get('peak') or 0)}, "
-                f"rms={round(float(audio_stats.get('rms') or 0.0), 2)}, "
-                f"nonzero_ratio={round(float(audio_stats.get('nonzero_ratio') or 0.0), 6)}"
-            )
-            self._trace(
-                "audio.asr.error",
-                source="ESP32",
-                device_id=device_id,
-                session_id=session_id,
-                error=silent_message,
+                error=error_text,
             )
             await self.connection_manager.send_to_esp32(
                 {
                     "type": "assistant_error",
                     "device_id": device_id,
-                    "error": "这段录音几乎是静音，服务端收到的 PCM 全是空白。请检查麦克风/I2S 接线、采样通道和增益。",
+                    "session_id": session_id,
+                    "error": error_text,
                 }
             )
             await _send_esp32_status(
@@ -2546,112 +2502,58 @@ class RobotRuntime:
                 status="error",
                 device_id=device_id,
                 session_id=session_id,
-                text="这段录音几乎是静音。",
+                text="豆包实时语音未启用。",
             )
             return
-
-        self._trace(
-            "audio.asr.start",
-            source="ESP32",
-            device_id=device_id,
+        if not self.doubao_dialog.available:
+            self._trace(
+                "dialog.config.error",
+                source="ESP32",
+                device_id=device_id,
+                session_id=session_id,
+                error="Doubao realtime dialog credentials are not configured",
+            )
+            await self.connection_manager.send_to_esp32(
+                {
+                    "type": "assistant_error",
+                    "device_id": device_id,
+                    "session_id": session_id,
+                    "error": "豆包端到端实时语音没有配置完整，请检查 DOUBAO_DIALOG_APP_ID / DOUBAO_DIALOG_APP_KEY / DOUBAO_DIALOG_ACCESS_TOKEN。",
+                }
+            )
+            await _send_esp32_status(
+                self.connection_manager,
+                status="error",
+                device_id=device_id,
+                session_id=session_id,
+                text="豆包实时语音配置不完整。",
+            )
+            return
+        handled = await self._run_esp32_doubao_dialog_pipeline(
             session_id=session_id,
-            wav_path=str(wav_path),
+            device_id=device_id,
+            wav_path=wav_path,
             duration_ms=duration_ms,
-            model=self.asr_model.model_name,
+        )
+        if handled:
+            return
+        logger.error("ESP32 豆包实时语音未完成，已禁止降级到旧 ASR + 文本/TTS 链路。")
+        await self.connection_manager.send_to_esp32(
+            {
+                "type": "assistant_error",
+                "device_id": device_id,
+                "session_id": session_id,
+                "error": "豆包实时语音未完成，已禁止切回旧文本/TTS链路。",
+            }
         )
         await _send_esp32_status(
             self.connection_manager,
-            status="asr",
+            status="error",
             device_id=device_id,
             session_id=session_id,
-            text="正在识别语音。",
+            text="豆包实时语音未完成。",
         )
-        try:
-            result = await self.asr_model.transcribe_wav(
-                wav_bytes,
-                mime_type="audio/wav",
-                prompt="请转写这段来自 ESP32 麦克风的中文语音，直接输出识别文本。",
-            )
-            transcript = str(result.get("text") or "").strip()
-            self._trace(
-                "audio.asr.done",
-                source="ESP32",
-                device_id=device_id,
-                session_id=session_id,
-                model=self.asr_model.model_name,
-                transcript=transcript,
-            )
-        except Exception as exc:
-            logger.exception("ESP32 语音转写失败")
-            self._trace(
-                "audio.asr.error",
-                source="ESP32",
-                device_id=device_id,
-                session_id=session_id,
-                model=self.asr_model.model_name,
-                error=str(exc),
-            )
-            await self.connection_manager.send_to_esp32(
-                {
-                    "type": "assistant_error",
-                    "device_id": device_id,
-                    "error": f"语音识别失败: {exc}",
-                }
-            )
-            await _send_esp32_status(
-                self.connection_manager,
-                status="error",
-                device_id=device_id,
-                session_id=session_id,
-                text=f"语音识别失败: {exc}",
-            )
-            return
-
-        if not transcript:
-            await self.connection_manager.send_to_esp32(
-                {
-                    "type": "assistant_error",
-                    "device_id": device_id,
-                    "error": "刚刚这段语音我没听清，你再说一次试试。",
-                }
-            )
-            await _send_esp32_status(
-                self.connection_manager,
-                status="error",
-                device_id=device_id,
-                session_id=session_id,
-                text="刚刚这段语音没有识别出文本。",
-            )
-            return
-        await _send_esp32_status(
-            self.connection_manager,
-            status="thinking",
-            device_id=device_id,
-            session_id=session_id,
-            text=transcript,
-        )
-
-        request = TextRequest(
-            source="ESP32",
-            text=transcript,
-            device_id=device_id,
-            extra={
-                "normalized_text": transcript,
-                "audio_session_id": session_id,
-                "audio_wav_path": str(wav_path),
-                "audio_duration_ms": duration_ms,
-                "audio_transcript": transcript,
-                "input_modality": "speech",
-            },
-        )
-        self._trace(
-            "chat.incoming",
-            source="ESP32",
-            device_id=device_id,
-            text=transcript,
-            modality="speech",
-        )
-        await self._run_text_conversation(request)
+        return
 
     async def _run_esp32_doubao_dialog_pipeline(
         self,
@@ -2690,6 +2592,29 @@ class RobotRuntime:
                     device_id=device_id,
                     session_id=session_id,
                     text="这段录音几乎是静音。",
+                )
+                return True
+            if float(audio_stats.get("rms") or 0.0) < _ESP32_DIALOG_MIN_RMS:
+                logger.info(
+                    "ESP32 dialog audio dropped before Doubao: rms=%.2f peak=%d min_rms=%.2f",
+                    float(audio_stats.get("rms") or 0.0),
+                    int(audio_stats.get("peak") or 0),
+                    _ESP32_DIALOG_MIN_RMS,
+                )
+                await self.connection_manager.send_to_esp32(
+                    {
+                        "type": "assistant_error",
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "error": "这段录音能量太低，没有检测到清楚人声。",
+                    }
+                )
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status="error",
+                    device_id=device_id,
+                    session_id=session_id,
+                    text="这段录音没有检测到清楚人声。",
                 )
                 return True
         except Exception as exc:
@@ -2884,14 +2809,19 @@ class RobotRuntime:
                 elif event.event == EVENT_SESSION_FAILED:
                     raise RuntimeError(f"Doubao dialog session failed: {payload!r}")
         except Exception as exc:
+            error_text = str(exc)
             logger.exception("ESP32 豆包实时语音失败")
-            self._trace("dialog.error", source="ESP32", device_id=device_id, session_id=session_id, error=str(exc))
+            self._trace("dialog.error", source="ESP32", device_id=device_id, session_id=session_id, error=error_text)
+            if "DialogAudioIdleTimeoutError" in error_text:
+                friendly_error = "刚刚这段没有检测到清楚的人声，请再说一次。"
+            else:
+                friendly_error = f"豆包实时语音失败: {exc}"
             await self.connection_manager.send_to_esp32(
                 {
                     "type": "assistant_error",
                     "device_id": device_id,
                     "session_id": session_id,
-                    "error": f"豆包实时语音失败: {exc}",
+                    "error": friendly_error,
                 }
             )
             await _send_esp32_status(
@@ -2899,7 +2829,7 @@ class RobotRuntime:
                 status="error",
                 device_id=device_id,
                 session_id=session_id,
-                text=f"豆包实时语音失败: {exc}",
+                text=friendly_error,
             )
             return True
 
@@ -3457,11 +3387,20 @@ class RobotRuntime:
         )
         if tts_dispatcher is not None:
             await tts_dispatcher.finish()
+            if request.source == "ESP32" and tts_dispatcher.sent_audio_segments == 0 and tts_dispatcher.last_error:
+                await self.connection_manager.send_to_esp32(
+                    {
+                        "type": "assistant_error",
+                        "device_id": request.device_id,
+                        "session_id": audio_session_id,
+                        "error": f"语音合成失败: {tts_dispatcher.last_error}",
+                    }
+                )
         if (
             request.source == "ESP32"
             and self.tts_model is not None
             and esp32_ready
-            and (tts_dispatcher is None or tts_dispatcher.sent_audio_segments == 0)
+            and (tts_dispatcher is None or (tts_dispatcher.sent_audio_segments == 0 and not tts_dispatcher.last_error))
         ):
             await _send_single_tts_segment(self.tts_model, self.connection_manager.send_to_esp32, final_reply)
         self.conversation_store.append_turn(

@@ -105,7 +105,7 @@ static char s_mcp_status[48] = "MCP NOT CONFIGURED";
 static char s_recent_text[128] = "";
 static char s_persona_label[64] = "默认人设";
 static char s_voice_profile_label[64] = "默认音色";
-static int s_volume = 45;
+static int s_volume = 75;
 static bool s_chat_continuous;
 static bool s_wake_enabled;
 static int s_mic_peak;

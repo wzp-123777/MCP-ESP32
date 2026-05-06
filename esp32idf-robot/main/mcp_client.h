@@ -16,6 +16,8 @@ bool mcp_client_is_configured(void);
 bool mcp_client_is_wifi_connected(void);
 bool mcp_client_is_connected(void);
 bool mcp_client_is_assistant_busy(void);
+typedef void (*mcp_client_busy_cb_t)(bool busy, void *ctx);
+void mcp_client_set_busy_callback(mcp_client_busy_cb_t cb, void *ctx);
 esp_err_t mcp_client_send_text_request(const char *text);
 esp_err_t mcp_client_audio_stream_begin(const char *session_id);
 esp_err_t mcp_client_audio_stream_chunk(const char *session_id, const uint8_t *data, size_t len);

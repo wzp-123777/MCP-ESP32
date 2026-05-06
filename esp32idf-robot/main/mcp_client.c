@@ -109,6 +109,8 @@ static char s_cfg_voice_label[64] = "默认音色";
 static bool s_cfg_continuous_chat;
 static bool s_cfg_wake_enabled;
 static bool s_cfg_valid;
+static mcp_client_busy_cb_t s_busy_cb;
+static void *s_busy_ctx;
 
 #define MCP_WIFI_CONNECTED_BIT BIT0
 #define MCP_SEND_TIMEOUT pdMS_TO_TICKS(3000)
@@ -134,6 +136,17 @@ static esp_err_t send_config_payload(const char *persona_id,
                                      const char *voice_label,
                                      bool continuous_chat,
                                      bool wake_enabled);
+
+static void set_assistant_busy(bool busy)
+{
+    if (s_assistant_busy == busy) {
+        return;
+    }
+    s_assistant_busy = busy;
+    if (s_busy_cb) {
+        s_busy_cb(busy, s_busy_ctx);
+    }
+}
 
 static void start_sntp_once(void)
 {
@@ -685,18 +698,18 @@ static bool tts_flush_base64_pending(void)
 static void tts_finish(void)
 {
     if (!tts_flush_base64_pending()) {
-        s_assistant_busy = false;
+        set_assistant_busy(false);
         tts_reset();
         return;
     }
     if (!s_tts_buf || s_tts_len <= 44) {
-        s_assistant_busy = false;
+        set_assistant_busy(false);
         tts_reset();
         return;
     }
     if (s_tts_len < MCP_MIN_TTS_BYTES) {
         ESP_LOGW(TAG, "tts too small, dropped len=%u", (unsigned)s_tts_len);
-        s_assistant_busy = false;
+        set_assistant_busy(false);
         tts_reset();
         return;
     }
@@ -714,7 +727,7 @@ static void tts_finish(void)
     s_tts_b64_chars = 0;
 
     if (!tts_queue_item(&item, "tts wav")) {
-        s_assistant_busy = false;
+        set_assistant_busy(false);
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
         return;
     }
@@ -734,14 +747,14 @@ static void tts_play_task(void *arg)
             ESP_LOGI(TAG, "tts pcm stream end chunks=%u", (unsigned)item.segment_no);
             s_tts_pcm_active = false;
             s_tts_pcm_first_chunk = false;
-            s_assistant_busy = false;
+            set_assistant_busy(false);
             ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
             continue;
         }
         if (!item.data || item.len == 0) {
             continue;
         }
-        s_assistant_busy = true;
+        set_assistant_busy(true);
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_PLAYING, NULL);
         if (item.kind == TTS_PLAY_ITEM_PCM) {
             esp_err_t ret = audio_player_play_pcm16(item.data, item.len, "tts_pcm", item.preroll);
@@ -766,6 +779,7 @@ static void tts_play_task(void *arg)
         heap_caps_free(item.data);
         item.data = NULL;
         item.len = 0;
+        set_assistant_busy(false);
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
     }
 }
@@ -782,22 +796,26 @@ static void ui_event_task(void *arg)
             case MCP_UI_EVENT_CONNECTED:
                 app_ui_set_mcp_connected(true);
                 app_ui_set_assistant_state(APP_UI_STATE_IDLE);
-                s_assistant_busy = false;
+                set_assistant_busy(false);
                 s_last_ui_state = APP_UI_STATE_IDLE;
                 s_last_ui_state_tick = xTaskGetTickCount();
                 break;
             case MCP_UI_EVENT_DISCONNECTED:
                 app_ui_set_mcp_connected(false);
-                s_assistant_busy = false;
+                set_assistant_busy(false);
                 s_last_ui_state = APP_UI_STATE_OFFLINE;
                 s_last_ui_state_tick = xTaskGetTickCount();
                 break;
             case MCP_UI_EVENT_STATUS:
                 app_ui_note_mcp_activity();
-                if (event.state == APP_UI_STATE_IDLE) {
-                    s_assistant_busy = false;
+                if (event.state == APP_UI_STATE_IDLE ||
+                    event.state == APP_UI_STATE_ERROR ||
+                    event.state == APP_UI_STATE_OFFLINE) {
+                    if (!s_tts_pcm_active) {
+                        set_assistant_busy(false);
+                    }
                 } else if (event.state != APP_UI_STATE_RECORDING) {
-                    s_assistant_busy = true;
+                    set_assistant_busy(true);
                 }
                 if (should_apply_ui_state(event.state)) {
                     app_ui_set_assistant_state(event.state);
@@ -810,12 +828,11 @@ static void ui_event_task(void *arg)
                 break;
             case MCP_UI_EVENT_TEXT:
                 app_ui_note_mcp_activity();
-                s_assistant_busy = false;
                 app_ui_set_recent_text(event.text);
                 break;
             case MCP_UI_EVENT_ERROR:
                 app_ui_note_mcp_activity();
-                s_assistant_busy = false;
+                set_assistant_busy(false);
                 app_ui_set_assistant_state(APP_UI_STATE_ERROR);
                 s_last_ui_state = APP_UI_STATE_ERROR;
                 s_last_ui_state_tick = xTaskGetTickCount();
@@ -873,7 +890,7 @@ static void handle_ws_text(const char *message)
         }
         s_tts_pcm_active = false;
         s_tts_pcm_first_chunk = false;
-        s_assistant_busy = false;
+        set_assistant_busy(false);
         ui_post_event(MCP_UI_EVENT_ERROR, APP_UI_STATE_ERROR, text);
         return;
     }
@@ -890,7 +907,7 @@ static void handle_ws_text(const char *message)
         s_tts_pcm_chunk_no = 0;
         s_tts_pcm_first_chunk = true;
         s_tts_pcm_active = (sample_rate == 16000 && sample_bits == 16 && channels == 1);
-        s_assistant_busy = true;
+        set_assistant_busy(true);
         ESP_LOGI(TAG,
                  "tts pcm start rate=%u bits=%u ch=%u text=%s",
                  (unsigned)sample_rate,
@@ -898,7 +915,7 @@ static void handle_ws_text(const char *message)
                  (unsigned)channels,
                  text);
         if (!s_tts_pcm_active) {
-            s_assistant_busy = false;
+            set_assistant_busy(false);
             ui_post_event(MCP_UI_EVENT_ERROR, APP_UI_STATE_ERROR, "unsupported pcm tts format");
             return;
         }
@@ -914,7 +931,7 @@ static void handle_ws_text(const char *message)
             s_tts_pcm_first_chunk = true;
             s_tts_pcm_chunk_no = 0;
         }
-        s_assistant_busy = true;
+        set_assistant_busy(true);
         if (json_get_string_span(message, "audio_b64", &audio_b64, &audio_b64_len)) {
             uint8_t *pcm = NULL;
             size_t pcm_len = 0;
@@ -945,7 +962,7 @@ static void handle_ws_text(const char *message)
         if (!tts_queue_item(&item, "tts pcm end")) {
             s_tts_pcm_active = false;
             s_tts_pcm_first_chunk = false;
-            s_assistant_busy = false;
+            set_assistant_busy(false);
             ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
         }
         return;
@@ -957,7 +974,7 @@ static void handle_ws_text(const char *message)
         ESP_LOGI(TAG, "tts segment: %s", text);
         s_tts_pcm_active = false;
         s_tts_pcm_first_chunk = false;
-        s_assistant_busy = true;
+        set_assistant_busy(true);
         if (s_tts_len > 44 || s_tts_b64_pending_len > 0) {
             tts_finish();
         } else {
@@ -991,7 +1008,7 @@ static void handle_ws_text(const char *message)
                  (unsigned)s_tts_chunk_count,
                  (unsigned)s_tts_b64_chars,
                  (unsigned)s_tts_len);
-        s_assistant_busy = true;
+        set_assistant_busy(true);
         tts_finish();
         return;
     }
@@ -1092,7 +1109,7 @@ static esp_err_t websocket_create_and_start(void)
     esp_websocket_client_config_t ws_cfg = {
         .uri = s_endpoint,
         .disable_auto_reconnect = false,
-        .task_stack = 6144,
+        .task_stack = 4096,
         .buffer_size = 16384,
         .network_timeout_ms = 10000,
         .reconnect_timeout_ms = 3000,
@@ -1383,6 +1400,12 @@ bool mcp_client_is_connected(void)
 bool mcp_client_is_assistant_busy(void)
 {
     return s_assistant_busy;
+}
+
+void mcp_client_set_busy_callback(mcp_client_busy_cb_t cb, void *ctx)
+{
+    s_busy_cb = cb;
+    s_busy_ctx = ctx;
 }
 
 esp_err_t mcp_client_send_text_request(const char *text)

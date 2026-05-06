@@ -18,6 +18,7 @@ class ModelConfig:
     base_url: str
     model: str
     timeout_seconds: float = 90.0
+    provider: str = "openai"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +50,7 @@ class DoubaoDialogConfig:
     ws_url: str = "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
     bot_name: str = "豆包"
     system_role: str = "你是一个简洁、自然的中文语音助手。回答要短，适合直接朗读。"
-    tts_speaker: str = ""
+    tts_speaker: str = "zh_female_vv_jupiter_bigtts"
     tts_format: str = "pcm_s16le"
     tts_sample_rate: int = 24000
     tts_channel: int = 1
@@ -290,11 +291,19 @@ def load_config() -> AppConfig:
         or generic_agent_keys.get("qwen_base_url")
         or "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ).strip()
-    default_language_api_key = mimo_api_key
-    default_language_base_url = mimo_base_url
-    default_language_model = os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro").strip()
-    default_tool_model = os.getenv("MIMO_TOOL_MODEL", default_language_model).strip()
-    doubao_dialog_app_id = os.getenv("DOUBAO_DIALOG_APP_ID", os.getenv("DOUBAO_TTS_APP_ID", "")).strip()
+    ark_api_key = os.getenv("ARK_API_KEY", "").strip()
+    ark_base_url = os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").strip()
+    default_language_api_key = ark_api_key or mimo_api_key
+    default_language_base_url = ark_base_url if ark_api_key else mimo_base_url
+    default_language_model = os.getenv(
+        "ARK_LANGUAGE_MODEL",
+        os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro"),
+    ).strip()
+    default_tool_model = os.getenv(
+        "ARK_TOOL_MODEL",
+        os.getenv("MIMO_TOOL_MODEL", default_language_model),
+    ).strip()
+    doubao_dialog_app_id = os.getenv("DOUBAO_DIALOG_APP_ID", "").strip()
     doubao_dialog_app_key = _pick_value(
         ["DOUBAO_DIALOG_APP_KEY"],
         mcp_robot_keys,
@@ -304,10 +313,8 @@ def load_config() -> AppConfig:
         generic_agent_keys,
         ["DOUBAO_DIALOG_APP_KEY", "doubao_dialog_app_key"],
     )
-    doubao_dialog_access_token = os.getenv(
-        "DOUBAO_DIALOG_ACCESS_TOKEN",
-        os.getenv("DOUBAO_TTS_ACCESS_TOKEN", ""),
-    ).strip()
+    doubao_dialog_access_token = os.getenv("DOUBAO_DIALOG_ACCESS_TOKEN", "").strip()
+    esp32_dialog_enabled = _env_bool("ESP32_DOUBAO_DIALOG_ENABLED", True)
 
     data_dir = Path(os.getenv("MCP_ROBOT_DATA_DIR", str(BASE_DIR / "data"))).resolve()
     subconscious_file = data_dir / "subconscious_memory.jsonl"
@@ -427,7 +434,7 @@ def load_config() -> AppConfig:
             ),
         ),
         doubao_dialog=DoubaoDialogConfig(
-            enabled=_env_bool("ESP32_DOUBAO_DIALOG_ENABLED", True),
+            enabled=esp32_dialog_enabled,
             app_id=doubao_dialog_app_id,
             app_key=doubao_dialog_app_key,
             access_token=doubao_dialog_access_token,
@@ -438,14 +445,17 @@ def load_config() -> AppConfig:
                 "DOUBAO_DIALOG_SYSTEM_ROLE",
                 "你是一个简洁、自然的中文语音助手。回答要短，适合直接朗读。",
             ).strip(),
-            tts_speaker=os.getenv("DOUBAO_DIALOG_TTS_SPEAKER", "").strip(),
+            tts_speaker=os.getenv("DOUBAO_DIALOG_TTS_SPEAKER", "zh_female_vv_jupiter_bigtts").strip(),
             tts_format=os.getenv("DOUBAO_DIALOG_TTS_FORMAT", "pcm_s16le").strip(),
             tts_sample_rate=max(8000, int(os.getenv("DOUBAO_DIALOG_TTS_SAMPLE_RATE", "24000"))),
             tts_channel=max(1, int(os.getenv("DOUBAO_DIALOG_TTS_CHANNEL", "1"))),
             timeout_seconds=float(os.getenv("DOUBAO_DIALOG_TIMEOUT_SECONDS", "30")),
-            audio_chunk_ms=max(20, int(os.getenv("DOUBAO_DIALOG_AUDIO_CHUNK_MS", "100"))),
-            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "1800"))),
-            output_flush_ms=max(200, int(os.getenv("DOUBAO_DIALOG_OUTPUT_FLUSH_MS", "250"))),
+            audio_chunk_ms=max(20, int(os.getenv("DOUBAO_DIALOG_AUDIO_CHUNK_MS", "40"))),
+            # The realtime dialog ASR endpoint currently reports eos_silence_timeout=1500.
+            # File-style ESP32 uploads need an explicit silence tail long enough for short
+            # utterances; otherwise the service may emit ClientLackDataError/idle timeout.
+            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "1600"))),
+            output_flush_ms=max(120, int(os.getenv("DOUBAO_DIALOG_OUTPUT_FLUSH_MS", "160"))),
             persona_dir=Path(os.getenv("MCP_PERSONA_DIR", str(data_dir / "personas"))).resolve(),
             voice_preset_file=Path(os.getenv("MCP_VOICE_PRESET_FILE", str(data_dir / "voice_presets.json"))).resolve(),
         ),

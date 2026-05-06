@@ -24,4 +24,4 @@
  * The current firmware still records and plays 16000 Hz / 16-bit / mono.
  */
 
-#define ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL 0
+#define ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL 1

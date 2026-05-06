@@ -902,7 +902,7 @@ def _build_logs_page() -> str:
       document.getElementById('health').textContent = data.health.ok
         ? `在线 · QQ=${{data.health.qq_connected ? '活跃' : '离线'}}(${{qqAge}}) · ESP32=${{data.health.esp32_connected ? '活跃' : '离线'}}(${{espAge}})`
         : '异常';
-      document.getElementById('models').textContent = `语言=${{data.health.models.language}} / ASR=${{data.health.models.asr}} / TTS=${{data.health.models.tts}}`;
+      document.getElementById('models').textContent = `语言=${{data.health.models.language}} / ASR=${{data.health.models.asr_provider}}:${{data.health.models.asr}} / ESP32语音=${{data.health.models.esp32_voice}} / TTS=${{data.health.models.tts_provider}}:${{data.health.models.tts}}`;
       const memoryHealth = data.health.structured_memory || {{}};
       document.getElementById('memory-status').textContent =
         `会话记忆=${{memoryHealth.memory_count ?? 0}} 条 / 画像=${{memoryHealth.profile_count ?? 0}} 条`;
@@ -1184,7 +1184,7 @@ def _build_audio_logs_page() -> str:
       const qqAge = data.health.qq_last_activity_age_s == null ? '无' : `${Number(data.health.qq_last_activity_age_s).toFixed(1)}s`;
       const espAge = data.health.esp32_last_activity_age_s == null ? '无' : `${Number(data.health.esp32_last_activity_age_s).toFixed(1)}s`;
       document.getElementById('health').textContent = `QQ=${data.health.qq_connected ? '活跃' : '离线'}(${qqAge}) · ESP32=${data.health.esp32_connected ? '活跃' : '离线'}(${espAge})`;
-      document.getElementById('models').textContent = `ASR=${data.health.models.asr} / TTS=${data.health.models.tts}`;
+      document.getElementById('models').textContent = `ASR=${data.health.models.asr_provider}:${data.health.models.asr} / ESP32语音=${data.health.models.esp32_voice} / TTS=${data.health.models.tts_provider}:${data.health.models.tts}`;
       document.getElementById('audio-dir').textContent = `录音=${data.audio_dir || ''} · TTS=${data.tts_dir || ''}`;
       renderCards(data.entries || []);
     }
@@ -1415,7 +1415,9 @@ async def healthz() -> dict[str, Any]:
             "vision_low": config.vision_model.model,
             "vision_high": config.vision_highres_model.model,
             "asr": config.asr_model.model,
+            "asr_provider": config.asr_model.provider,
             "tts": config.tts_model.model,
+            "tts_provider": config.tts_model.provider,
             "tts_voice": config.tts_voice,
             "tts_style_prompt": config.tts_style_prompt,
             "esp32_voice": (
@@ -1423,7 +1425,7 @@ async def healthz() -> dict[str, Any]:
                 if runtime.doubao_dialog.available
                 else "doubao-dialog-config-missing"
                 if config.doubao_dialog.enabled
-                else "legacy-asr-llm-tts"
+                else "doubao-dialog-disabled"
             ),
             "doubao_dialog_enabled": config.doubao_dialog.enabled,
             "doubao_dialog_configured": runtime.doubao_dialog.available,
@@ -1521,13 +1523,21 @@ if __name__ == "__main__":
             logger.info("运行日志: %s", config.runtime_log_file)
             logger.info("模型轨迹/聊天记录日志: %s", config.trace_log_file)
             logger.info(
-                "模型路由: language=%s | tool=%s | embedding=%s | vision_low=%s | vision_high=%s | tts=%s | tts_voice=%s",
+                "模型路由: language=%s | tool=%s | embedding=%s | vision_low=%s | vision_high=%s | esp32_voice=%s | tts=%s(%s) | tts_voice=%s",
                 config.language_model.model,
                 config.tool_model.model,
                 config.context_embedding.model,
                 config.vision_model.model,
                 config.vision_highres_model.model,
+                (
+                    "doubao-realtime-dialog"
+                    if runtime.doubao_dialog.available
+                    else "doubao-dialog-config-missing"
+                    if config.doubao_dialog.enabled
+                    else "doubao-dialog-disabled"
+                ),
                 config.tts_model.model,
+                config.tts_model.provider,
                 config.tts_voice,
             )
             logger.info("TTS 风格: %s", config.tts_style_prompt)
