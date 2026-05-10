@@ -96,6 +96,8 @@ TTS_PRESETS: dict[str, TTSPreset] = {
 class AppConfig:
     language_model: ModelConfig
     tool_model: ModelConfig
+    qq_language_model: ModelConfig
+    qq_tool_model: ModelConfig
     vision_model: ModelConfig
     vision_highres_model: ModelConfig
     asr_model: ModelConfig
@@ -303,6 +305,20 @@ def load_config() -> AppConfig:
         "ARK_TOOL_MODEL",
         os.getenv("MIMO_TOOL_MODEL", default_language_model),
     ).strip()
+    qq_language_api_key = os.getenv("QQ_LANGUAGE_API_KEY", os.getenv("QQ_MIMO_API_KEY", mimo_api_key)).strip() or mimo_api_key
+    qq_language_base_url = os.getenv("QQ_LANGUAGE_BASE_URL", os.getenv("QQ_MIMO_BASE_URL", mimo_base_url)).strip() or mimo_base_url
+    qq_language_model = os.getenv("QQ_LANGUAGE_MODEL", os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro")).strip() or "mimo-v2.5-pro"
+    qq_language_timeout = os.getenv("QQ_LANGUAGE_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120")).strip() or "120"
+    qq_tool_api_key = os.getenv(
+        "QQ_TOOL_MODEL_API_KEY",
+        os.getenv("QQ_TOOL_API_KEY", qq_language_api_key),
+    ).strip() or qq_language_api_key
+    qq_tool_base_url = os.getenv(
+        "QQ_TOOL_MODEL_BASE_URL",
+        os.getenv("QQ_TOOL_BASE_URL", qq_language_base_url),
+    ).strip() or qq_language_base_url
+    qq_tool_model = os.getenv("QQ_TOOL_MODEL", os.getenv("MIMO_TOOL_MODEL", qq_language_model)).strip() or qq_language_model
+    qq_tool_timeout = os.getenv("QQ_TOOL_MODEL_TIMEOUT_SECONDS", os.getenv("QQ_TOOL_TIMEOUT_SECONDS", qq_language_timeout)).strip() or qq_language_timeout
     doubao_dialog_app_id = os.getenv("DOUBAO_DIALOG_APP_ID", "").strip()
     doubao_dialog_app_key = _pick_value(
         ["DOUBAO_DIALOG_APP_KEY"],
@@ -335,6 +351,18 @@ def load_config() -> AppConfig:
             base_url=os.getenv("TOOL_MODEL_BASE_URL", default_language_base_url).strip(),
             model=os.getenv("TOOL_MODEL", default_tool_model).strip(),
             timeout_seconds=float(os.getenv("TOOL_MODEL_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120"))),
+        ),
+        qq_language_model=ModelConfig(
+            api_key=qq_language_api_key,
+            base_url=qq_language_base_url,
+            model=qq_language_model,
+            timeout_seconds=float(qq_language_timeout),
+        ),
+        qq_tool_model=ModelConfig(
+            api_key=qq_tool_api_key,
+            base_url=qq_tool_base_url,
+            model=qq_tool_model,
+            timeout_seconds=float(qq_tool_timeout),
         ),
         # 视觉链路默认切到 Qwen VL。
         # 低频环境观察优先速度，高清检查优先细节；都保留环境变量覆盖入口。

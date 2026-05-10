@@ -147,6 +147,12 @@ def _build_trace_details(event: str, payload: dict[str, Any]) -> str:
         ("source", "来源", None),
         ("device_id", "设备", None),
         ("session_id", "会话", None),
+        ("action", "动作", None),
+        ("target", "目标", None),
+        ("echo", "回声", None),
+        ("status", "状态", None),
+        ("retcode", "返回码", None),
+        ("wording", "提示", lambda value: _short_text(value, 80)),
         ("task_type", "任务", _translate_task_type),
         ("worker", "后台任务", _translate_worker_name),
         ("state", "状态", _translate_worker_state),
@@ -271,7 +277,17 @@ def _render_trace_event(event: str, payload: dict[str, Any]) -> str:
     if event == "chat.outgoing.qq.empty_guard":
         return "准备发送到 QQ 的文本被清洗成空白，已自动换成兜底提示"
     if event == "chat.outgoing.qq":
-        return "QQ 消息已发送"
+        action = payload.get("action") or "send_msg"
+        return f"QQ 下行动作已投递给 NapCat: {action}"
+    if event == "qq.action.response":
+        retcode = payload.get("retcode")
+        return f"NapCat 动作响应正常，返回码 {retcode if retcode not in (None, '') else 0}"
+    if event == "qq.action.error":
+        retcode = payload.get("retcode")
+        wording = _short_text(payload.get("wording") or "", 80)
+        if wording:
+            return f"NapCat 动作响应异常，返回码 {retcode}: {wording}"
+        return f"NapCat 动作响应异常，返回码 {retcode}"
     if event == "chat.outgoing.esp32.done":
         return "ESP32 文本回复已发送完成"
     if event == "task.start":
@@ -418,7 +434,7 @@ def _guess_log_category(text: str) -> str:
         return "memory"
     if any(token in lowered for token in ("tool", "approval", "root", "mcp facade", "外挂接口", "审批", "高级指令")):
         return "tools"
-    if any(token in lowered for token in ("chat", "qq 消息", "收到消息", "完成回复", "对话", "回复", "napcatqq")):
+    if any(token in lowered for token in ("chat", "qq 消息", "qq 下行", "收到消息", "完成回复", "对话", "回复", "napcatqq", "napcat 动作")):
         return "chat"
     return "other"
 
@@ -902,7 +918,7 @@ def _build_logs_page() -> str:
       document.getElementById('health').textContent = data.health.ok
         ? `在线 · QQ=${{data.health.qq_connected ? '活跃' : '离线'}}(${{qqAge}}) · ESP32=${{data.health.esp32_connected ? '活跃' : '离线'}}(${{espAge}})`
         : '异常';
-      document.getElementById('models').textContent = `语言=${{data.health.models.language}} / ASR=${{data.health.models.asr_provider}}:${{data.health.models.asr}} / ESP32语音=${{data.health.models.esp32_voice}} / TTS=${{data.health.models.tts_provider}}:${{data.health.models.tts}}`;
+      document.getElementById('models').textContent = `QQ文本=${{data.health.models.qq_language}} / 默认=${{data.health.models.default_language}} / ASR=${{data.health.models.asr_provider}}:${{data.health.models.asr}} / ESP32语音=${{data.health.models.esp32_voice}} / TTS=${{data.health.models.tts_provider}}:${{data.health.models.tts}}`;
       const memoryHealth = data.health.structured_memory || {{}};
       document.getElementById('memory-status').textContent =
         `会话记忆=${{memoryHealth.memory_count ?? 0}} 条 / 画像=${{memoryHealth.profile_count ?? 0}} 条`;
@@ -1337,13 +1353,29 @@ class ConnectionManager:
 
     async def send_to_qq(self, message: dict[str, Any]) -> None:
         if not self._socket_is_alive(self.qq_client):
-            logger.warning("QQ 终端未连接，消息未送达。")
+            logger.warning(
+                "QQ 终端未连接，下行动作未送达: action=%s echo=%s",
+                message.get("action"),
+                message.get("echo"),
+            )
             self.disconnect_qq()
             return
         try:
-            await self.qq_client.send_text(json.dumps(message, ensure_ascii=False))
+            payload = json.dumps(message, ensure_ascii=False)
+            await self.qq_client.send_text(payload)
             self.note_qq_activity()
+            logger.info(
+                "NapCat 下行动作已发送: action=%s echo=%s bytes=%d",
+                message.get("action"),
+                message.get("echo"),
+                len(payload.encode("utf-8")),
+            )
         except Exception:
+            logger.exception(
+                "NapCat 下行动作发送失败: action=%s echo=%s",
+                message.get("action"),
+                message.get("echo"),
+            )
             self.disconnect_qq()
             raise
 
@@ -1411,6 +1443,10 @@ async def healthz() -> dict[str, Any]:
         "models": {
             "language": config.language_model.model,
             "tool": config.tool_model.model,
+            "default_language": config.language_model.model,
+            "default_tool": config.tool_model.model,
+            "qq_language": config.qq_language_model.model,
+            "qq_tool": config.qq_tool_model.model,
             "embedding": config.context_embedding.model,
             "vision_low": config.vision_model.model,
             "vision_high": config.vision_highres_model.model,
@@ -1469,6 +1505,16 @@ async def api_esp32_tts_test(text: str = "小乐测试语音。") -> dict[str, A
     return {"ok": True, "text": text[:120]}
 
 
+@app.get("/api/esp32/device-command")
+async def api_esp32_device_command(command: str) -> dict[str, Any]:
+    command = command.strip()[:80]
+    if not command:
+        return {"ok": False, "error": "empty command"}
+    await manager.send_to_esp32({"type": "device_command", "command": command})
+    connection = manager.snapshot()
+    return {"ok": True, "command": command, "esp32_connected": connection["esp32_connected"]}
+
+
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page() -> HTMLResponse:
     return HTMLResponse(_build_logs_page())
@@ -1487,6 +1533,11 @@ if app_mount is not None:
 @app.websocket("/ws")
 async def qq_endpoint(websocket: WebSocket) -> None:
     await manager.connect_qq(websocket)
+    logger.info(
+        "QQ 文本链路已绑定: route=/ws | language=%s | tool=%s",
+        config.qq_language_model.model,
+        config.qq_tool_model.model,
+    )
     try:
         while True:
             payload = json.loads(await websocket.receive_text())
@@ -1523,7 +1574,9 @@ if __name__ == "__main__":
             logger.info("运行日志: %s", config.runtime_log_file)
             logger.info("模型轨迹/聊天记录日志: %s", config.trace_log_file)
             logger.info(
-                "模型路由: language=%s | tool=%s | embedding=%s | vision_low=%s | vision_high=%s | esp32_voice=%s | tts=%s(%s) | tts_voice=%s",
+                "模型路由: qq_text=%s | qq_tool=%s | default_language=%s | default_tool=%s | embedding=%s | vision_low=%s | vision_high=%s | esp32_voice=%s | tts=%s(%s) | tts_voice=%s",
+                config.qq_language_model.model,
+                config.qq_tool_model.model,
                 config.language_model.model,
                 config.tool_model.model,
                 config.context_embedding.model,

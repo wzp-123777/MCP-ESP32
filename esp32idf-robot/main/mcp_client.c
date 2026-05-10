@@ -78,6 +78,7 @@ static bool s_netif_ready;
 static bool s_wifi_connected;
 static bool s_ws_connected;
 static bool s_started;
+static bool s_sr_enabled;
 static bool s_ws_restart_requested;
 static bool s_ws_recreate_requested;
 static bool s_ws_stopping;
@@ -111,6 +112,8 @@ static bool s_cfg_wake_enabled;
 static bool s_cfg_valid;
 static mcp_client_busy_cb_t s_busy_cb;
 static void *s_busy_ctx;
+static mcp_client_device_command_cb_t s_device_command_cb;
+static void *s_device_command_ctx;
 
 #define MCP_WIFI_CONNECTED_BIT BIT0
 #define MCP_SEND_TIMEOUT pdMS_TO_TICKS(3000)
@@ -1014,7 +1017,12 @@ static void handle_ws_text(const char *message)
     }
 
     if (strcmp(type, "device_command") == 0) {
-        ESP_LOGI(TAG, "device_command: %s", message);
+        char command[80];
+        json_get_string(message, "command", command, sizeof(command));
+        ESP_LOGI(TAG, "device_command: %s", command[0] ? command : message);
+        if (command[0] && s_device_command_cb) {
+            s_device_command_cb(command, s_device_command_ctx);
+        }
         return;
     }
 
@@ -1402,10 +1410,24 @@ bool mcp_client_is_assistant_busy(void)
     return s_assistant_busy;
 }
 
+void mcp_client_set_sr_enabled(bool enabled)
+{
+    s_sr_enabled = enabled;
+    if (s_ws_connected) {
+        mcp_client_send_telemetry();
+    }
+}
+
 void mcp_client_set_busy_callback(mcp_client_busy_cb_t cb, void *ctx)
 {
     s_busy_cb = cb;
     s_busy_ctx = ctx;
+}
+
+void mcp_client_set_device_command_callback(mcp_client_device_command_cb_t cb, void *ctx)
+{
+    s_device_command_cb = cb;
+    s_device_command_ctx = ctx;
 }
 
 esp_err_t mcp_client_send_text_request(const char *text)
@@ -1570,11 +1592,12 @@ esp_err_t mcp_client_send_telemetry(void)
     }
     snprintf(payload,
              sizeof(payload),
-             "{\"type\":\"telemetry\",\"device_id\":\"%s\",\"free_heap\":%u,\"wifi_rssi\":%d,\"uptime_ms\":%u,\"ws_connected\":true,\"sr_enabled\":false}",
+             "{\"type\":\"telemetry\",\"device_id\":\"%s\",\"free_heap\":%u,\"wifi_rssi\":%d,\"uptime_ms\":%u,\"ws_connected\":true,\"sr_enabled\":%s}",
              ROBOT_DEVICE_ID,
              (unsigned)esp_get_free_heap_size(),
              rssi,
-             (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+             (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS),
+             s_sr_enabled ? "true" : "false");
     esp_err_t err = ws_send_json(payload);
     if (err == ESP_OK) {
         app_ui_set_mcp_connected(true);

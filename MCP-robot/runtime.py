@@ -194,6 +194,46 @@ def _analyze_wav_audio(wav_bytes: bytes) -> dict[str, float | int]:
         return {"sample_count": 0, "nonzero_samples": 0, "nonzero_ratio": 0.0, "peak": 0, "rms": 0.0}
 
 
+def _normalize_esp32_dialog_input_pcm(
+    pcm_bytes: bytes,
+) -> tuple[bytes, dict[str, float | int], dict[str, float | int], float]:
+    before = _analyze_pcm_s16le(pcm_bytes)
+    peak = int(before.get("peak") or 0)
+    rms = float(before.get("rms") or 0.0)
+    if not pcm_bytes or peak <= 0 or rms <= 0.0:
+        return pcm_bytes, before, before, 1.0
+
+    gain_candidates = [_ESP32_DIALOG_INPUT_MAX_GAIN]
+    if _ESP32_DIALOG_INPUT_TARGET_RMS > 0:
+        gain_candidates.append(_ESP32_DIALOG_INPUT_TARGET_RMS / rms)
+    gain = max(1.0, min(gain_candidates))
+    if gain <= 1.01:
+        return pcm_bytes, before, before, 1.0
+
+    frame_bytes = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    normalized = bytearray(frame_bytes)
+    offset = 0
+    for (sample,) in struct.iter_unpack("<h", pcm_bytes[:frame_bytes]):
+        value = int(round(float(sample) * gain))
+        if _ESP32_DIALOG_INPUT_TARGET_PEAK > 0:
+            if value > _ESP32_DIALOG_INPUT_TARGET_PEAK:
+                value = _ESP32_DIALOG_INPUT_TARGET_PEAK
+            elif value < -_ESP32_DIALOG_INPUT_TARGET_PEAK:
+                value = -_ESP32_DIALOG_INPUT_TARGET_PEAK
+        if value > 32767:
+            value = 32767
+        elif value < -32768:
+            value = -32768
+        struct.pack_into("<h", normalized, offset, value)
+        offset += 2
+    if frame_bytes < len(pcm_bytes):
+        normalized.extend(pcm_bytes[frame_bytes:])
+
+    normalized_bytes = bytes(normalized)
+    after = _analyze_pcm_s16le(normalized_bytes)
+    return normalized_bytes, before, after, gain
+
+
 _TTS_AUDIO_B64_CHUNK_CHARS = 4096
 _TTS_AUDIO_CHUNK_DELAY_SECONDS = 0.005
 _TTS_STRONG_PUNCT_MIN_CHARS = 2
@@ -205,7 +245,10 @@ _ESP32_TTS_TARGET_PEAK = 12000
 _ESP32_TTS_SOFT_LIMIT = 26000
 _DIALOG_TTS_TARGET_PEAK = 14000
 _DIALOG_TTS_MAX_GAIN = 8.0
-_ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "220"))
+_ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "80"))
+_ESP32_DIALOG_INPUT_TARGET_RMS = float(os.getenv("ESP32_DIALOG_INPUT_TARGET_RMS", "900"))
+_ESP32_DIALOG_INPUT_TARGET_PEAK = int(os.getenv("ESP32_DIALOG_INPUT_TARGET_PEAK", "16000"))
+_ESP32_DIALOG_INPUT_MAX_GAIN = float(os.getenv("ESP32_DIALOG_INPUT_MAX_GAIN", "4"))
 _TTS_DEBUG_DIR = Path(__file__).resolve().parent / "data" / "esp32_tts"
 _EMOJI_RE = re.compile(
     "["
@@ -728,6 +771,8 @@ class RobotRuntime:
         self.connection_manager = connection_manager
         self.language_model = LanguageModelService(config.language_model)
         self.tool_model = ToolModelService(config.tool_model)
+        self.qq_language_model = LanguageModelService(config.qq_language_model)
+        self.qq_tool_model = ToolModelService(config.qq_tool_model)
         self.context_embedding = ContextEmbeddingService(config.context_embedding) if config.context_embedding.api_key else None
         self.vision_model = VisionModelService(config.vision_model)
         self.vision_highres_model = VisionModelService(config.vision_highres_model)
@@ -772,6 +817,14 @@ class RobotRuntime:
         self.audio_capture_dir = self.config.data_dir / "esp32_audio"
         self.audio_capture_dir.mkdir(parents=True, exist_ok=True)
         self.config.doubao_dialog.persona_dir.mkdir(parents=True, exist_ok=True)
+
+    def _language_model_for(self, request_or_source: TextRequest | str) -> LanguageModelService:
+        source = request_or_source.source if isinstance(request_or_source, TextRequest) else str(request_or_source)
+        return self.qq_language_model if source == "NapCatQQ" else self.language_model
+
+    def _tool_model_for(self, request_or_source: TextRequest | str) -> ToolModelService:
+        source = request_or_source.source if isinstance(request_or_source, TextRequest) else str(request_or_source)
+        return self.qq_tool_model if source == "NapCatQQ" else self.tool_model
 
     def _cleanup_stale_audio_streams(self) -> None:
         if not self._pending_audio_streams:
@@ -961,8 +1014,9 @@ class RobotRuntime:
         recent_summaries = self.conversation_store.recent_summaries(session_id=session_id, limit=3)
 
         try:
+            tool_model = self._tool_model_for(source)
             result = await asyncio.wait_for(
-                self.tool_model.build_returning_user_context(
+                tool_model.build_returning_user_context(
                     session_id=session_id,
                     source=source,
                     gap_minutes=gap_minutes,
@@ -1062,7 +1116,8 @@ class RobotRuntime:
             text=candidate.return_user_text,
         )
         try:
-            result = await self.tool_model.analyze_offline_gap(
+            tool_model = self._tool_model_for(candidate.source)
+            result = await tool_model.analyze_offline_gap(
                 session_id=candidate.session_id,
                 source=candidate.source,
                 gap_minutes=candidate.gap_minutes,
@@ -1105,6 +1160,10 @@ class RobotRuntime:
             "models": {
                 "language": self.language_model.model_name,
                 "tool": self.tool_model.model_name,
+                "default_language": self.language_model.model_name,
+                "default_tool": self.tool_model.model_name,
+                "qq_language": self.qq_language_model.model_name,
+                "qq_tool": self.qq_tool_model.model_name,
                 "vision_low": self.vision_model.model_name,
                 "vision_high": self.vision_highres_model.model_name,
                 "asr": self.asr_model.model_name if self.asr_model else "",
@@ -1534,12 +1593,12 @@ class RobotRuntime:
         return ""
 
     async def _compose_natural_image_followup(self, *, user_text: str, memory_summary: str) -> str:
-        text = await self.language_model.compose_image_followup(
+        text = await self.qq_language_model.compose_image_followup(
             user_text=user_text,
             memory_summary=memory_summary,
         )
         if self._looks_like_raw_image_followup(text, memory_summary):
-            polished = await self.tool_model.polish_image_followup(
+            polished = await self.qq_tool_model.polish_image_followup(
                 user_text=user_text,
                 memory_summary=memory_summary,
             )
@@ -1754,7 +1813,8 @@ class RobotRuntime:
         threshold: int | None = None,
     ) -> tuple[bool, bool]:
         threshold = self.config.image_reply_relevance_threshold if threshold is None else threshold
-        decision = await self.language_model.assess_image_reply_relevance(
+        language_model = self._language_model_for(request)
+        decision = await language_model.assess_image_reply_relevance(
             source=request.source,
             user_text=request_text,
             image_summary=image_summary,
@@ -1771,7 +1831,7 @@ class RobotRuntime:
             user_id=request.user_id,
             group_id=request.group_id,
             device_id=request.device_id,
-            model=self.language_model.model_name,
+            model=language_model.model_name,
             score=decision.score,
             threshold=threshold,
             should_reply=should_reply_with_image,
@@ -2049,6 +2109,30 @@ class RobotRuntime:
     async def handle_napcat_payload(self, payload: dict[str, Any]) -> None:
         self._ensure_background_workers()
         if payload.get("meta_event_type") == "heartbeat":
+            return
+        if "status" in payload or "retcode" in payload:
+            status = str(payload.get("status") or "").strip()
+            retcode = payload.get("retcode")
+            echo = str(payload.get("echo") or "").strip()
+            wording = str(payload.get("wording") or payload.get("message") or payload.get("msg") or "").strip()
+            ok = status.lower() in {"ok", "async"} and (retcode in (None, "", 0, "0"))
+            event = "qq.action.response" if ok else "qq.action.error"
+            self._trace(
+                event,
+                source="NapCatQQ",
+                status=status,
+                retcode=retcode,
+                echo=echo,
+                wording=wording,
+            )
+            if not ok:
+                logger.warning(
+                    "NapCat 动作响应异常: status=%s retcode=%s echo=%s wording=%s",
+                    status,
+                    retcode,
+                    echo,
+                    wording,
+                )
             return
         if payload.get("post_type") != "message":
             return
@@ -2450,6 +2534,25 @@ class RobotRuntime:
                 audio_rms=round(float(audio_stats["rms"]), 2),
                 audio_nonzero_ratio=round(float(audio_stats["nonzero_ratio"]), 6),
             )
+            if reason.startswith("raw_tdm_diag"):
+                self._trace(
+                    "audio.capture.raw_tdm_diag.saved",
+                    source="ESP32",
+                    device_id=device_id,
+                    session_id=session_id,
+                    wav_path=str(wav_path),
+                    reason=str(payload.get("reason") or ""),
+                    audio_peak=audio_stats["peak"],
+                    audio_rms=round(float(audio_stats["rms"]), 2),
+                )
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status="idle",
+                    device_id=device_id,
+                    session_id=session_id,
+                    text=f"Raw TDM 诊断已保存: {wav_path.name}",
+                )
+                return
             self._track_task(
                 self._run_esp32_audio_pipeline(
                     session_id=session_id,
@@ -2578,6 +2681,8 @@ class RobotRuntime:
                 target_rate=16000,
             )
             audio_stats = _analyze_pcm_s16le(pcm16)
+            raw_audio_stats = audio_stats
+            dialog_input_gain = 1.0
             if int(audio_stats.get("nonzero_samples") or 0) == 0 or int(audio_stats.get("peak") or 0) == 0:
                 await self.connection_manager.send_to_esp32(
                     {
@@ -2617,6 +2722,20 @@ class RobotRuntime:
                     text="这段录音没有检测到清楚人声。",
                 )
                 return True
+            pcm16, raw_audio_stats, audio_stats, dialog_input_gain = _normalize_esp32_dialog_input_pcm(pcm16)
+            if dialog_input_gain > 1.01:
+                logger.info(
+                    "ESP32 dialog input normalized: session=%s gain=%.2f rms=%.2f->%.2f peak=%d->%d "
+                    "target_rms=%.1f target_peak=%d",
+                    session_id,
+                    dialog_input_gain,
+                    float(raw_audio_stats.get("rms") or 0.0),
+                    float(audio_stats.get("rms") or 0.0),
+                    int(raw_audio_stats.get("peak") or 0),
+                    int(audio_stats.get("peak") or 0),
+                    _ESP32_DIALOG_INPUT_TARGET_RMS,
+                    _ESP32_DIALOG_INPUT_TARGET_PEAK,
+                )
         except Exception as exc:
             logger.exception("ESP32 豆包实时语音准备失败")
             self._trace("dialog.prepare.error", source="ESP32", device_id=device_id, session_id=session_id, error=str(exc))
@@ -2647,8 +2766,11 @@ class RobotRuntime:
             session_id=session_id,
             wav_path=str(wav_path),
             duration_ms=duration_ms,
+            audio_peak_raw=raw_audio_stats["peak"],
+            audio_rms_raw=round(float(raw_audio_stats["rms"]), 2),
             audio_peak=audio_stats["peak"],
             audio_rms=round(float(audio_stats["rms"]), 2),
+            audio_input_gain=round(dialog_input_gain, 2),
             persona_id=runtime_cfg.persona_id,
             voice_id=runtime_cfg.voice_id,
             voice_speaker=tts_speaker,
@@ -2998,7 +3120,8 @@ class RobotRuntime:
             raw_result = await self.agent_bridge.run_root_command(bridge_prompt)
             message = raw_result
             if self._should_summarize_root_result(raw_result):
-                message = await self.language_model.summarize_agent_result(
+                language_model = self._language_model_for(request)
+                message = await language_model.summarize_agent_result(
                     command=command,
                     raw_result=raw_result,
                     max_chars=900,
@@ -3297,6 +3420,7 @@ class RobotRuntime:
     ) -> None:
         esp32_ready = bool(getattr(self.connection_manager, "is_esp32_connected", True))
         audio_session_id = str(request.extra.get("audio_session_id") or "")
+        language_model = self._language_model_for(request)
         tts_dispatcher = (
             StreamingTTSDispatcher(
                 self.tts_model,
@@ -3328,7 +3452,7 @@ class RobotRuntime:
             )
 
         last_tts_flush_len = 0
-        async for chunk in self.language_model.stream_reply(
+        async for chunk in language_model.stream_reply(
             source=request.source,
             user_text=request_text,
             subconscious=subconscious_context,
@@ -3341,7 +3465,7 @@ class RobotRuntime:
                 "assistant.delta",
                 source=request.source,
                 device_id=request.device_id,
-                model=self.language_model.model_name,
+                model=language_model.model_name,
                 text=chunk,
             )
             if request.source == "ESP32":
@@ -3380,7 +3504,7 @@ class RobotRuntime:
         self._trace(
             "chat.record",
             source=request.source,
-            model=self.language_model.model_name,
+            model=language_model.model_name,
             user_text=request.text,
             assistant_text=final_reply,
             tool_context=tool_context,
@@ -3421,7 +3545,7 @@ class RobotRuntime:
         if request.source == "NapCatQQ":
             qq_summary = ""
             if self._should_build_qq_summary(final_reply):
-                qq_summary = await self.language_model.summarize_for_qq(
+                qq_summary = await language_model.summarize_for_qq(
                     user_text=request_text,
                     assistant_reply=final_reply,
                     max_chars=self.config.qq_summary_max_chars,
@@ -3489,6 +3613,8 @@ class RobotRuntime:
     ) -> None:
         try:
             request_text = str(request.extra.get("normalized_text") or request.text).strip() or request.text
+            language_model = self._language_model_for(request)
+            tool_model = self._tool_model_for(request)
             pending_image_job = self._get_pending_image_job(request) if request.source == "NapCatQQ" else None
             recent_frame_hint = self._get_recent_frame_for_request(request) if request.source == "NapCatQQ" else None
             referential_hint = recent_frame_hint is not None and self._looks_like_referential_followup(request_text)
@@ -3603,13 +3729,13 @@ class RobotRuntime:
                         needs_tools=semantic_plan.needs_tools,
                     )
                 else:
-                    semantic_plan = await self.language_model.plan_text(
+                    semantic_plan = await language_model.plan_text(
                         source=request.source,
                         user_text=request_text,
                         subconscious=subconscious_context,
                     )
             else:
-                semantic_plan = await self.language_model.plan_text(
+                semantic_plan = await language_model.plan_text(
                     source=request.source,
                     user_text=request_text,
                     subconscious=subconscious_context,
@@ -3618,7 +3744,7 @@ class RobotRuntime:
                 "semantic.plan",
                 source=request.source,
                 user_text=request_text,
-                model=self.language_model.model_name,
+                model=language_model.model_name,
                 intent=semantic_plan.intent,
                 needs_tools=semantic_plan.needs_tools,
                 should_reply=semantic_plan.should_reply,
@@ -3634,7 +3760,7 @@ class RobotRuntime:
                 return
 
             if semantic_plan.needs_tools:
-                tool_plan = await self.tool_model.plan_tools(
+                tool_plan = await tool_model.plan_tools(
                     user_text=request_text,
                     semantic_plan=semantic_plan,
                     tool_catalog=self.tool_registry.catalog(),
@@ -3644,7 +3770,7 @@ class RobotRuntime:
                     "tool.plan",
                     source=request.source,
                     user_text=request_text,
-                    model=self.tool_model.model_name,
+                    model=tool_model.model_name,
                     calls=tool_plan.calls,
                     return_to_language=tool_plan.return_to_language,
                     direct_reply=tool_plan.direct_reply,
@@ -3770,8 +3896,10 @@ class RobotRuntime:
         else:
             user_id = request.user_id
             params["user_id"] = int(user_id) if user_id.isdigit() else user_id
-        self._trace("chat.outgoing.qq", action=action, params=params)
-        await self.connection_manager.send_to_qq({"action": action, "params": params})
+        target = request.group_id if action == "send_group_msg" else request.user_id
+        echo = f"qq:{action}:{target or 'unknown'}:{int(time.time() * 1000)}"
+        self._trace("chat.outgoing.qq", action=action, target=target, echo=echo, params=params)
+        await self.connection_manager.send_to_qq({"action": action, "params": params, "echo": echo})
 
     def _format_qq_message(self, final_reply: str, qq_summary: str) -> str:
         if not qq_summary:
