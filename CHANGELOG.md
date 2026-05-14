@@ -31,12 +31,18 @@ Known limitation:
 
 - The current firmware still uses the ADF-vendored ESP-SR 2.1.5 stack, so playback self-echo can still trigger AFE VAD. The v1.5 gate makes barge-in usable, but it is not the official full-duplex AEC solution.
 
-## v2.0 Target
+## v2.0
 
-Planned Espressif-aligned full-duplex release.
+Espressif-aligned full-duplex AEC candidate.
 
-- Override or upgrade the firmware ESP-SR dependency to Espressif ESP-SR 2.4.3 or newer.
-- Use the official ESP32-S3 Full-Duplex AEC/AFE path.
-- Evaluate `AEC_MODE_FD_LOW_COST` first, then `AEC_MODE_FD_HIGH_PERF` if needed.
-- Validate playback reference stability, reference lag, correlation, and near-end speech preservation.
-- Keep the v1.5 asynchronous upload queue and barge-in gate as fallback protection.
+- Adds an explicit firmware dependency on Espressif ESP-SR 2.4.4 instead of relying on the ADF-vendored ESP-SR 2.1.5 component.
+- Switches AFE creation to `AFE_TYPE_FD` for the official full-duplex scenario.
+- Uses `AEC_MODE_FD_LOW_COST` first to keep ESP32-S3 CPU load conservative.
+- Enables aggressive AEC NLP and keeps noise suppression active when a playback reference channel is present.
+- Keeps the v1.5 asynchronous upload queue and playback-aware barge-in gate as fallback protection while hardware tuning continues.
+
+Validation still required:
+
+- Flash on COM3 and confirm logs show the managed ESP-SR 2.4.4 component.
+- Re-run `BARGE` and continuous-chat interruption tests.
+- Compare `ref_corr`, `ref_lag_ms`, self-echo VAD behavior, and whether real near-end speech remains accepted.

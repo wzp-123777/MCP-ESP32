@@ -49,8 +49,10 @@
 #define AFE_CAPTURE_LOG_INTERVAL_MS 1000
 #define AFE_CAPTURE_I2S_TIMEOUT_MS 100
 #define AFE_CAPTURE_AEC_FILTER_LENGTH 4
-#define AFE_CAPTURE_AFE_MODE AFE_MODE_HIGH_PERF
-#define AFE_CAPTURE_AEC_MODE AEC_MODE_SR_HIGH_PERF
+#define AFE_CAPTURE_AFE_TYPE AFE_TYPE_FD
+#define AFE_CAPTURE_AFE_MODE AFE_MODE_LOW_COST
+#define AFE_CAPTURE_AEC_MODE AEC_MODE_FD_LOW_COST
+#define AFE_CAPTURE_AEC_NLP_LEVEL AEC_NLP_LEVEL_AGGR
 #define AFE_CAPTURE_I2S_OUT_RB_SIZE (2 * 1024)
 #define AFE_CAPTURE_RAW_OUT_RB_SIZE (4 * 1024)
 #define AFE_CAPTURE_FILTER_OUT_RB_SIZE (2 * 1024)
@@ -82,7 +84,7 @@ static audio_element_handle_t s_i2s_reader;
 static audio_element_handle_t s_filter;
 static audio_element_handle_t s_raw_reader;
 static srmodel_list_t *s_models;
-static esp_afe_sr_iface_t *s_afe_handle;
+static const esp_afe_sr_iface_t *s_afe_handle;
 static esp_afe_sr_data_t *s_afe_data;
 static TaskHandle_t s_feed_task;
 static TaskHandle_t s_fetch_task;
@@ -812,7 +814,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     }
     log_heap("after model load");
 
-    afe_config_t *afe_cfg = afe_config_init(s_input_format, s_models, AFE_TYPE_SR, AFE_CAPTURE_AFE_MODE);
+    afe_config_t *afe_cfg = afe_config_init(s_input_format, s_models, AFE_CAPTURE_AFE_TYPE, AFE_CAPTURE_AFE_MODE);
     if (!afe_cfg) {
         ESP_LOGE(TAG, "afe_config_init failed");
         afe_capture_cleanup_failed_init();
@@ -835,8 +837,9 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     afe_cfg->aec_init = s_has_ref_channel;
     afe_cfg->aec_mode = AFE_CAPTURE_AEC_MODE;
     afe_cfg->aec_filter_length = AFE_CAPTURE_AEC_FILTER_LENGTH;
+    afe_cfg->aec_nlp_level = AFE_CAPTURE_AEC_NLP_LEVEL;
     afe_cfg->se_init = false;
-    afe_cfg->ns_init = false;
+    afe_cfg->ns_init = s_has_ref_channel;
     afe_cfg->vad_init = true;
     afe_cfg->vad_mode = VAD_MODE_2;
     afe_cfg->vad_model_name = vad_model;
@@ -908,13 +911,18 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
 
     log_heap("init ready");
     ESP_LOGI(TAG,
-             "ready: input=%s rate=%dHz feed=%dch/%d samples fetch=%dch/%d samples aec=%d vad=esp-sr vad_mute_playback=%d wake=%d model=%s vad_model=%s",
+             "ready: input=%s rate=%dHz feed=%dch/%d samples fetch=%dch/%d samples afe_type=%d afe_mode=%d aec=%d aec_mode=%d aec_nlp=%d ns=%d vad=esp-sr vad_mute_playback=%d wake=%d model=%s vad_model=%s",
              s_input_format,
              s_afe_handle->get_samp_rate(s_afe_data),
              s_feed_channels,
              s_feed_chunk_samples,
              s_fetch_channels,
              s_fetch_chunk_samples,
+             AFE_CAPTURE_AFE_TYPE,
+             AFE_CAPTURE_AFE_MODE,
+             s_has_ref_channel,
+             AFE_CAPTURE_AEC_MODE,
+             AFE_CAPTURE_AEC_NLP_LEVEL,
              s_has_ref_channel,
              s_vad_mute_playback,
              s_has_wake_model,

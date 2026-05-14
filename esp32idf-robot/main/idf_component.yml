@@ -1,4 +1,5 @@
 dependencies:
+  espressif/esp-sr: "2.4.4"
   lvgl/lvgl: "^8.4.0"
   esp_lcd_touch_gt911: "^1"
   esp_lcd_touch_tt21100: ">=1.0.0"

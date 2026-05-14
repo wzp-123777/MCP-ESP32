@@ -1,6 +1,25 @@
 cmake_minimum_required(VERSION 3.5)
 
 include($ENV{ADF_PATH}/CMakeLists.txt)
+
+file(TO_CMAKE_PATH "$ENV{ADF_PATH}/components" ADF_COMPONENT_ROOT)
+set(FILTERED_EXTRA_COMPONENT_DIRS "")
+foreach(EXTRA_COMPONENT_DIR IN LISTS EXTRA_COMPONENT_DIRS)
+    file(TO_CMAKE_PATH "${EXTRA_COMPONENT_DIR}" EXTRA_COMPONENT_DIR_CMAKE)
+    if(EXTRA_COMPONENT_DIR_CMAKE STREQUAL ADF_COMPONENT_ROOT)
+        file(GLOB ADF_COMPONENT_DIRS LIST_DIRECTORIES true "${ADF_COMPONENT_ROOT}/*")
+        foreach(ADF_COMPONENT_DIR IN LISTS ADF_COMPONENT_DIRS)
+            get_filename_component(ADF_COMPONENT_NAME "${ADF_COMPONENT_DIR}" NAME)
+            if(NOT ADF_COMPONENT_NAME STREQUAL "esp-sr")
+                list(APPEND FILTERED_EXTRA_COMPONENT_DIRS "${ADF_COMPONENT_DIR}")
+            endif()
+        endforeach()
+    else()
+        list(APPEND FILTERED_EXTRA_COMPONENT_DIRS "${EXTRA_COMPONENT_DIR}")
+    endif()
+endforeach()
+set(EXTRA_COMPONENT_DIRS ${FILTERED_EXTRA_COMPONENT_DIRS})
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(esp32idf_robot_voice)
