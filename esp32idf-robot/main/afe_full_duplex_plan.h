@@ -16,6 +16,8 @@
  * Official references in the local ADF checkout:
  * - examples/advanced_examples/aec/main/aec_examples.c
  *   Korvo-2 single-mic AEC uses input format "RM"; dual-mic AEC uses "RMNM".
+ *   This board's raw TDM diagnostics currently point to "RNNM" as the safer
+ *   default: ch0 is the playback reference and ch3 is the cleaner mic.
  * - examples/speech_recognition/wwe/main/main.c
  *   Uses recorder_sr + audio_recorder events for WakeNet/VAD.
  * - examples/ai_agent/volc_rtc/components/audio_processor/

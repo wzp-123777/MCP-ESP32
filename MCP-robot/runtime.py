@@ -2237,6 +2237,19 @@ class RobotRuntime:
             self._track_task(self._run_image_pipeline(device_id, payload), task_type="esp32.image", source="ESP32", metadata={"device_id": device_id})
         elif event_type == "telemetry":
             logger.info("收到 ESP32 状态上报 [%s]: %s", device_id, json.dumps(payload, ensure_ascii=False))
+        elif event_type == "diagnostic_event":
+            name = str(payload.get("name") or "unknown")
+            phase = str(payload.get("phase") or "")
+            detail = str(payload.get("detail") or "")
+            logger.info("ESP32 诊断事件 [%s]: name=%s phase=%s detail=%s", device_id, name, phase, detail)
+            self._trace(
+                "esp32.diagnostic",
+                source="ESP32",
+                device_id=device_id,
+                name=name,
+                phase=phase,
+                detail=detail,
+            )
         elif event_type == "client_config":
             await self._handle_esp32_client_config(payload, device_id=device_id)
         elif event_type == "audio_stream_start":
@@ -2932,6 +2945,30 @@ class RobotRuntime:
                     raise RuntimeError(f"Doubao dialog session failed: {payload!r}")
         except Exception as exc:
             error_text = str(exc)
+            if (
+                "DialogAudioIdleTimeoutError" in error_text
+                and not final_asr
+                and not sent_pcm_start
+            ):
+                logger.info(
+                    "ESP32 Doubao dialog ignored no-speech idle timeout: session=%s",
+                    session_id,
+                )
+                self._trace(
+                    "dialog.no_speech",
+                    source="ESP32",
+                    device_id=device_id,
+                    session_id=session_id,
+                    error=error_text,
+                )
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status="idle",
+                    device_id=device_id,
+                    session_id=session_id,
+                    text="刚刚这段没有检测到清楚的人声。",
+                )
+                return True
             logger.exception("ESP32 豆包实时语音失败")
             self._trace("dialog.error", source="ESP32", device_id=device_id, session_id=session_id, error=error_text)
             if "DialogAudioIdleTimeoutError" in error_text:

@@ -1,5 +1,6 @@
 #include "afe_capture.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -41,6 +42,10 @@
 #define AFE_CAPTURE_AFE_RINGBUF_FRAMES 16
 #define AFE_CAPTURE_VAD_OFF_MS 850
 #define AFE_CAPTURE_VAD_START_MS 160
+#define AFE_CAPTURE_VAD_DELAY_MS 128
+#define AFE_CAPTURE_RNNM_VAD_OFF_MS 1000
+#define AFE_CAPTURE_RNNM_VAD_START_MS 240
+#define AFE_CAPTURE_RNNM_VAD_DELAY_MS 160
 #define AFE_CAPTURE_LOG_INTERVAL_MS 1000
 #define AFE_CAPTURE_I2S_TIMEOUT_MS 100
 #define AFE_CAPTURE_AEC_FILTER_LENGTH 4
@@ -50,9 +55,10 @@
 #define AFE_CAPTURE_RAW_OUT_RB_SIZE (4 * 1024)
 #define AFE_CAPTURE_FILTER_OUT_RB_SIZE (2 * 1024)
 #define AFE_CAPTURE_RAW_MONITOR_CHANNELS 4
+#define AFE_CAPTURE_INPUT_FMT_MAX_LEN 7
 
 #if defined(CONFIG_ESP32_S3_KORVO2_V3_BOARD)
-#define AFE_CAPTURE_INPUT_FMT "RMNM"
+#define AFE_CAPTURE_DEFAULT_INPUT_FMT "RNNM"
 #define AFE_CAPTURE_I2S_RATE AFE_CAPTURE_RATE
 #define AFE_CAPTURE_I2S_BITS I2S_DATA_BIT_WIDTH_32BIT
 #define AFE_CAPTURE_I2S_CHANNEL_TYPE I2S_CHANNEL_FMT_RIGHT_LEFT
@@ -60,7 +66,7 @@
 #define AFE_CAPTURE_FILTER_SRC_CH 0
 #define AFE_CAPTURE_FILTER_DEST_CH 0
 #else
-#define AFE_CAPTURE_INPUT_FMT AUDIO_ADC_INPUT_CH_FORMAT
+#define AFE_CAPTURE_DEFAULT_INPUT_FMT AUDIO_ADC_INPUT_CH_FORMAT
 #define AFE_CAPTURE_I2S_RATE AFE_CAPTURE_RATE
 #define AFE_CAPTURE_I2S_BITS CODEC_ADC_BITS_PER_SAMPLE
 #define AFE_CAPTURE_I2S_CHANNEL_TYPE I2S_CHANNEL_FMT_RIGHT_LEFT
@@ -97,6 +103,7 @@ static bool s_has_wake_model;
 static bool s_vad_speech;
 static bool s_wake_latched;
 static bool s_has_ref_channel;
+static bool s_vad_mute_playback;
 static TickType_t s_capture_start_tick;
 static volatile uint32_t s_capture_bytes;
 static TickType_t s_feed_wait_log_tick;
@@ -108,6 +115,7 @@ static int s_fetch_chunk_samples;
 static int s_feed_channels;
 static int s_fetch_channels;
 static int s_feed_bytes;
+static char s_input_format[AFE_CAPTURE_INPUT_FMT_MAX_LEN + 1] = AFE_CAPTURE_DEFAULT_INPUT_FMT;
 
 static int abs16_local(int16_t value)
 {
@@ -137,6 +145,48 @@ static void log_heap(const char *where)
 static bool input_format_has_ref(const char *fmt)
 {
     return fmt && strchr(fmt, 'R') != NULL;
+}
+
+static bool input_format_is_supported(const char *fmt)
+{
+    if (!fmt || !fmt[0]) {
+        return false;
+    }
+    size_t len = strlen(fmt);
+    if (len == 0 || len > AFE_CAPTURE_INPUT_FMT_MAX_LEN) {
+        return false;
+    }
+#if defined(CONFIG_ESP32_S3_KORVO2_V3_BOARD)
+    if (len != 4) {
+        return false;
+    }
+#endif
+    bool has_mic = false;
+    for (size_t i = 0; i < len; ++i) {
+        char ch = (char)toupper((unsigned char)fmt[i]);
+        if (ch == 'M') {
+            has_mic = true;
+        } else if (ch != 'R' && ch != 'N') {
+            return false;
+        }
+    }
+    return has_mic;
+}
+
+static esp_err_t normalize_input_format(const char *fmt, char *out, size_t out_size)
+{
+    if (!out || out_size == 0 || !input_format_is_supported(fmt)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t len = strlen(fmt);
+    if (len >= out_size) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = (char)toupper((unsigned char)fmt[i]);
+    }
+    out[len] = '\0';
+    return ESP_OK;
 }
 
 static void analyze_level(const int16_t *samples, int bytes, int *peak, int *avg_abs)
@@ -442,7 +492,7 @@ static esp_err_t create_audio_pipeline(void)
              "audio pipeline ready: i2s=%dHz bits=%d input=%s filter=%d raw=%dHz",
              AFE_CAPTURE_I2S_RATE,
              (int)AFE_CAPTURE_I2S_BITS,
-             AFE_CAPTURE_INPUT_FMT,
+             s_input_format,
              AFE_CAPTURE_USE_RESAMPLE_FILTER,
              AFE_CAPTURE_RATE);
     return ESP_OK;
@@ -672,6 +722,40 @@ static esp_err_t create_afe_tasks(void)
     return ESP_OK;
 }
 
+static void afe_capture_deinit_afe_runtime(void)
+{
+    s_running = false;
+    s_audio_cb = NULL;
+    s_audio_ctx = NULL;
+    s_raw_audio_cb = NULL;
+    s_raw_audio_ctx = NULL;
+    s_processed_audio_cb = NULL;
+    s_processed_audio_ctx = NULL;
+    s_raw_monitor_enabled = false;
+
+    cleanup_tasks();
+
+    if (s_afe_handle && s_afe_data) {
+        s_afe_handle->destroy(s_afe_data);
+    }
+    s_afe_data = NULL;
+    s_afe_handle = NULL;
+    s_initialized = false;
+    s_has_wake_model = false;
+    s_vad_speech = false;
+    s_wake_latched = false;
+    s_has_ref_channel = false;
+    s_capture_bytes = 0;
+    s_feed_wait_log_tick = 0;
+    s_fetch_log_tick = 0;
+    s_raw_monitor_log_tick = 0;
+    s_feed_chunk_samples = 0;
+    s_fetch_chunk_samples = 0;
+    s_feed_channels = 0;
+    s_fetch_channels = 0;
+    s_feed_bytes = 0;
+}
+
 esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
 {
     if (s_initialized) {
@@ -680,7 +764,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
 
     s_event_cb = event_cb;
     s_event_ctx = event_ctx;
-    s_has_ref_channel = input_format_has_ref(AFE_CAPTURE_INPUT_FMT);
+    s_has_ref_channel = input_format_has_ref(s_input_format);
     log_heap("init begin");
 
     audio_board_handle_t board = audio_board_get_handle();
@@ -702,13 +786,25 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     es7210_adc_set_gain(ES7210_INPUT_MIC1 | ES7210_INPUT_MIC2, GAIN_33DB);
 #endif
 
-    if (create_audio_pipeline() != ESP_OK) {
-        afe_capture_cleanup_failed_init();
-        return ESP_FAIL;
+    if (!s_pipeline || !s_raw_reader) {
+        if (create_audio_pipeline() != ESP_OK) {
+            afe_capture_cleanup_failed_init();
+            return ESP_FAIL;
+        }
+    } else {
+        ESP_LOGI(TAG,
+                 "audio pipeline reused: i2s=%dHz bits=%d input=%s filter=%d raw=%dHz",
+                 AFE_CAPTURE_I2S_RATE,
+                 (int)AFE_CAPTURE_I2S_BITS,
+                 s_input_format,
+                 AFE_CAPTURE_USE_RESAMPLE_FILTER,
+                 AFE_CAPTURE_RATE);
     }
     log_heap("after audio pipeline");
 
-    s_models = esp_srmodel_init("model");
+    if (!s_models) {
+        s_models = esp_srmodel_init("model");
+    }
     if (!s_models || s_models->num == 0) {
         ESP_LOGW(TAG, "no ESP-SR model found in partition 'model'; WakeNet/VADNet disabled");
     } else {
@@ -716,7 +812,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     }
     log_heap("after model load");
 
-    afe_config_t *afe_cfg = afe_config_init(AFE_CAPTURE_INPUT_FMT, s_models, AFE_TYPE_SR, AFE_CAPTURE_AFE_MODE);
+    afe_config_t *afe_cfg = afe_config_init(s_input_format, s_models, AFE_TYPE_SR, AFE_CAPTURE_AFE_MODE);
     if (!afe_cfg) {
         ESP_LOGE(TAG, "afe_config_init failed");
         afe_capture_cleanup_failed_init();
@@ -731,6 +827,10 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
 #endif
 
     bool init_wakenet = s_wake_enabled && wn_model != NULL;
+    bool rnnm_tuned = strcmp(s_input_format, "RNNM") == 0;
+    int vad_min_speech_ms = rnnm_tuned ? AFE_CAPTURE_RNNM_VAD_START_MS : AFE_CAPTURE_VAD_START_MS;
+    int vad_min_noise_ms = rnnm_tuned ? AFE_CAPTURE_RNNM_VAD_OFF_MS : AFE_CAPTURE_VAD_OFF_MS;
+    int vad_delay_ms = rnnm_tuned ? AFE_CAPTURE_RNNM_VAD_DELAY_MS : AFE_CAPTURE_VAD_DELAY_MS;
     s_has_wake_model = init_wakenet;
     afe_cfg->aec_init = s_has_ref_channel;
     afe_cfg->aec_mode = AFE_CAPTURE_AEC_MODE;
@@ -740,10 +840,10 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     afe_cfg->vad_init = true;
     afe_cfg->vad_mode = VAD_MODE_2;
     afe_cfg->vad_model_name = vad_model;
-    afe_cfg->vad_min_speech_ms = AFE_CAPTURE_VAD_START_MS;
-    afe_cfg->vad_min_noise_ms = AFE_CAPTURE_VAD_OFF_MS;
-    afe_cfg->vad_delay_ms = 128;
-    afe_cfg->vad_mute_playback = false;
+    afe_cfg->vad_min_speech_ms = vad_min_speech_ms;
+    afe_cfg->vad_min_noise_ms = vad_min_noise_ms;
+    afe_cfg->vad_delay_ms = vad_delay_ms;
+    afe_cfg->vad_mute_playback = s_vad_mute_playback;
     afe_cfg->vad_enable_channel_trigger = false;
     afe_cfg->wakenet_init = init_wakenet;
     afe_cfg->wakenet_model_name = init_wakenet ? wn_model : NULL;
@@ -753,6 +853,13 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     afe_cfg->afe_perferred_priority = AFE_CAPTURE_AFE_TASK_PRIO;
     afe_cfg->afe_ringbuf_size = AFE_CAPTURE_AFE_RINGBUF_FRAMES;
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    if (rnnm_tuned) {
+        ESP_LOGI(TAG,
+                 "RNNM VAD tuned: min_speech=%dms min_noise=%dms delay=%dms",
+                 vad_min_speech_ms,
+                 vad_min_noise_ms,
+                 vad_delay_ms);
+    }
     afe_cfg->afe_linear_gain = 1.0f;
     afe_cfg = afe_config_check(afe_cfg);
     afe_config_print(afe_cfg);
@@ -801,14 +908,15 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
 
     log_heap("init ready");
     ESP_LOGI(TAG,
-             "ready: input=%s rate=%dHz feed=%dch/%d samples fetch=%dch/%d samples aec=%d vad=esp-sr wake=%d model=%s vad_model=%s",
-             AFE_CAPTURE_INPUT_FMT,
+             "ready: input=%s rate=%dHz feed=%dch/%d samples fetch=%dch/%d samples aec=%d vad=esp-sr vad_mute_playback=%d wake=%d model=%s vad_model=%s",
+             s_input_format,
              s_afe_handle->get_samp_rate(s_afe_data),
              s_feed_channels,
              s_feed_chunk_samples,
              s_fetch_channels,
              s_fetch_chunk_samples,
              s_has_ref_channel,
+             s_vad_mute_playback,
              s_has_wake_model,
              wn_model ? wn_model : "none",
              vad_model ? vad_model : "webrtc");
@@ -876,6 +984,60 @@ void afe_capture_set_wake_enabled(bool enabled)
 bool afe_capture_has_wake_model(void)
 {
     return s_has_wake_model;
+}
+
+const char *afe_capture_get_input_format(void)
+{
+    return s_input_format;
+}
+
+esp_err_t afe_capture_set_input_format(const char *fmt)
+{
+    char normalized[AFE_CAPTURE_INPUT_FMT_MAX_LEN + 1];
+    esp_err_t err = normalize_input_format(fmt, normalized, sizeof(normalized));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "reject input format: %s", fmt ? fmt : "(null)");
+        return err;
+    }
+    if (strcmp(s_input_format, normalized) == 0) {
+        ESP_LOGI(TAG, "input format unchanged: %s", s_input_format);
+        return ESP_OK;
+    }
+    if (s_running) {
+        ESP_LOGW(TAG, "cannot change input format while capture is running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "input format change: %s -> %s", s_input_format, normalized);
+    if (s_initialized) {
+        afe_capture_deinit_afe_runtime();
+    }
+    snprintf(s_input_format, sizeof(s_input_format), "%s", normalized);
+    return ESP_OK;
+}
+
+bool afe_capture_get_vad_mute_playback(void)
+{
+    return s_vad_mute_playback;
+}
+
+esp_err_t afe_capture_set_vad_mute_playback(bool enabled)
+{
+    if (s_vad_mute_playback == enabled) {
+        ESP_LOGI(TAG, "vad_mute_playback unchanged: %d", enabled);
+        return ESP_OK;
+    }
+    if (s_running) {
+        ESP_LOGW(TAG, "cannot change vad_mute_playback while capture is running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "vad_mute_playback change: %d -> %d", s_vad_mute_playback, enabled);
+    s_vad_mute_playback = enabled;
+    if (s_initialized) {
+        afe_capture_deinit_afe_runtime();
+    }
+    return ESP_OK;
 }
 
 void afe_capture_set_raw_audio_callback(afe_capture_raw_audio_cb_t cb, void *ctx)

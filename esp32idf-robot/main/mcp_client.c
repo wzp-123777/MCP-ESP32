@@ -25,6 +25,7 @@
 #include "freertos/task.h"
 #include "lwip/apps/sntp.h"
 #include "mbedtls/base64.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 typedef enum {
@@ -44,6 +45,12 @@ typedef enum {
     TTS_PLAY_ITEM_END,
 } tts_play_item_kind_t;
 
+typedef enum {
+    AUDIO_UPLOAD_ITEM_START,
+    AUDIO_UPLOAD_ITEM_CHUNK,
+    AUDIO_UPLOAD_ITEM_END,
+} audio_upload_item_kind_t;
+
 typedef struct {
     tts_play_item_kind_t kind;
     uint8_t *data;
@@ -51,6 +58,15 @@ typedef struct {
     uint32_t segment_no;
     bool preroll;
 } tts_play_item_t;
+
+typedef struct {
+    audio_upload_item_kind_t kind;
+    char session_id[32];
+    uint8_t *data;
+    size_t len;
+    uint32_t duration_ms;
+    char reason[32];
+} audio_upload_item_t;
 
 typedef enum {
     MCP_UI_EVENT_STATUS,
@@ -72,6 +88,7 @@ static mcp_status_t s_status = MCP_STATUS_NOT_CONFIGURED;
 static EventGroupHandle_t s_event_group;
 static SemaphoreHandle_t s_send_lock;
 static QueueHandle_t s_tts_play_queue;
+static QueueHandle_t s_audio_upload_queue;
 static QueueHandle_t s_ui_event_queue;
 static esp_websocket_client_handle_t s_ws;
 static bool s_netif_ready;
@@ -103,6 +120,7 @@ static char s_current_session_id[32];
 static app_ui_assistant_state_t s_last_ui_state = APP_UI_STATE_IDLE;
 static TickType_t s_last_ui_state_tick;
 static volatile bool s_assistant_busy;
+static bool s_tts_playback_busy;
 static char s_cfg_persona_id[48] = "default";
 static char s_cfg_persona_label[64] = "默认人设";
 static char s_cfg_voice_id[48] = "default";
@@ -112,6 +130,8 @@ static bool s_cfg_wake_enabled;
 static bool s_cfg_valid;
 static mcp_client_busy_cb_t s_busy_cb;
 static void *s_busy_ctx;
+static mcp_client_playback_cb_t s_playback_cb;
+static void *s_playback_ctx;
 static mcp_client_device_command_cb_t s_device_command_cb;
 static void *s_device_command_ctx;
 
@@ -121,15 +141,23 @@ static void *s_device_command_ctx;
 #define MCP_MAX_TTS_BYTES (384 * 1024)
 #define MCP_MIN_TTS_BYTES 1024
 #define MCP_TTS_PLAY_QUEUE_LEN 12
+#define MCP_AUDIO_UPLOAD_QUEUE_LEN 64
+#define MCP_AUDIO_UPLOAD_BEGIN_WAIT_MS 250
+#define MCP_AUDIO_UPLOAD_END_WAIT_MS 250
 #define MCP_TTS_QUEUE_WAIT_MS 250
 #define MCP_UI_EVENT_QUEUE_LEN 8
+#define MCP_ENDPOINT_NVS_NAMESPACE "mcp_robot"
+#define MCP_ENDPOINT_NVS_KEY "endpoint"
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static void websocket_restart(void);
 static esp_err_t websocket_create_and_start(void);
 static void websocket_request_restart(void);
 static void websocket_request_recreate(void);
+static esp_err_t load_endpoint_from_nvs(void);
+static esp_err_t save_endpoint_to_nvs(const char *endpoint);
 static void tts_play_task(void *arg);
+static void audio_upload_task(void *arg);
 static void ui_event_task(void *arg);
 static const char *json_get_string(const char *json, const char *key, char *out, size_t out_size);
 static bool json_get_uint32(const char *json, const char *key, uint32_t *out);
@@ -148,6 +176,17 @@ static void set_assistant_busy(bool busy)
     s_assistant_busy = busy;
     if (s_busy_cb) {
         s_busy_cb(busy, s_busy_ctx);
+    }
+}
+
+static void set_tts_playback_busy(bool busy)
+{
+    if (s_tts_playback_busy == busy) {
+        return;
+    }
+    s_tts_playback_busy = busy;
+    if (s_playback_cb) {
+        s_playback_cb(busy, s_playback_ctx);
     }
 }
 
@@ -467,6 +506,57 @@ static void websocket_request_recreate(void)
     s_ws_restart_requested = true;
 }
 
+static esp_err_t load_endpoint_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(MCP_ENDPOINT_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char stored[sizeof(s_endpoint)] = {0};
+    size_t len = sizeof(stored);
+    err = nvs_get_str(handle, MCP_ENDPOINT_NVS_KEY, stored, &len);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (stored[0]) {
+        strlcpy(s_endpoint, stored, sizeof(s_endpoint));
+        ESP_LOGI(TAG, "endpoint loaded from nvs=%s", s_endpoint);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t save_endpoint_to_nvs(const char *endpoint)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(MCP_ENDPOINT_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!endpoint || endpoint[0] == '\0') {
+        err = nvs_erase_key(handle, MCP_ENDPOINT_NVS_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+    } else {
+        err = nvs_set_str(handle, MCP_ENDPOINT_NVS_KEY, endpoint);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
 static bool rx_reserve(size_t needed)
 {
     if (needed <= s_rx_cap) {
@@ -514,6 +604,187 @@ static void tts_reset(void)
     s_tts_b64_pending_len = 0;
     s_tts_chunk_count = 0;
     s_tts_b64_chars = 0;
+}
+
+static void tts_drop_queued_items(void)
+{
+    if (!s_tts_play_queue) {
+        return;
+    }
+    tts_play_item_t item = {0};
+    while (xQueueReceive(s_tts_play_queue, &item, 0) == pdTRUE) {
+        if (item.data) {
+            heap_caps_free(item.data);
+            item.data = NULL;
+        }
+    }
+}
+
+static void audio_upload_drop_queued_items(void)
+{
+    if (!s_audio_upload_queue) {
+        return;
+    }
+    audio_upload_item_t item = {0};
+    size_t dropped = 0;
+    while (xQueueReceive(s_audio_upload_queue, &item, 0) == pdTRUE) {
+        if (item.data) {
+            heap_caps_free(item.data);
+            item.data = NULL;
+        }
+        ++dropped;
+    }
+    if (dropped > 0) {
+        ESP_LOGW(TAG, "audio upload queue cleared items=%u", (unsigned)dropped);
+    }
+}
+
+void mcp_client_cancel_playback(void)
+{
+    audio_player_cancel();
+    tts_reset();
+    tts_drop_queued_items();
+    s_tts_pcm_active = false;
+    s_tts_pcm_first_chunk = false;
+    set_tts_playback_busy(false);
+    set_assistant_busy(false);
+    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+    ESP_LOGI(TAG, "tts playback canceled and queue cleared");
+}
+
+static bool audio_upload_queue_item(audio_upload_item_t *item, TickType_t wait_ticks, const char *label)
+{
+    if (!item || !s_audio_upload_queue) {
+        return false;
+    }
+    if (!s_ws_connected) {
+        if (item->data) {
+            heap_caps_free(item->data);
+            item->data = NULL;
+        }
+        ESP_LOGW(TAG, "%s skipped: ws disconnected", label ? label : "audio upload");
+        return false;
+    }
+    if (xQueueSend(s_audio_upload_queue, item, wait_ticks) == pdTRUE) {
+        UBaseType_t queued = uxQueueMessagesWaiting(s_audio_upload_queue);
+        if (queued >= (MCP_AUDIO_UPLOAD_QUEUE_LEN * 3) / 4) {
+            ESP_LOGW(TAG, "audio upload queue high queued=%u/%u", (unsigned)queued, MCP_AUDIO_UPLOAD_QUEUE_LEN);
+        }
+        return true;
+    }
+    if (item->data) {
+        heap_caps_free(item->data);
+        item->data = NULL;
+    }
+    ESP_LOGW(TAG, "%s queue full, dropped len=%u", label ? label : "audio upload", (unsigned)item->len);
+    return false;
+}
+
+static esp_err_t audio_upload_send_start(const audio_upload_item_t *item)
+{
+    char payload[256];
+    snprintf(payload,
+             sizeof(payload),
+             "{\"type\":\"audio_stream_start\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sample_rate\":%d,\"sample_bits\":%d,\"channels\":%d,\"encoding\":\"pcm_s16le\"}",
+             ROBOT_DEVICE_ID,
+             item ? item->session_id : "",
+             ROBOT_AUDIO_SAMPLE_RATE,
+             ROBOT_AUDIO_BITS,
+             ROBOT_AUDIO_CHANNELS);
+    return ws_send_json(payload);
+}
+
+static esp_err_t audio_upload_send_chunk(audio_upload_item_t *item)
+{
+    if (!item || !item->data || item->len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t b64_cap = ((item->len + 2) / 3) * 4 + 1;
+    char *b64 = heap_caps_malloc(b64_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!b64) {
+        b64 = heap_caps_malloc(b64_cap, MALLOC_CAP_8BIT);
+    }
+    if (!b64) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t b64_len = 0;
+    int rc = mbedtls_base64_encode((unsigned char *)b64, b64_cap, &b64_len, item->data, item->len);
+    if (rc != 0) {
+        heap_caps_free(b64);
+        return ESP_FAIL;
+    }
+    b64[b64_len] = '\0';
+
+    size_t payload_cap = b64_len + 160;
+    char *payload = heap_caps_malloc(payload_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!payload) {
+        payload = heap_caps_malloc(payload_cap, MALLOC_CAP_8BIT);
+    }
+    if (!payload) {
+        heap_caps_free(b64);
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(payload,
+             payload_cap,
+             "{\"type\":\"audio_stream_chunk\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"audio_b64\":\"%s\"}",
+             ROBOT_DEVICE_ID,
+             item->session_id,
+             b64);
+    esp_err_t err = ws_send_json(payload);
+    heap_caps_free(payload);
+    heap_caps_free(b64);
+    return err;
+}
+
+static esp_err_t audio_upload_send_end(const audio_upload_item_t *item)
+{
+    char reason_escaped[48];
+    char payload[256];
+    json_escape(item ? item->reason : "", reason_escaped, sizeof(reason_escaped));
+    snprintf(payload,
+             sizeof(payload),
+             "{\"type\":\"audio_stream_end\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"duration_ms\":%u,\"reason\":\"%s\"}",
+             ROBOT_DEVICE_ID,
+             item ? item->session_id : "",
+             (unsigned)(item ? item->duration_ms : 0),
+             reason_escaped[0] ? reason_escaped : "set_release");
+    return ws_send_json(payload);
+}
+
+static void audio_upload_task(void *arg)
+{
+    (void)arg;
+    audio_upload_item_t item = {0};
+    while (true) {
+        if (xQueueReceive(s_audio_upload_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        esp_err_t ret = ESP_OK;
+        switch (item.kind) {
+            case AUDIO_UPLOAD_ITEM_START:
+                ret = audio_upload_send_start(&item);
+                break;
+            case AUDIO_UPLOAD_ITEM_CHUNK:
+                ret = audio_upload_send_chunk(&item);
+                break;
+            case AUDIO_UPLOAD_ITEM_END:
+                ret = audio_upload_send_end(&item);
+                break;
+        }
+        if (item.data) {
+            heap_caps_free(item.data);
+            item.data = NULL;
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "audio upload send failed kind=%d session=%s ret=%s",
+                     item.kind,
+                     item.session_id,
+                     esp_err_to_name(ret));
+        }
+    }
 }
 
 static bool tts_reserve(size_t needed)
@@ -750,6 +1021,7 @@ static void tts_play_task(void *arg)
             ESP_LOGI(TAG, "tts pcm stream end chunks=%u", (unsigned)item.segment_no);
             s_tts_pcm_active = false;
             s_tts_pcm_first_chunk = false;
+            set_tts_playback_busy(false);
             set_assistant_busy(false);
             ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
             continue;
@@ -760,6 +1032,7 @@ static void tts_play_task(void *arg)
         set_assistant_busy(true);
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_PLAYING, NULL);
         if (item.kind == TTS_PLAY_ITEM_PCM) {
+            set_tts_playback_busy(true);
             esp_err_t ret = audio_player_play_pcm16(item.data, item.len, "tts_pcm", item.preroll);
             ESP_LOGD(TAG,
                      "tts pcm played chunk=%u len=%u ret=%s",
@@ -773,6 +1046,7 @@ static void tts_play_task(void *arg)
         }
 
         bool first_segment = item.segment_no == 0;
+        set_tts_playback_busy(true);
         esp_err_t ret = audio_player_play_wav_ex(item.data, item.len, "tts", first_segment, first_segment ? 30 : 0);
         ESP_LOGI(TAG,
                  "tts play finished segment=%u len=%u ret=%s",
@@ -782,6 +1056,7 @@ static void tts_play_task(void *arg)
         heap_caps_free(item.data);
         item.data = NULL;
         item.len = 0;
+        set_tts_playback_busy(false);
         set_assistant_busy(false);
         ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
     }
@@ -1041,6 +1316,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         s_wifi_connected = false;
         s_ws_connected = false;
+        audio_upload_drop_queued_items();
         websocket_request_restart();
         xEventGroupClearBits(s_event_group, MCP_WIFI_CONNECTED_BIT);
         s_status = MCP_STATUS_WIFI_CONNECTING;
@@ -1236,6 +1512,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_CLOSED:
             s_ws_connected = false;
+            audio_upload_drop_queued_items();
             if (!s_ws_stopping) {
                 websocket_request_restart();
             }
@@ -1246,6 +1523,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             break;
         case WEBSOCKET_EVENT_ERROR:
             s_ws_connected = false;
+            audio_upload_drop_queued_items();
             if (!s_ws_stopping) {
                 websocket_request_restart();
             }
@@ -1306,11 +1584,26 @@ esp_err_t mcp_client_init(void)
     s_event_group = xEventGroupCreate();
     s_send_lock = xSemaphoreCreateMutex();
     s_tts_play_queue = xQueueCreate(MCP_TTS_PLAY_QUEUE_LEN, sizeof(tts_play_item_t));
+    s_audio_upload_queue = xQueueCreate(MCP_AUDIO_UPLOAD_QUEUE_LEN, sizeof(audio_upload_item_t));
     s_ui_event_queue = xQueueCreate(MCP_UI_EVENT_QUEUE_LEN, sizeof(mcp_ui_event_t));
-    if (!s_event_group || !s_send_lock || !s_tts_play_queue || !s_ui_event_queue) {
+    if (!s_event_group || !s_send_lock || !s_tts_play_queue || !s_audio_upload_queue || !s_ui_event_queue) {
         return ESP_ERR_NO_MEM;
     }
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    if (nvs_ret == ESP_OK) {
+        esp_err_t endpoint_ret = load_endpoint_from_nvs();
+        if (endpoint_ret != ESP_OK) {
+            ESP_LOGW(TAG, "endpoint nvs load failed: %s", esp_err_to_name(endpoint_ret));
+        }
+    } else {
+        ESP_LOGW(TAG, "nvs_flash_init for endpoint failed: %s", esp_err_to_name(nvs_ret));
+    }
     xTaskCreate(tts_play_task, "tts_play", 6144, NULL, 5, NULL);
+    xTaskCreate(audio_upload_task, "audio_upload", 6144, NULL, 5, NULL);
     xTaskCreate(ui_event_task, "mcp_ui_events", 3072, NULL, 3, NULL);
     s_status = s_endpoint[0] ? MCP_STATUS_CONFIGURED : MCP_STATUS_NOT_CONFIGURED;
     ESP_LOGI(TAG, "status=%s", mcp_client_get_status_text());
@@ -1322,12 +1615,20 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
     if (!endpoint || endpoint[0] == '\0') {
         s_endpoint[0] = '\0';
         s_status = MCP_STATUS_NOT_CONFIGURED;
+        esp_err_t nvs_ret = save_endpoint_to_nvs(NULL);
+        if (nvs_ret != ESP_OK) {
+            ESP_LOGW(TAG, "endpoint nvs clear failed: %s", esp_err_to_name(nvs_ret));
+        }
         ESP_LOGW(TAG, "endpoint cleared");
         return ESP_OK;
     }
 
     strlcpy(s_endpoint, endpoint, sizeof(s_endpoint));
     s_status = MCP_STATUS_CONFIGURED;
+    esp_err_t nvs_ret = save_endpoint_to_nvs(s_endpoint);
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGW(TAG, "endpoint nvs save failed: %s", esp_err_to_name(nvs_ret));
+    }
     ESP_LOGI(TAG, "endpoint=%s", s_endpoint);
     if (s_ws) {
         websocket_request_recreate();
@@ -1357,6 +1658,7 @@ void mcp_client_disconnect(void)
         s_ws_stopping = false;
     }
     s_ws_connected = false;
+    audio_upload_drop_queued_items();
     s_status = s_endpoint[0] ? MCP_STATUS_DISCONNECTED : MCP_STATUS_NOT_CONFIGURED;
     ui_post_event(MCP_UI_EVENT_DISCONNECTED, APP_UI_STATE_OFFLINE, NULL);
     ESP_LOGI(TAG, "disconnected");
@@ -1424,6 +1726,12 @@ void mcp_client_set_busy_callback(mcp_client_busy_cb_t cb, void *ctx)
     s_busy_ctx = ctx;
 }
 
+void mcp_client_set_playback_callback(mcp_client_playback_cb_t cb, void *ctx)
+{
+    s_playback_cb = cb;
+    s_playback_ctx = ctx;
+}
+
 void mcp_client_set_device_command_callback(mcp_client_device_command_cb_t cb, void *ctx)
 {
     s_device_command_cb = cb;
@@ -1449,21 +1757,63 @@ esp_err_t mcp_client_send_text_request(const char *text)
     return err;
 }
 
+esp_err_t mcp_client_send_diagnostic_event(const char *name, const char *phase, const char *detail)
+{
+    if (!name || !name[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char name_escaped[48];
+    char phase_escaped[48];
+    char *detail_escaped = heap_caps_malloc(512, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!detail_escaped) {
+        detail_escaped = heap_caps_malloc(512, MALLOC_CAP_8BIT);
+    }
+    char *payload = heap_caps_malloc(768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!payload) {
+        payload = heap_caps_malloc(768, MALLOC_CAP_8BIT);
+    }
+    if (!detail_escaped || !payload) {
+        free(detail_escaped);
+        free(payload);
+        return ESP_ERR_NO_MEM;
+    }
+    json_escape(name, name_escaped, sizeof(name_escaped));
+    json_escape(phase ? phase : "", phase_escaped, sizeof(phase_escaped));
+    json_escape(detail ? detail : "", detail_escaped, 512);
+    snprintf(payload,
+             768,
+             "{\"type\":\"diagnostic_event\",\"device_id\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"detail\":\"%s\"}",
+             ROBOT_DEVICE_ID,
+             name_escaped,
+             phase_escaped,
+             detail_escaped);
+    ESP_LOGI(TAG, "diagnostic event name=%s phase=%s detail=%s",
+             name,
+             phase ? phase : "",
+             detail ? detail : "");
+    esp_err_t ret = ws_send_json(payload);
+    free(payload);
+    free(detail_escaped);
+    return ret;
+}
+
 esp_err_t mcp_client_audio_stream_begin(const char *session_id)
 {
-    char payload[256];
-    snprintf(payload,
-             sizeof(payload),
-             "{\"type\":\"audio_stream_start\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sample_rate\":%d,\"sample_bits\":%d,\"channels\":%d,\"encoding\":\"pcm_s16le\"}",
-             ROBOT_DEVICE_ID,
-             session_id,
-             ROBOT_AUDIO_SAMPLE_RATE,
-             ROBOT_AUDIO_BITS,
-             ROBOT_AUDIO_CHANNELS);
+    if (!session_id || !session_id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    audio_upload_item_t item = {
+        .kind = AUDIO_UPLOAD_ITEM_START,
+    };
+    strlcpy(item.session_id, session_id, sizeof(item.session_id));
     ESP_LOGI(TAG, "audio stream begin session=%s", session_id);
-    strlcpy(s_current_session_id, session_id ? session_id : "", sizeof(s_current_session_id));
+    strlcpy(s_current_session_id, session_id, sizeof(s_current_session_id));
     ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_RECORDING, NULL);
-    return ws_send_json(payload);
+    return audio_upload_queue_item(&item,
+                                   pdMS_TO_TICKS(MCP_AUDIO_UPLOAD_BEGIN_WAIT_MS),
+                                   "audio start")
+               ? ESP_OK
+               : ESP_FAIL;
 }
 
 esp_err_t mcp_client_audio_stream_chunk(const char *session_id, const uint8_t *data, size_t len)
@@ -1471,51 +1821,40 @@ esp_err_t mcp_client_audio_stream_chunk(const char *session_id, const uint8_t *d
     if (!session_id || !data || len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    size_t b64_cap = ((len + 2) / 3) * 4 + 1;
-    char *b64 = heap_caps_malloc(b64_cap, MALLOC_CAP_8BIT);
-    if (!b64) {
+    audio_upload_item_t item = {
+        .kind = AUDIO_UPLOAD_ITEM_CHUNK,
+        .len = len,
+    };
+    strlcpy(item.session_id, session_id, sizeof(item.session_id));
+    item.data = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!item.data) {
+        item.data = heap_caps_malloc(len, MALLOC_CAP_8BIT);
+    }
+    if (!item.data) {
         return ESP_ERR_NO_MEM;
     }
-    size_t b64_len = 0;
-    int rc = mbedtls_base64_encode((unsigned char *)b64, b64_cap, &b64_len, data, len);
-    if (rc != 0) {
-        free(b64);
-        return ESP_FAIL;
-    }
-    b64[b64_len] = '\0';
-
-    size_t payload_cap = b64_len + 160;
-    char *payload = heap_caps_malloc(payload_cap, MALLOC_CAP_8BIT);
-    if (!payload) {
-        free(b64);
-        return ESP_ERR_NO_MEM;
-    }
-    snprintf(payload,
-             payload_cap,
-             "{\"type\":\"audio_stream_chunk\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"audio_b64\":\"%s\"}",
-             ROBOT_DEVICE_ID,
-             session_id,
-             b64);
-    esp_err_t err = ws_send_json(payload);
-    free(payload);
-    free(b64);
-    return err;
+    memcpy(item.data, data, len);
+    return audio_upload_queue_item(&item, 0, "audio chunk") ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t mcp_client_audio_stream_end(const char *session_id, uint32_t duration_ms, const char *reason)
 {
-    char payload[256];
-    snprintf(payload,
-             sizeof(payload),
-             "{\"type\":\"audio_stream_end\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"duration_ms\":%u,\"reason\":\"%s\"}",
-             ROBOT_DEVICE_ID,
-             session_id,
-             (unsigned)duration_ms,
-             reason ? reason : "set_release");
+    if (!session_id || !session_id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    audio_upload_item_t item = {
+        .kind = AUDIO_UPLOAD_ITEM_END,
+        .duration_ms = duration_ms,
+    };
+    strlcpy(item.session_id, session_id, sizeof(item.session_id));
+    strlcpy(item.reason, reason ? reason : "set_release", sizeof(item.reason));
     ESP_LOGI(TAG, "audio stream end session=%s duration=%ums", session_id, (unsigned)duration_ms);
     ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_UPLOADING, NULL);
-    return ws_send_json(payload);
+    return audio_upload_queue_item(&item,
+                                   pdMS_TO_TICKS(MCP_AUDIO_UPLOAD_END_WAIT_MS),
+                                   "audio end")
+               ? ESP_OK
+               : ESP_FAIL;
 }
 
 static esp_err_t send_config_payload(const char *persona_id,

@@ -19,6 +19,10 @@
 
 extern const uint8_t xiaole_pcm_start[] asm("_binary_xiaole_16k_stereo_pcm_start");
 extern const uint8_t xiaole_pcm_end[] asm("_binary_xiaole_16k_stereo_pcm_end");
+extern const uint8_t barge_after_prompt_wav_start[] asm("_binary_barge_after_prompt_16k_mono_wav_start");
+extern const uint8_t barge_after_prompt_wav_end[] asm("_binary_barge_after_prompt_16k_mono_wav_end");
+extern const uint8_t barge_interrupt_prompt_wav_start[] asm("_binary_barge_interrupt_prompt_16k_mono_wav_start");
+extern const uint8_t barge_interrupt_prompt_wav_end[] asm("_binary_barge_interrupt_prompt_16k_mono_wav_end");
 
 #define PLAYER_SAMPLE_RATE 16000
 #define PLAYER_BITS 16
@@ -45,6 +49,9 @@ static audio_element_handle_t s_i2s_writer;
 static audio_element_handle_t s_active_raw_writer;
 static int s_volume = PLAYER_INITIAL_VOLUME;
 static uint8_t s_i2s_bus_chunk[PLAYER_CHUNK_BYTES * PLAYER_I2S_CHANNELS];
+static audio_player_reference_tap_cb_t s_reference_tap_cb;
+static void *s_reference_tap_ctx;
+static volatile bool s_cancel_requested;
 
 static int clamp_volume(int volume)
 {
@@ -154,6 +161,25 @@ static int16_t soft_limit16(int value)
     return clamp16(value);
 }
 
+static void audio_player_begin_playback(void)
+{
+    s_cancel_requested = false;
+}
+
+void audio_player_cancel(void)
+{
+    s_cancel_requested = true;
+    ESP_LOGI(TAG, "playback cancel requested");
+}
+
+static void emit_reference_tap(const int16_t *samples, int frames)
+{
+    audio_player_reference_tap_cb_t cb = s_reference_tap_cb;
+    if (cb && samples && frames > 0 && s_active_raw_writer == s_raw_writer) {
+        cb(samples, frames, s_reference_tap_ctx);
+    }
+}
+
 static int16_t *wav_to_16k_mono(const wav_format_t *fmt, const uint8_t *pcm, size_t pcm_len, size_t *out_bytes)
 {
     if (!fmt || !pcm || !out_bytes || fmt->audio_format != 1 || fmt->bits_per_sample != 16 ||
@@ -200,6 +226,10 @@ static esp_err_t raw_write_all(audio_element_handle_t target, const uint8_t *dat
     const uint8_t *cursor = data;
     const uint8_t *end = data + len;
     while (cursor < end) {
+        if (s_cancel_requested) {
+            ESP_LOGI(TAG, "%s raw write canceled", tag ? tag : "pcm");
+            return ESP_ERR_INVALID_STATE;
+        }
         int written = raw_stream_write(target, (char *)cursor, (int)(end - cursor));
         if (written < 0) {
             ESP_LOGE(TAG, "%s raw_stream_write failed ret=%d", tag ? tag : "pcm", written);
@@ -224,6 +254,10 @@ static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const ch
     size_t bytes_written = 0;
 
     while (cursor < end) {
+        if (s_cancel_requested) {
+            ESP_LOGI(TAG, "%s pcm canceled bytes=%u", tag ? tag : "pcm", (unsigned)bytes_written);
+            return ESP_ERR_INVALID_STATE;
+        }
         int chunk = (int)(end - cursor);
         if (chunk > PLAYER_CHUNK_BYTES) {
             chunk = PLAYER_CHUNK_BYTES;
@@ -246,6 +280,7 @@ static esp_err_t audio_player_write_pcm(const uint8_t *pcm, size_t len, const ch
             if (ret != ESP_OK) {
                 return ret;
             }
+            emit_reference_tap(src, frames);
         } else {
             esp_err_t ret = raw_write_all(s_active_raw_writer, cursor, (size_t)chunk, tag);
             if (ret != ESP_OK) {
@@ -269,6 +304,7 @@ static esp_err_t audio_player_write_preroll(const char *tag)
 
 esp_err_t audio_player_write_silence_ms(uint32_t duration_ms, const char *tag)
 {
+    audio_player_begin_playback();
     static const uint8_t silence[PLAYER_CHUNK_BYTES] = {0};
     size_t total = ((size_t)PLAYER_SAMPLE_RATE * PLAYER_BITS / 8 * PLAYER_CHANNELS * duration_ms) / 1000;
 
@@ -307,6 +343,13 @@ void audio_player_set_output_target(audio_element_handle_t target)
 {
     s_active_raw_writer = target ? target : s_raw_writer;
     ESP_LOGI(TAG, "output target: %s", target ? "BT" : "speaker");
+}
+
+void audio_player_set_reference_tap_callback(audio_player_reference_tap_cb_t cb, void *ctx)
+{
+    s_reference_tap_ctx = ctx;
+    s_reference_tap_cb = cb;
+    ESP_LOGI(TAG, "reference tap %s", cb ? "enabled" : "disabled");
 }
 
 esp_err_t audio_player_init(void)
@@ -381,6 +424,7 @@ esp_err_t audio_player_init(void)
 
 esp_err_t audio_player_play_xiaole(void)
 {
+    audio_player_begin_playback();
     const uint8_t *pcm = xiaole_pcm_start;
     size_t bytes_total = xiaole_pcm_end - xiaole_pcm_start;
     size_t stereo_frames = bytes_total / (sizeof(int16_t) * 2);
@@ -409,13 +453,38 @@ esp_err_t audio_player_play_xiaole(void)
         ret = audio_player_write_pcm((const uint8_t *)mono, mono_bytes, "xiaole");
     }
     free(mono);
-    vTaskDelay(pdMS_TO_TICKS(180));
+    if (!s_cancel_requested) {
+        vTaskDelay(pdMS_TO_TICKS(180));
+    }
     ESP_LOGI(TAG, "play done");
     return ret;
 }
 
+static esp_err_t audio_player_play_embedded_wav(const uint8_t *start, const uint8_t *end, const char *tag)
+{
+    if (!start || !end || end <= start) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return audio_player_play_wav_ex(start, (size_t)(end - start), tag, true, 180);
+}
+
+esp_err_t audio_player_play_barge_after_prompt(void)
+{
+    return audio_player_play_embedded_wav(barge_after_prompt_wav_start,
+                                          barge_after_prompt_wav_end,
+                                          "barge_after_prompt");
+}
+
+esp_err_t audio_player_play_barge_interrupt_prompt(void)
+{
+    return audio_player_play_embedded_wav(barge_interrupt_prompt_wav_start,
+                                          barge_interrupt_prompt_wav_end,
+                                          "barge_interrupt_prompt");
+}
+
 esp_err_t audio_player_play_wav_ex(const uint8_t *wav, size_t wav_len, const char *tag, bool preroll, uint32_t tail_delay_ms)
 {
+    audio_player_begin_playback();
     wav_format_t fmt = {0};
     const uint8_t *pcm = NULL;
     size_t pcm_len = 0;
@@ -454,7 +523,7 @@ esp_err_t audio_player_play_wav_ex(const uint8_t *wav, size_t wav_len, const cha
         ret = audio_player_write_pcm((const uint8_t *)mono16, out_bytes, tag ? tag : "wav");
     }
     free(mono16);
-    if (tail_delay_ms > 0) {
+    if (tail_delay_ms > 0 && !s_cancel_requested) {
         vTaskDelay(pdMS_TO_TICKS(tail_delay_ms));
     }
     return ret;
@@ -467,6 +536,7 @@ esp_err_t audio_player_play_wav(const uint8_t *wav, size_t wav_len, const char *
 
 esp_err_t audio_player_play_pcm16(const uint8_t *pcm, size_t len, const char *tag, bool preroll)
 {
+    audio_player_begin_playback();
     if (!pcm || len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
