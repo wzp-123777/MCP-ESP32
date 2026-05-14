@@ -51,7 +51,7 @@
 #define AFE_CAPTURE_AEC_FILTER_LENGTH 4
 #define AFE_CAPTURE_AFE_TYPE AFE_TYPE_FD
 #define AFE_CAPTURE_AFE_MODE AFE_MODE_LOW_COST
-#define AFE_CAPTURE_AEC_MODE AEC_MODE_FD_LOW_COST
+#define AFE_CAPTURE_DEFAULT_AEC_PROFILE AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST
 #define AFE_CAPTURE_AEC_NLP_LEVEL AEC_NLP_LEVEL_AGGR
 #define AFE_CAPTURE_I2S_OUT_RB_SIZE (2 * 1024)
 #define AFE_CAPTURE_RAW_OUT_RB_SIZE (4 * 1024)
@@ -105,6 +105,7 @@ static bool s_has_wake_model;
 static bool s_vad_speech;
 static bool s_wake_latched;
 static bool s_has_ref_channel;
+static afe_capture_aec_profile_t s_aec_profile = AFE_CAPTURE_DEFAULT_AEC_PROFILE;
 static bool s_vad_mute_playback;
 static TickType_t s_capture_start_tick;
 static volatile uint32_t s_capture_bytes;
@@ -131,6 +132,19 @@ static void *capture_malloc(size_t size)
         ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     return ptr;
+}
+
+static bool aec_profile_is_valid(afe_capture_aec_profile_t profile)
+{
+    return profile == AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST ||
+           profile == AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF;
+}
+
+static aec_mode_t resolve_aec_mode(afe_capture_aec_profile_t profile)
+{
+    return profile == AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF
+               ? AEC_MODE_FD_HIGH_PERF
+               : AEC_MODE_FD_LOW_COST;
 }
 
 static void log_heap(const char *where)
@@ -835,7 +849,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     int vad_delay_ms = rnnm_tuned ? AFE_CAPTURE_RNNM_VAD_DELAY_MS : AFE_CAPTURE_VAD_DELAY_MS;
     s_has_wake_model = init_wakenet;
     afe_cfg->aec_init = s_has_ref_channel;
-    afe_cfg->aec_mode = AFE_CAPTURE_AEC_MODE;
+    afe_cfg->aec_mode = resolve_aec_mode(s_aec_profile);
     afe_cfg->aec_filter_length = AFE_CAPTURE_AEC_FILTER_LENGTH;
     afe_cfg->aec_nlp_level = AFE_CAPTURE_AEC_NLP_LEVEL;
     afe_cfg->se_init = false;
@@ -911,7 +925,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
 
     log_heap("init ready");
     ESP_LOGI(TAG,
-             "ready: input=%s rate=%dHz feed=%dch/%d samples fetch=%dch/%d samples afe_type=%d afe_mode=%d aec=%d aec_mode=%d aec_nlp=%d ns=%d vad=esp-sr vad_mute_playback=%d wake=%d model=%s vad_model=%s",
+             "ready: input=%s rate=%dHz feed=%dch/%d samples fetch=%dch/%d samples afe_type=%d afe_mode=%d aec=%d aec_profile=%s aec_mode=%d aec_nlp=%d ns=%d vad=esp-sr vad_mute_playback=%d wake=%d model=%s vad_model=%s",
              s_input_format,
              s_afe_handle->get_samp_rate(s_afe_data),
              s_feed_channels,
@@ -921,7 +935,8 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
              AFE_CAPTURE_AFE_TYPE,
              AFE_CAPTURE_AFE_MODE,
              s_has_ref_channel,
-             AFE_CAPTURE_AEC_MODE,
+             afe_capture_get_aec_profile_name(),
+             resolve_aec_mode(s_aec_profile),
              AFE_CAPTURE_AEC_NLP_LEVEL,
              s_has_ref_channel,
              s_vad_mute_playback,
@@ -992,6 +1007,45 @@ void afe_capture_set_wake_enabled(bool enabled)
 bool afe_capture_has_wake_model(void)
 {
     return s_has_wake_model;
+}
+
+afe_capture_aec_profile_t afe_capture_get_aec_profile(void)
+{
+    return s_aec_profile;
+}
+
+const char *afe_capture_get_aec_profile_name(void)
+{
+    switch (s_aec_profile) {
+        case AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF:
+            return "fd_high_perf";
+        case AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST:
+        default:
+            return "fd_low_cost";
+    }
+}
+
+esp_err_t afe_capture_set_aec_profile(afe_capture_aec_profile_t profile)
+{
+    if (!aec_profile_is_valid(profile)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_aec_profile == profile) {
+        ESP_LOGI(TAG, "AEC profile unchanged: %s", afe_capture_get_aec_profile_name());
+        return ESP_OK;
+    }
+    if (s_running) {
+        ESP_LOGW(TAG, "cannot change AEC profile while capture is running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const char *old_name = afe_capture_get_aec_profile_name();
+    s_aec_profile = profile;
+    ESP_LOGI(TAG, "AEC profile change: %s -> %s", old_name, afe_capture_get_aec_profile_name());
+    if (s_initialized) {
+        afe_capture_deinit_afe_runtime();
+    }
+    return ESP_OK;
 }
 
 const char *afe_capture_get_input_format(void)

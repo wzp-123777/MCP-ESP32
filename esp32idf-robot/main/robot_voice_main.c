@@ -164,6 +164,8 @@ typedef enum {
     VOICE_CMD_BARGE_DIAG,
     VOICE_CMD_BARGE_DIAG_DONE,
     VOICE_CMD_AFE_VAD_MUTE_SET,
+    VOICE_CMD_AFE_AEC_PROFILE_SET,
+    VOICE_CMD_AFE_STATUS,
 } voice_cmd_type_t;
 
 typedef enum {
@@ -394,11 +396,14 @@ static int clamp_int(int value, int low, int high);
 static int max_int(int a, int b);
 static int parse_barge_diag_value(const char *args);
 static int parse_on_off_value(const char *text);
+static int parse_afe_aec_profile_value(const char *text);
+static void log_afe_status(void);
 static bool apply_afe_vad_mute_playback(bool enabled);
+static bool apply_afe_aec_profile(afe_capture_aec_profile_t profile);
 
 static void print_help(void)
 {
-    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT, WAKE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt] [ms], AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>, MCP CONNECT, HELP");
+    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT, WAKE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>, MCP CONNECT, HELP");
 }
 
 static void send_cmd(voice_cmd_type_t type, int value)
@@ -631,6 +636,37 @@ static int parse_on_off_value(const char *text)
     return -1;
 }
 
+static int parse_afe_aec_profile_value(const char *text)
+{
+    if (!text) {
+        return -1;
+    }
+    while (*text && isspace((unsigned char)*text)) {
+        ++text;
+    }
+    const char *token = text;
+    while (*text && !isspace((unsigned char)*text)) {
+        ++text;
+    }
+    size_t len = (size_t)(text - token);
+    if (token_equals_ignore_case(token, len, "low") ||
+        token_equals_ignore_case(token, len, "low_cost") ||
+        token_equals_ignore_case(token, len, "fd_low") ||
+        token_equals_ignore_case(token, len, "fd_low_cost") ||
+        token_equals_ignore_case(token, len, "lc")) {
+        return AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST;
+    }
+    if (token_equals_ignore_case(token, len, "high") ||
+        token_equals_ignore_case(token, len, "high_perf") ||
+        token_equals_ignore_case(token, len, "fd_high") ||
+        token_equals_ignore_case(token, len, "fd_high_perf") ||
+        token_equals_ignore_case(token, len, "perf") ||
+        token_equals_ignore_case(token, len, "hp")) {
+        return AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF;
+    }
+    return -1;
+}
+
 static void send_cmd_from_isr_safe(voice_cmd_type_t type, int value)
 {
     send_cmd(type, value);
@@ -838,9 +874,27 @@ static bool ensure_afe_ready(void)
         ESP_LOGW(TAG, "AFE/AEC init failed: %s; capture falls back to mono PCM",
                  esp_err_to_name(afe_err));
     } else {
-        ESP_LOGI(TAG, "AFE/AEC ready; capture path=AFE/AEC");
+        ESP_LOGI(TAG,
+                 "AFE/AEC ready; capture path=AFE/AEC input=%s aec_profile=%s vad_mute=%d",
+                 afe_capture_get_input_format(),
+                 afe_capture_get_aec_profile_name(),
+                 afe_capture_get_vad_mute_playback());
     }
     return s_afe_ready;
+}
+
+static void log_afe_status(void)
+{
+    ESP_LOGI(TAG,
+             "AFE status ready=%d init_attempted=%d running=%d input=%s aec_profile=%s vad_mute=%d wake_enabled=%d wake_model=%d",
+             s_afe_ready,
+             s_afe_init_attempted,
+             afe_capture_is_running(),
+             afe_capture_get_input_format(),
+             afe_capture_get_aec_profile_name(),
+             afe_capture_get_vad_mute_playback(),
+             s_wake_enabled,
+             s_afe_ready ? afe_capture_has_wake_model() : 0);
 }
 
 static bool apply_afe_diag_format(const char *fmt)
@@ -895,6 +949,40 @@ static bool apply_afe_vad_mute_playback(bool enabled)
     bool ready = ensure_afe_ready();
     app_ui_set_voice_state(enabled ? "VAD MUTE ON" : "VAD MUTE OFF");
     ESP_LOGI(TAG, "vad_mute_playback=%d ready=%d", enabled, ready);
+    if (restart_continuous && ready) {
+        start_continuous_chat();
+    }
+    return ready;
+}
+
+static bool apply_afe_aec_profile(afe_capture_aec_profile_t profile)
+{
+    bool restart_continuous = s_continuous_chat &&
+                              s_capture_mode == CAPTURE_MODE_CONTINUOUS &&
+                              !s_continuous_speaking;
+    if (s_afe_ready && afe_capture_is_running()) {
+        if (!restart_continuous) {
+            ESP_LOGW(TAG, "cannot switch AEC profile while capture is running");
+            return false;
+        }
+        ESP_LOGI(TAG, "restart continuous chat to switch AEC profile");
+        stop_continuous_chat();
+    }
+
+    bool changed = afe_capture_get_aec_profile() != profile;
+    esp_err_t err = afe_capture_set_aec_profile(profile);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AEC profile switch failed profile=%d err=%s", profile, esp_err_to_name(err));
+        return false;
+    }
+    if (changed) {
+        s_afe_ready = false;
+        s_afe_init_attempted = false;
+        mcp_client_set_sr_enabled(false);
+    }
+    bool ready = ensure_afe_ready();
+    app_ui_set_voice_state(profile == AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF ? "AEC HIGH" : "AEC LOW");
+    ESP_LOGI(TAG, "AEC profile=%s ready=%d", afe_capture_get_aec_profile_name(), ready);
     if (restart_continuous && ready) {
         start_continuous_chat();
     }
@@ -3343,6 +3431,22 @@ static void on_mcp_device_command(const char *command, void *ctx)
         }
         return;
     }
+    if (command_has_token_prefix(command, "afe_aec_mode") ||
+        command_has_token_prefix(command, "aec_mode") ||
+        command_has_token_prefix(command, "fd_aec_mode")) {
+        const char *space = strchr(command, ' ');
+        int value = parse_afe_aec_profile_value(space ? space + 1 : NULL);
+        if (value >= 0) {
+            send_cmd_nonblocking(VOICE_CMD_AFE_AEC_PROFILE_SET, value);
+        } else {
+            ESP_LOGW(TAG, "AFE AEC mode command needs LOW/HIGH");
+        }
+        return;
+    }
+    if (command_equals(command, "afe_status") || command_equals(command, "afe status")) {
+        send_cmd_nonblocking(VOICE_CMD_AFE_STATUS, 0);
+        return;
+    }
 }
 
 static void on_button_event(app_button_event_t event, void *ctx)
@@ -3506,6 +3610,12 @@ static void playback_task(void *arg)
             case VOICE_CMD_AFE_VAD_MUTE_SET:
                 apply_afe_vad_mute_playback(cmd.value != 0);
                 break;
+            case VOICE_CMD_AFE_AEC_PROFILE_SET:
+                apply_afe_aec_profile((afe_capture_aec_profile_t)cmd.value);
+                break;
+            case VOICE_CMD_AFE_STATUS:
+                log_afe_status();
+                break;
         }
     }
 }
@@ -3575,6 +3685,29 @@ static void command_task(void *arg)
                 send_cmd(VOICE_CMD_AFE_VAD_MUTE_SET, value);
             } else {
                 ESP_LOGW(TAG, "usage: VAD MUTE ON/OFF");
+            }
+        } else if (strcmp(line, "AFE STATUS") == 0 || strcmp(line, "AEC STATUS") == 0) {
+            send_cmd(VOICE_CMD_AFE_STATUS, 0);
+        } else if (strncmp(line, "AFE AEC MODE ", 13) == 0) {
+            int value = parse_afe_aec_profile_value(raw_line + 13);
+            if (value >= 0) {
+                send_cmd(VOICE_CMD_AFE_AEC_PROFILE_SET, value);
+            } else {
+                ESP_LOGW(TAG, "usage: AFE AEC MODE LOW/HIGH");
+            }
+        } else if (strncmp(line, "AEC MODE ", 9) == 0) {
+            int value = parse_afe_aec_profile_value(raw_line + 9);
+            if (value >= 0) {
+                send_cmd(VOICE_CMD_AFE_AEC_PROFILE_SET, value);
+            } else {
+                ESP_LOGW(TAG, "usage: AEC MODE LOW/HIGH");
+            }
+        } else if (strncmp(line, "AEC ", 4) == 0) {
+            int value = parse_afe_aec_profile_value(raw_line + 4);
+            if (value >= 0) {
+                send_cmd(VOICE_CMD_AFE_AEC_PROFILE_SET, value);
+            } else {
+                ESP_LOGW(TAG, "usage: AEC LOW/HIGH");
             }
         } else if (strcmp(line, "PERSONA") == 0) {
             send_cmd(VOICE_CMD_PERSONA_NEXT, 0);
