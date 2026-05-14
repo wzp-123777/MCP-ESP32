@@ -40,6 +40,7 @@ Espressif-aligned full-duplex AEC candidate.
 - Uses `AEC_MODE_FD_LOW_COST` first to keep ESP32-S3 CPU load conservative.
 - Enables aggressive AEC NLP and keeps noise suppression active when a playback reference channel is present.
 - Keeps the v1.5 asynchronous upload queue and playback-aware barge-in gate as fallback protection while hardware tuning continues.
+- The `v2.0-espressif-fd-aec` branch also keeps ESP32-S3 defaults aligned with the development firmware by enabling the `wn9_hiesp` WakeNet model and conservative PSRAM/internal allocation defaults.
 
 Validation still required:
 
