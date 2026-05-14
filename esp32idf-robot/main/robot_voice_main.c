@@ -153,6 +153,7 @@ typedef enum {
     VOICE_CMD_MIC_OFF,
     VOICE_CMD_MCP_CONNECT,
     VOICE_CMD_MCP_DISCONNECT,
+    VOICE_CMD_MCP_ENDPOINT_DEFAULT,
     VOICE_CMD_SET_PRESS,
     VOICE_CMD_SET_RELEASE,
     VOICE_CMD_CHAT_TOGGLE,
@@ -403,7 +404,7 @@ static bool apply_afe_aec_profile(afe_capture_aec_profile_t profile);
 
 static void print_help(void)
 {
-    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT, WAKE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>, MCP CONNECT, HELP");
+    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT, WAKE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>|DEFAULT, MCP CONNECT, HELP");
 }
 
 static void send_cmd(voice_cmd_type_t type, int value)
@@ -3443,6 +3444,11 @@ static void on_mcp_device_command(const char *command, void *ctx)
         }
         return;
     }
+    if (command_equals(command, "mcp_url_default") || command_equals(command, "mcp_default") ||
+        command_equals(command, "mcp_endpoint_default") || command_equals(command, "mcp_url_reset")) {
+        send_cmd_nonblocking(VOICE_CMD_MCP_ENDPOINT_DEFAULT, 0);
+        return;
+    }
     if (command_equals(command, "afe_status") || command_equals(command, "afe status")) {
         send_cmd_nonblocking(VOICE_CMD_AFE_STATUS, 0);
         return;
@@ -3553,6 +3559,10 @@ static void playback_task(void *arg)
             case VOICE_CMD_MCP_DISCONNECT:
                 stop_continuous_chat();
                 mcp_client_disconnect();
+                app_ui_set_mcp_status(mcp_client_get_status_text());
+                break;
+            case VOICE_CMD_MCP_ENDPOINT_DEFAULT:
+                mcp_client_reset_endpoint_to_default();
                 app_ui_set_mcp_status(mcp_client_get_status_text());
                 break;
             case VOICE_CMD_SET_PRESS:
@@ -3728,6 +3738,9 @@ static void command_task(void *arg)
         } else if (strncmp(line, "VOL ", 4) == 0 || strncmp(line, "V ", 2) == 0) {
             char *value_text = strchr(line, ' ');
             send_cmd(VOICE_CMD_VOL_SET, value_text ? atoi(value_text + 1) : audio_player_get_volume());
+        } else if (strcmp(line, "MCP URL DEFAULT") == 0 || strcmp(line, "MCP DEFAULT") == 0 ||
+                   strcmp(line, "MCP URL RESET") == 0 || strcmp(line, "MCP RESET") == 0) {
+            send_cmd(VOICE_CMD_MCP_ENDPOINT_DEFAULT, 0);
         } else if (strncmp(line, "MCP URL ", 8) == 0) {
             const char *endpoint = raw_line + 8;
             mcp_client_set_endpoint(endpoint);

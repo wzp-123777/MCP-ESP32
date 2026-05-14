@@ -8,6 +8,7 @@
 
 esp_err_t mcp_client_init(void);
 esp_err_t mcp_client_set_endpoint(const char *endpoint);
+esp_err_t mcp_client_reset_endpoint_to_default(void);
 esp_err_t mcp_client_connect(void);
 void mcp_client_disconnect(void);
 const char *mcp_client_get_endpoint(void);

@@ -1636,6 +1636,22 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
     return ESP_OK;
 }
 
+esp_err_t mcp_client_reset_endpoint_to_default(void)
+{
+    strlcpy(s_endpoint, ROBOT_MCP_URI, sizeof(s_endpoint));
+    s_status = s_endpoint[0] ? MCP_STATUS_CONFIGURED : MCP_STATUS_NOT_CONFIGURED;
+
+    esp_err_t nvs_ret = save_endpoint_to_nvs(NULL);
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGW(TAG, "endpoint nvs default reset failed: %s", esp_err_to_name(nvs_ret));
+    }
+    ESP_LOGI(TAG, "endpoint reset to default=%s", s_endpoint[0] ? s_endpoint : "<empty>");
+    if (s_ws) {
+        websocket_request_recreate();
+    }
+    return nvs_ret;
+}
+
 esp_err_t mcp_client_connect(void)
 {
     if (!s_endpoint[0]) {
