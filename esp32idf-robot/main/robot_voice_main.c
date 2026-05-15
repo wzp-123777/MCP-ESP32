@@ -103,6 +103,8 @@
 #define CONT_BARGE_ECHO_GAIN_MAX 5000
 #define CONT_BARGE_MIC_EXCESS_AVG 260
 #define CONT_BARGE_MIC_EXCESS_PEAK 1200
+#define CONT_BARGE_LOCAL_MIC_AVG 220
+#define CONT_BARGE_LOCAL_MIC_PEAK 700
 #define CONT_BARGE_STRONG_EXTRA_AVG 180
 #define CONT_BARGE_STRONG_EXTRA_PEAK 900
 #define CONT_PREROLL_CHUNKS 16
@@ -1620,6 +1622,8 @@ static bool cont_barge_compute_rule(TickType_t now,
 
     int predicted_mic_avg = raw.ref_avg * s_cont_barge_echo_gain_permille / 1000;
     int predicted_mic_peak = raw.ref_peak * s_cont_barge_echo_gain_permille / 1000;
+    int effective_avg = max_int(avg_abs, s_cont_barge_max_afe_avg);
+    int effective_peak = max_int(peak, s_cont_barge_max_afe_peak);
     bool ref_active = raw_valid &&
                       (raw.ref_avg >= CONT_BARGE_REF_ACTIVE_AVG ||
                        raw.ref_peak >= CONT_BARGE_REF_ACTIVE_PEAK);
@@ -1628,25 +1632,28 @@ static bool cont_barge_compute_rule(TickType_t now,
     bool mic_excess = raw_valid &&
                       raw.mic_avg >= predicted_mic_avg + CONT_BARGE_MIC_EXCESS_AVG &&
                       raw.mic_peak >= predicted_mic_peak + CONT_BARGE_MIC_EXCESS_PEAK;
+    bool local_mic_energy = raw_valid &&
+                            raw.mic_avg >= CONT_BARGE_LOCAL_MIC_AVG &&
+                            raw.mic_peak >= CONT_BARGE_LOCAL_MIC_PEAK;
     bool afe_voice = ((sr_vad_state == VAD_SPEECH) &&
-                      avg_abs >= confirm_avg &&
-                      peak >= confirm_peak);
-    bool afe_strong = avg_abs >= strong_avg && peak >= strong_peak;
+                      effective_avg >= confirm_avg &&
+                      effective_peak >= confirm_peak);
+    bool afe_strong = effective_avg >= strong_avg && effective_peak >= strong_peak;
     bool echo_like = ref_active &&
                      corr_high &&
                      !afe_strong;
     bool very_strong_without_raw = !raw_valid &&
-                                   avg_abs >= strong_avg + CONT_BARGE_STRONG_EXTRA_AVG &&
-                                   peak >= strong_peak + CONT_BARGE_STRONG_EXTRA_PEAK;
+                                   effective_avg >= strong_avg + CONT_BARGE_STRONG_EXTRA_AVG &&
+                                   effective_peak >= strong_peak + CONT_BARGE_STRONG_EXTRA_PEAK;
     bool local_dominant = raw_valid &&
                           ((ref_active && mic_excess && (!corr_high || afe_strong)) ||
-                           (!ref_active && corr_low));
+                           (!ref_active && (corr_low || local_mic_energy)));
     bool barge_hit = !echo_like &&
                      (afe_voice || afe_strong) &&
                      (local_dominant ||
                       (afe_strong &&
-                       avg_abs >= strong_avg + CONT_BARGE_STRONG_EXTRA_AVG &&
-                       peak >= strong_peak + CONT_BARGE_STRONG_EXTRA_PEAK) ||
+                       effective_avg >= strong_avg + CONT_BARGE_STRONG_EXTRA_AVG &&
+                       effective_peak >= strong_peak + CONT_BARGE_STRONG_EXTRA_PEAK) ||
                       very_strong_without_raw);
 
     if (raw_out) {
