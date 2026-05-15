@@ -83,6 +83,25 @@ typedef struct {
 } mcp_ui_event_t;
 
 static const char *TAG = "MCP_CLIENT";
+
+typedef struct {
+    const char *ssid;
+    const char *password;
+    const char *endpoint;
+    uint8_t endpoint_host_octet;
+} wifi_profile_t;
+
+#ifndef ROBOT_WIFI_PROFILES
+#define ROBOT_WIFI_PROFILES \
+    { \
+        {ROBOT_WIFI_SSID, ROBOT_WIFI_PASSWORD, ROBOT_MCP_URI, 0}, \
+    }
+#endif
+
+static const wifi_profile_t s_wifi_profiles[] = ROBOT_WIFI_PROFILES;
+#define WIFI_PROFILE_COUNT (sizeof(s_wifi_profiles) / sizeof(s_wifi_profiles[0]))
+#define WIFI_PROFILE_MAX_FAILURES 2
+
 static char s_endpoint[160] = ROBOT_MCP_URI;
 static mcp_status_t s_status = MCP_STATUS_NOT_CONFIGURED;
 static EventGroupHandle_t s_event_group;
@@ -95,6 +114,11 @@ static bool s_netif_ready;
 static bool s_wifi_connected;
 static bool s_ws_connected;
 static bool s_started;
+static bool s_endpoint_user_override;
+static size_t s_wifi_profile_index;
+static uint8_t s_wifi_profile_failures;
+static esp_netif_ip_info_t s_last_ip_info;
+static bool s_last_ip_info_valid;
 static bool s_sr_enabled;
 static bool s_ws_restart_requested;
 static bool s_ws_recreate_requested;
@@ -156,6 +180,8 @@ static void websocket_request_restart(void);
 static void websocket_request_recreate(void);
 static esp_err_t load_endpoint_from_nvs(void);
 static esp_err_t save_endpoint_to_nvs(const char *endpoint);
+static esp_err_t wifi_apply_profile(size_t index);
+static void endpoint_apply_wifi_profile(const esp_netif_ip_info_t *ip_info);
 static void tts_play_task(void *arg);
 static void audio_upload_task(void *arg);
 static void ui_event_task(void *arg);
@@ -529,6 +555,7 @@ static esp_err_t load_endpoint_from_nvs(void)
     }
     if (stored[0]) {
         strlcpy(s_endpoint, stored, sizeof(s_endpoint));
+        s_endpoint_user_override = true;
         ESP_LOGI(TAG, "endpoint loaded from nvs=%s", s_endpoint);
     }
     return ESP_OK;
@@ -1304,6 +1331,80 @@ static void handle_ws_text(const char *message)
     ESP_LOGI(TAG, "unhandled ws: %s", message);
 }
 
+static const wifi_profile_t *wifi_current_profile(void)
+{
+    if (WIFI_PROFILE_COUNT == 0) {
+        return NULL;
+    }
+    if (s_wifi_profile_index >= WIFI_PROFILE_COUNT) {
+        s_wifi_profile_index = 0;
+    }
+    return &s_wifi_profiles[s_wifi_profile_index];
+}
+
+static esp_err_t wifi_apply_profile(size_t index)
+{
+    if (WIFI_PROFILE_COUNT == 0 || index >= WIFI_PROFILE_COUNT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const wifi_profile_t *profile = &s_wifi_profiles[index];
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, profile->ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, profile->password, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (ret == ESP_OK) {
+        s_wifi_profile_index = index;
+        ESP_LOGI(TAG,
+                 "wifi profile %u/%u ssid=%s",
+                 (unsigned)(s_wifi_profile_index + 1),
+                 (unsigned)WIFI_PROFILE_COUNT,
+                 profile->ssid ? profile->ssid : "<empty>");
+    }
+    return ret;
+}
+
+static void wifi_select_next_profile(void)
+{
+    if (WIFI_PROFILE_COUNT <= 1) {
+        return;
+    }
+    size_t next = (s_wifi_profile_index + 1) % WIFI_PROFILE_COUNT;
+    esp_err_t ret = wifi_apply_profile(next);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "wifi profile switch failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void endpoint_apply_wifi_profile(const esp_netif_ip_info_t *ip_info)
+{
+    if (s_endpoint_user_override) {
+        return;
+    }
+
+    const wifi_profile_t *profile = wifi_current_profile();
+    if (profile && profile->endpoint && profile->endpoint[0]) {
+        strlcpy(s_endpoint, profile->endpoint, sizeof(s_endpoint));
+    } else if (profile && profile->endpoint_host_octet != 0 && ip_info) {
+        snprintf(s_endpoint,
+                 sizeof(s_endpoint),
+                 "ws://%u.%u.%u.%u:8080/esp32_ws",
+                 esp_ip4_addr1_16(&ip_info->ip),
+                 esp_ip4_addr2_16(&ip_info->ip),
+                 esp_ip4_addr3_16(&ip_info->ip),
+                 (unsigned)profile->endpoint_host_octet);
+    } else {
+        strlcpy(s_endpoint, ROBOT_MCP_URI, sizeof(s_endpoint));
+    }
+    ESP_LOGI(TAG,
+             "endpoint profile ssid=%s endpoint=%s",
+             profile && profile->ssid ? profile->ssid : "<default>",
+             s_endpoint[0] ? s_endpoint : "<empty>");
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -1314,8 +1415,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         app_ui_set_mcp_status(mcp_client_get_status_text());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+        int reason = event ? event->reason : -1;
         s_wifi_connected = false;
         s_ws_connected = false;
+        s_last_ip_info_valid = false;
         audio_upload_drop_queued_items();
         websocket_request_restart();
         xEventGroupClearBits(s_event_group, MCP_WIFI_CONNECTED_BIT);
@@ -1323,16 +1426,38 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         app_ui_set_wifi_connected(false);
         ui_post_event(MCP_UI_EVENT_DISCONNECTED, APP_UI_STATE_OFFLINE, NULL);
         app_ui_set_mcp_status("WIFI RETRY");
-        ESP_LOGW(TAG, "wifi disconnected reason=%d, reconnecting", event ? event->reason : -1);
+        s_wifi_profile_failures++;
+        if (WIFI_PROFILE_COUNT > 1 && s_wifi_profile_failures >= WIFI_PROFILE_MAX_FAILURES) {
+            ESP_LOGW(TAG,
+                     "wifi disconnected reason=%d, switch profile after %u failures",
+                     reason,
+                     (unsigned)s_wifi_profile_failures);
+            s_wifi_profile_failures = 0;
+            wifi_select_next_profile();
+        } else {
+            const wifi_profile_t *profile = wifi_current_profile();
+            ESP_LOGW(TAG,
+                     "wifi disconnected reason=%d, retry ssid=%s failure=%u/%u",
+                     reason,
+                     profile && profile->ssid ? profile->ssid : "<empty>",
+                     (unsigned)s_wifi_profile_failures,
+                     (unsigned)WIFI_PROFILE_MAX_FAILURES);
+        }
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        if (event) {
+            s_last_ip_info = event->ip_info;
+            s_last_ip_info_valid = true;
+            endpoint_apply_wifi_profile(&event->ip_info);
+        }
+        s_wifi_profile_failures = 0;
         s_wifi_connected = true;
         xEventGroupSetBits(s_event_group, MCP_WIFI_CONNECTED_BIT);
         s_status = MCP_STATUS_WIFI_CONNECTED;
         websocket_request_restart();
         app_ui_set_wifi_connected(true);
         app_ui_set_mcp_status(mcp_client_get_status_text());
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "wifi connected ip=" IPSTR, IP2STR(&event->ip_info.ip));
         start_sntp_once();
     }
@@ -1364,19 +1489,17 @@ static esp_err_t wifi_start(void)
     ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL), TAG, "wifi handler failed");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL), TAG, "ip handler failed");
 
-    wifi_config_t wifi_config = {0};
-    strlcpy((char *)wifi_config.sta.ssid, ROBOT_WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, ROBOT_WIFI_PASSWORD, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set wifi mode failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set wifi config failed");
+    ESP_RETURN_ON_ERROR(wifi_apply_profile(s_wifi_profile_index), TAG, "set wifi profile failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "set wifi ps failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
 
     s_netif_ready = true;
-    ESP_LOGI(TAG, "wifi start ssid=%s", ROBOT_WIFI_SSID);
+    const wifi_profile_t *profile = wifi_current_profile();
+    ESP_LOGI(TAG,
+             "wifi start ssid=%s profiles=%u",
+             profile && profile->ssid ? profile->ssid : "<empty>",
+             (unsigned)WIFI_PROFILE_COUNT);
     return ESP_OK;
 }
 
@@ -1614,6 +1737,7 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
 {
     if (!endpoint || endpoint[0] == '\0') {
         s_endpoint[0] = '\0';
+        s_endpoint_user_override = true;
         s_status = MCP_STATUS_NOT_CONFIGURED;
         esp_err_t nvs_ret = save_endpoint_to_nvs(NULL);
         if (nvs_ret != ESP_OK) {
@@ -1624,6 +1748,7 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
     }
 
     strlcpy(s_endpoint, endpoint, sizeof(s_endpoint));
+    s_endpoint_user_override = true;
     s_status = MCP_STATUS_CONFIGURED;
     esp_err_t nvs_ret = save_endpoint_to_nvs(s_endpoint);
     if (nvs_ret != ESP_OK) {
@@ -1638,7 +1763,12 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
 
 esp_err_t mcp_client_reset_endpoint_to_default(void)
 {
-    strlcpy(s_endpoint, ROBOT_MCP_URI, sizeof(s_endpoint));
+    s_endpoint_user_override = false;
+    if (s_last_ip_info_valid) {
+        endpoint_apply_wifi_profile(&s_last_ip_info);
+    } else {
+        strlcpy(s_endpoint, ROBOT_MCP_URI, sizeof(s_endpoint));
+    }
     s_status = s_endpoint[0] ? MCP_STATUS_CONFIGURED : MCP_STATUS_NOT_CONFIGURED;
 
     esp_err_t nvs_ret = save_endpoint_to_nvs(NULL);
