@@ -105,6 +105,9 @@
 #define CONT_BARGE_MIC_EXCESS_PEAK 1200
 #define CONT_BARGE_LOCAL_MIC_AVG 220
 #define CONT_BARGE_LOCAL_MIC_PEAK 700
+#define CONT_BARGE_OVERRIDE_MIC_AVG 480
+#define CONT_BARGE_OVERRIDE_MIC_PEAK 1500
+#define CONT_BARGE_OVERRIDE_CORR_MAX 820
 #define CONT_BARGE_STRONG_EXTRA_AVG 180
 #define CONT_BARGE_STRONG_EXTRA_PEAK 900
 #define CONT_PREROLL_CHUNKS 16
@@ -284,6 +287,7 @@ static TickType_t s_cont_barge_candidate_start_tick;
 static TickType_t s_cont_barge_candidate_log_tick;
 static int s_cont_barge_accept_hits;
 static int s_cont_barge_echo_hits;
+static bool s_cont_barge_start_local_override;
 static int s_cont_barge_max_afe_avg;
 static int s_cont_barge_max_afe_peak;
 static int s_cont_barge_max_ref_avg;
@@ -1476,6 +1480,7 @@ static void cont_barge_reset_candidate(void)
     s_cont_barge_candidate_log_tick = 0;
     s_cont_barge_accept_hits = 0;
     s_cont_barge_echo_hits = 0;
+    s_cont_barge_start_local_override = false;
     s_cont_barge_max_afe_avg = 0;
     s_cont_barge_max_afe_peak = 0;
     s_cont_barge_max_ref_avg = 0;
@@ -1524,6 +1529,11 @@ static void cont_barge_begin_candidate(TickType_t now, bool playback, bool tail)
     s_cont_barge_candidate_log_tick = 0;
     s_cont_barge_accept_hits = 0;
     s_cont_barge_echo_hits = 0;
+    s_cont_barge_start_local_override = playback &&
+                                         raw_valid &&
+                                         raw.mic_avg >= CONT_BARGE_OVERRIDE_MIC_AVG &&
+                                         raw.mic_peak >= CONT_BARGE_OVERRIDE_MIC_PEAK &&
+                                         raw.corr_permille <= CONT_BARGE_OVERRIDE_CORR_MAX;
     s_cont_barge_max_afe_avg = 0;
     s_cont_barge_max_afe_peak = 0;
     s_cont_barge_max_ref_avg = raw_valid ? raw.ref_avg : 0;
@@ -1539,6 +1549,13 @@ static void cont_barge_begin_candidate(TickType_t now, bool playback, bool tail)
              raw.mic_peak,
              raw.corr_permille,
              s_cont_barge_echo_gain_permille);
+    if (s_cont_barge_start_local_override) {
+        ESP_LOGI(TAG,
+                 "cont barge start local override mic_avg=%d mic_peak=%d corr=%d",
+                 raw.mic_avg,
+                 raw.mic_peak,
+                 raw.corr_permille);
+    }
 }
 
 static void cont_barge_log_decision(const char *decision,
@@ -1752,6 +1769,10 @@ static cont_barge_decision_t cont_barge_process_candidate(TickType_t now,
     if (age_ms < CONT_BARGE_CANDIDATE_MIN_MS) {
         return CONT_BARGE_DECISION_PENDING;
     }
+    if (s_cont_barge_start_local_override) {
+        cont_barge_log_decision("accept_local_override", now, avg_abs, peak, &raw, raw_valid, mic_excess, afe_strong);
+        return CONT_BARGE_DECISION_ACCEPT;
+    }
     if (s_cont_barge_accept_hits >= CONT_BARGE_ACCEPT_HITS) {
         cont_barge_log_decision("accept", now, avg_abs, peak, &raw, raw_valid, mic_excess, afe_strong);
         return CONT_BARGE_DECISION_ACCEPT;
@@ -1868,6 +1889,15 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
         bool playback_busy = s_assistant_playback_busy;
         bool playback_tail_gate = cont_playback_tail_gate_active(now);
         bool started_now = false;
+        if (afe_vad_path &&
+            !s_continuous_speaking &&
+            s_afe_vad_suppressed &&
+            s_afe_vad_suppress_reason == CONT_AFE_SUPPRESS_BARGE_REJECT &&
+            (playback_busy || playback_tail_gate) &&
+            now >= s_afe_vad_reject_until_tick) {
+            cont_afe_clear_suppressed();
+            cont_barge_begin_candidate(now, playback_busy, playback_tail_gate);
+        }
         if (afe_vad_path && !s_continuous_speaking && s_afe_vad_suppressed) {
             cont_vad_log_suppressed_gate(now, avg_abs, peak, sr_vad_state);
             cont_preroll_reset();

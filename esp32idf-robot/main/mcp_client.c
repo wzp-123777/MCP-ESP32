@@ -20,6 +20,7 @@
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -172,6 +173,8 @@ static void *s_device_command_ctx;
 #define MCP_UI_EVENT_QUEUE_LEN 8
 #define MCP_ENDPOINT_NVS_NAMESPACE "mcp_robot"
 #define MCP_ENDPOINT_NVS_KEY "endpoint"
+#define MCP_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define MCP_QUEUE_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static void websocket_restart(void);
@@ -193,6 +196,31 @@ static esp_err_t send_config_payload(const char *persona_id,
                                      const char *voice_label,
                                      bool continuous_chat,
                                      bool wake_enabled);
+
+static void log_heap_state(const char *phase)
+{
+    ESP_LOGI(TAG,
+             "%s heap internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u",
+             phase ? phase : "mcp",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
+static esp_err_t create_spiram_task(TaskFunction_t task_func,
+                                    const char *name,
+                                    uint32_t stack_bytes,
+                                    UBaseType_t prio)
+{
+    BaseType_t ok = xTaskCreateWithCaps(task_func, name, stack_bytes, NULL, prio, NULL, MCP_TASK_STACK_CAPS);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "task create failed name=%s stack=%u", name ? name : "?", (unsigned)stack_bytes);
+        log_heap_state("task create failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 static void set_assistant_busy(bool busy)
 {
@@ -1531,7 +1559,17 @@ static esp_err_t websocket_create_and_start(void)
     ESP_RETURN_ON_ERROR(esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL), TAG, "ws register failed");
     s_status = MCP_STATUS_CONNECTING;
     app_ui_set_mcp_status(mcp_client_get_status_text());
-    ESP_RETURN_ON_ERROR(esp_websocket_client_start(s_ws), TAG, "ws start failed");
+    log_heap_state("before ws start");
+    esp_err_t start_ret = esp_websocket_client_start(s_ws);
+    if (start_ret != ESP_OK) {
+        ESP_LOGE(TAG, "ws start failed: %s", esp_err_to_name(start_ret));
+        log_heap_state("after ws start failed");
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+        s_status = MCP_STATUS_ERROR;
+        app_ui_set_mcp_status(mcp_client_get_status_text());
+        return start_ret;
+    }
     s_last_ws_start_tick = xTaskGetTickCount();
     ESP_LOGI(TAG, "websocket start %s", s_endpoint);
     return ESP_OK;
@@ -1706,10 +1744,11 @@ esp_err_t mcp_client_init(void)
 {
     s_event_group = xEventGroupCreate();
     s_send_lock = xSemaphoreCreateMutex();
-    s_tts_play_queue = xQueueCreate(MCP_TTS_PLAY_QUEUE_LEN, sizeof(tts_play_item_t));
-    s_audio_upload_queue = xQueueCreate(MCP_AUDIO_UPLOAD_QUEUE_LEN, sizeof(audio_upload_item_t));
-    s_ui_event_queue = xQueueCreate(MCP_UI_EVENT_QUEUE_LEN, sizeof(mcp_ui_event_t));
+    s_tts_play_queue = xQueueCreateWithCaps(MCP_TTS_PLAY_QUEUE_LEN, sizeof(tts_play_item_t), MCP_QUEUE_CAPS);
+    s_audio_upload_queue = xQueueCreateWithCaps(MCP_AUDIO_UPLOAD_QUEUE_LEN, sizeof(audio_upload_item_t), MCP_QUEUE_CAPS);
+    s_ui_event_queue = xQueueCreateWithCaps(MCP_UI_EVENT_QUEUE_LEN, sizeof(mcp_ui_event_t), MCP_QUEUE_CAPS);
     if (!s_event_group || !s_send_lock || !s_tts_play_queue || !s_audio_upload_queue || !s_ui_event_queue) {
+        log_heap_state("mcp queue create failed");
         return ESP_ERR_NO_MEM;
     }
     esp_err_t nvs_ret = nvs_flash_init();
@@ -1725,10 +1764,11 @@ esp_err_t mcp_client_init(void)
     } else {
         ESP_LOGW(TAG, "nvs_flash_init for endpoint failed: %s", esp_err_to_name(nvs_ret));
     }
-    xTaskCreate(tts_play_task, "tts_play", 6144, NULL, 5, NULL);
-    xTaskCreate(audio_upload_task, "audio_upload", 6144, NULL, 5, NULL);
-    xTaskCreate(ui_event_task, "mcp_ui_events", 3072, NULL, 3, NULL);
+    ESP_RETURN_ON_ERROR(create_spiram_task(tts_play_task, "tts_play", 6144, 5), TAG, "tts task failed");
+    ESP_RETURN_ON_ERROR(create_spiram_task(audio_upload_task, "audio_upload", 6144, 5), TAG, "audio upload task failed");
+    ESP_RETURN_ON_ERROR(create_spiram_task(ui_event_task, "mcp_ui_events", 3072, 3), TAG, "ui event task failed");
     s_status = s_endpoint[0] ? MCP_STATUS_CONFIGURED : MCP_STATUS_NOT_CONFIGURED;
+    log_heap_state("mcp init ready");
     ESP_LOGI(TAG, "status=%s", mcp_client_get_status_text());
     return ESP_OK;
 }
