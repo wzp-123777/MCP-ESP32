@@ -111,6 +111,10 @@
 #define CONT_BARGE_STRONG_EXTRA_AVG 180
 #define CONT_BARGE_STRONG_EXTRA_PEAK 900
 #define CONT_PREROLL_CHUNKS 16
+#define CONT_BARGE_RAW_UPLOAD_CHUNKS 32
+#define CONT_BARGE_RAW_UPLOAD_PREROLL_MS 700
+#define CONT_BARGE_RAW_UPLOAD_MIN_MS 2300
+#define CONT_BARGE_RAW_UPLOAD_TAIL_MS 1800
 #define RAW_TDM_DIAG_CHANNELS 4
 #define RAW_TDM_DIAG_RATE 16000
 #define RAW_TDM_DIAG_DEFAULT_MS 3000
@@ -298,6 +302,16 @@ static uint16_t s_cont_barge_ref_env[CONT_BARGE_RAW_CORR_WINDOW];
 static uint16_t s_cont_barge_mic_env[CONT_BARGE_RAW_CORR_WINDOW];
 static int s_cont_barge_env_pos;
 static int s_cont_barge_env_count;
+static uint8_t *s_barge_raw_upload_buf;
+static uint8_t s_barge_raw_upload_drain[CAPTURE_CHUNK_BYTES];
+static size_t s_barge_raw_upload_head;
+static size_t s_barge_raw_upload_size;
+static size_t s_barge_raw_upload_dropped;
+static bool s_cont_barge_upload_raw_mic;
+static TickType_t s_cont_barge_upload_accept_tick;
+static raw_tdm_channel_stats_t s_barge_upload_raw_stats;
+static raw_tdm_channel_stats_t s_barge_upload_afe_stats;
+static portMUX_TYPE s_barge_raw_upload_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_mic_diag_ready;
 static bool s_mic_diag_init_attempted;
 static volatile bool s_raw_tdm_active;
@@ -379,6 +393,12 @@ static void on_mcp_playback_busy(bool busy, void *ctx);
 static void cont_barge_begin_candidate(TickType_t now, bool playback, bool tail);
 static void cont_barge_reset_candidate(void);
 static void cont_preroll_reset(void);
+static void barge_raw_upload_reset(void);
+static bool barge_raw_upload_ensure(void);
+static bool barge_raw_upload_has_audio(void);
+static void barge_raw_upload_trim_to_ms(uint32_t keep_ms);
+static void barge_raw_upload_drain_to_capture(void);
+static void barge_raw_upload_log_and_reset(uint32_t duration_ms, const char *reason);
 static bool cont_playback_tail_gate_active(TickType_t now);
 static cont_barge_decision_t cont_barge_process_candidate(TickType_t now,
                                                           int avg_abs,
@@ -407,6 +427,10 @@ static int parse_afe_aec_profile_value(const char *text);
 static void log_afe_status(void);
 static bool apply_afe_vad_mute_playback(bool enabled);
 static bool apply_afe_aec_profile(afe_capture_aec_profile_t profile);
+static void diag_stats_update_sample(raw_tdm_channel_stats_t *stats, int16_t sample);
+static void diag_stats_update_pcm(raw_tdm_channel_stats_t *stats, const uint8_t *data, int len);
+static uint32_t diag_stats_avg(const raw_tdm_channel_stats_t *stats);
+static uint32_t diag_stats_rms(const raw_tdm_channel_stats_t *stats);
 
 static void print_help(void)
 {
@@ -1245,6 +1269,9 @@ static void cont_vad_reset_runtime(void)
     s_afe_vad_suppressed = false;
     s_afe_vad_suppressed_tick = 0;
     s_afe_vad_suppress_reason = CONT_AFE_SUPPRESS_NONE;
+    if (!s_cont_barge_upload_raw_mic) {
+        barge_raw_upload_reset();
+    }
     cont_sr_vad_reset();
 }
 
@@ -1450,6 +1477,159 @@ static void cont_preroll_flush_to_capture(void)
     cont_preroll_reset();
 }
 
+static size_t barge_raw_upload_capacity(void)
+{
+    return (size_t)CONT_BARGE_RAW_UPLOAD_CHUNKS * CAPTURE_CHUNK_BYTES;
+}
+
+static size_t barge_raw_upload_bytes_for_ms(uint32_t ms)
+{
+    return ((size_t)CONT_SR_VAD_RATE * sizeof(int16_t) * ms) / 1000;
+}
+
+static bool barge_raw_upload_ensure(void)
+{
+    if (s_barge_raw_upload_buf) {
+        return true;
+    }
+    s_barge_raw_upload_buf = heap_caps_malloc(barge_raw_upload_capacity(),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_barge_raw_upload_buf) {
+        ESP_LOGW(TAG, "barge raw upload buffer alloc failed");
+        return false;
+    }
+    barge_raw_upload_reset();
+    return true;
+}
+
+static void barge_raw_upload_reset(void)
+{
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    s_barge_raw_upload_head = 0;
+    s_barge_raw_upload_size = 0;
+    s_barge_raw_upload_dropped = 0;
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+    s_cont_barge_upload_raw_mic = false;
+    s_cont_barge_upload_accept_tick = 0;
+    memset(&s_barge_upload_raw_stats, 0, sizeof(s_barge_upload_raw_stats));
+    memset(&s_barge_upload_afe_stats, 0, sizeof(s_barge_upload_afe_stats));
+}
+
+static bool barge_raw_upload_has_audio(void)
+{
+    bool has_audio = false;
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    has_audio = s_barge_raw_upload_size > 0;
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+    return has_audio;
+}
+
+static void barge_raw_upload_trim_to_ms(uint32_t keep_ms)
+{
+    size_t keep = barge_raw_upload_bytes_for_ms(keep_ms);
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    if (s_barge_raw_upload_size > keep) {
+        s_barge_raw_upload_size = keep;
+    }
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+}
+
+static void barge_raw_upload_write_sample_locked(int16_t sample, size_t cap)
+{
+    if (!s_barge_raw_upload_buf || cap == 0) {
+        return;
+    }
+    if (s_barge_raw_upload_size + sizeof(sample) > cap) {
+        s_barge_raw_upload_size -= sizeof(sample);
+        s_barge_raw_upload_dropped += sizeof(sample);
+    }
+    memcpy(s_barge_raw_upload_buf + s_barge_raw_upload_head, &sample, sizeof(sample));
+    s_barge_raw_upload_head = (s_barge_raw_upload_head + sizeof(sample)) % cap;
+    s_barge_raw_upload_size += sizeof(sample);
+}
+
+static void barge_raw_upload_push_mic(const int16_t *interleaved, int frames, int channels)
+{
+    if ((!s_cont_barge_candidate_active && !s_cont_barge_upload_raw_mic) ||
+        !interleaved ||
+        frames <= 0 ||
+        channels <= CONT_BARGE_MIC_CH ||
+        !barge_raw_upload_ensure()) {
+        return;
+    }
+
+    size_t cap = barge_raw_upload_capacity();
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    for (int frame = 0; frame < frames; ++frame) {
+        int16_t sample = interleaved[frame * channels + CONT_BARGE_MIC_CH];
+        barge_raw_upload_write_sample_locked(sample, cap);
+        diag_stats_update_sample(&s_barge_upload_raw_stats, sample);
+    }
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+}
+
+static size_t barge_raw_upload_pop(uint8_t *out, size_t out_cap)
+{
+    if (!out || out_cap == 0 || !s_barge_raw_upload_buf) {
+        return 0;
+    }
+
+    size_t copied = 0;
+    size_t cap = barge_raw_upload_capacity();
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    if (s_barge_raw_upload_size > 0) {
+        copied = s_barge_raw_upload_size < out_cap ? s_barge_raw_upload_size : out_cap;
+        size_t tail = (s_barge_raw_upload_head + cap - s_barge_raw_upload_size) % cap;
+        size_t first = copied;
+        if (tail + first > cap) {
+            first = cap - tail;
+        }
+        memcpy(out, s_barge_raw_upload_buf + tail, first);
+        if (copied > first) {
+            memcpy(out + first, s_barge_raw_upload_buf, copied - first);
+        }
+        s_barge_raw_upload_size -= copied;
+    }
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+    return copied;
+}
+
+static void barge_raw_upload_drain_to_capture(void)
+{
+    while (true) {
+        size_t len = barge_raw_upload_pop(s_barge_raw_upload_drain, sizeof(s_barge_raw_upload_drain));
+        if (len == 0) {
+            break;
+        }
+        append_capture_audio(s_barge_raw_upload_drain, (int)len);
+    }
+}
+
+static void barge_raw_upload_log_and_reset(uint32_t duration_ms, const char *reason)
+{
+    uint32_t raw_avg = diag_stats_avg(&s_barge_upload_raw_stats);
+    uint32_t raw_rms = diag_stats_rms(&s_barge_upload_raw_stats);
+    uint32_t afe_avg = diag_stats_avg(&s_barge_upload_afe_stats);
+    uint32_t afe_rms = diag_stats_rms(&s_barge_upload_afe_stats);
+    size_t dropped = 0;
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    dropped = s_barge_raw_upload_dropped;
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+    ESP_LOGI(TAG,
+             "barge upload raw_mic done reason=%s duration=%ums raw_samples=%u raw_avg=%u raw_rms=%u raw_peak=%d afe_avg=%u afe_rms=%u afe_peak=%d dropped=%u",
+             reason ? reason : "vad_silence",
+             (unsigned)duration_ms,
+             (unsigned)s_barge_upload_raw_stats.samples,
+             (unsigned)raw_avg,
+             (unsigned)raw_rms,
+             s_barge_upload_raw_stats.peak,
+             (unsigned)afe_avg,
+             (unsigned)afe_rms,
+             s_barge_upload_afe_stats.peak,
+             (unsigned)dropped);
+    barge_raw_upload_reset();
+}
+
 static bool cont_playback_tail_gate_active(TickType_t now)
 {
     if (s_cont_playback_tail_until_tick != 0 && now < s_cont_playback_tail_until_tick) {
@@ -1485,6 +1665,9 @@ static void cont_barge_reset_candidate(void)
     s_cont_barge_max_afe_peak = 0;
     s_cont_barge_max_ref_avg = 0;
     s_cont_barge_max_mic_avg = 0;
+    if (!s_cont_barge_upload_raw_mic) {
+        barge_raw_upload_reset();
+    }
 }
 
 static void suppress_playback_for_barge(void)
@@ -1538,6 +1721,8 @@ static void cont_barge_begin_candidate(TickType_t now, bool playback, bool tail)
     s_cont_barge_max_afe_peak = 0;
     s_cont_barge_max_ref_avg = raw_valid ? raw.ref_avg : 0;
     s_cont_barge_max_mic_avg = raw_valid ? raw.mic_avg : 0;
+    barge_raw_upload_reset();
+    (void)barge_raw_upload_ensure();
     clear_afe_vad_pending();
     ESP_LOGI(TAG,
              "cont barge candidate start phase=%s raw_valid=%d ch0_ref avg=%d peak=%d ch3_mic avg=%d peak=%d corr=%d gain=%d/1000",
@@ -1813,7 +1998,22 @@ static bool cont_barge_accept_candidate(TickType_t now,
     s_cont_last_audio_tick = now;
     s_cont_silence_hits = 0;
     s_cont_utterance_peak_avg = avg_abs;
-    cont_preroll_flush_to_capture();
+    if (barge_raw_upload_has_audio()) {
+        s_cont_barge_upload_raw_mic = true;
+        s_cont_barge_upload_accept_tick = now;
+        barge_raw_upload_trim_to_ms(CONT_BARGE_RAW_UPLOAD_PREROLL_MS);
+        barge_raw_upload_drain_to_capture();
+        cont_preroll_reset();
+        ESP_LOGI(TAG,
+                 "barge upload source=raw_mic ch=%d preroll=%dms min=%dms tail=%dms",
+                 CONT_BARGE_MIC_CH,
+                 CONT_BARGE_RAW_UPLOAD_PREROLL_MS,
+                 CONT_BARGE_RAW_UPLOAD_MIN_MS,
+                 CONT_BARGE_RAW_UPLOAD_TAIL_MS);
+    } else {
+        cont_preroll_flush_to_capture();
+        ESP_LOGW(TAG, "barge upload source=afe fallback: raw mic preroll empty");
+    }
     suppress_playback_for_barge();
     clear_afe_vad_pending();
     cont_barge_reset_candidate();
@@ -1837,6 +2037,13 @@ static void finish_continuous_utterance(const char *reason)
     }
     bool abort_upload = reason && (strcmp(reason, "manual_stop") == 0 ||
                                    strcmp(reason, "mcp_disconnect") == 0);
+    bool barge_raw_upload = s_cont_barge_upload_raw_mic;
+    if (barge_raw_upload) {
+        s_cont_barge_upload_raw_mic = false;
+        if (!abort_upload) {
+            barge_raw_upload_drain_to_capture();
+        }
+    }
     if (abort_upload) {
         drop_capture_chunk();
     } else {
@@ -1846,6 +2053,9 @@ static void finish_continuous_utterance(const char *reason)
     uint32_t duration_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
     if (s_capture_session_id[0] != '\0') {
         mcp_client_audio_stream_end(s_capture_session_id, duration_ms, reason ? reason : "vad_silence");
+    }
+    if (barge_raw_upload) {
+        barge_raw_upload_log_and_reset(duration_ms, reason);
     }
     ESP_LOGI(TAG, "continuous utterance end reason=%s duration=%ums", reason ? reason : "vad_silence", (unsigned)duration_ms);
     s_capture_session_id[0] = '\0';
@@ -2108,7 +2318,10 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
                      sr_vad_state == VAD_SPEECH ? 1 : 0);
         }
 
-        if (!started_now) {
+        if (s_cont_barge_upload_raw_mic) {
+            diag_stats_update_pcm(&s_barge_upload_afe_stats, data, len);
+            barge_raw_upload_drain_to_capture();
+        } else if (!started_now) {
             append_capture_audio(data, len);
         }
         int stop_threshold = cont_vad_stop_threshold();
@@ -2140,7 +2353,9 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
         uint32_t speech_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
         uint32_t silence_ms = (uint32_t)((now - s_cont_last_voice_tick) * portTICK_PERIOD_MS);
         cont_vad_log_sample_ex(now, avg_abs, peak, silence_ms, sr_vad_state);
-        if ((speech_ms >= CONT_VAD_MIN_SPEECH_MS && silence_ms >= CONT_VAD_TAIL_MS) ||
+        uint32_t min_speech_ms = s_cont_barge_upload_raw_mic ? CONT_BARGE_RAW_UPLOAD_MIN_MS : CONT_VAD_MIN_SPEECH_MS;
+        uint32_t tail_ms = s_cont_barge_upload_raw_mic ? CONT_BARGE_RAW_UPLOAD_TAIL_MS : CONT_VAD_TAIL_MS;
+        if ((speech_ms >= min_speech_ms && silence_ms >= tail_ms) ||
             speech_ms >= CONT_VAD_MAX_SPEECH_MS) {
             finish_continuous_utterance(speech_ms >= CONT_VAD_MAX_SPEECH_MS ? "vad_max" : "vad_silence");
         }
@@ -2167,7 +2382,8 @@ static void continuous_chat_housekeeping(void)
     uint32_t stale_audio_ms = s_cont_last_audio_tick
                                   ? (uint32_t)((now - s_cont_last_audio_tick) * portTICK_PERIOD_MS)
                                   : speech_ms;
-    if (speech_ms >= CONT_VAD_MIN_SPEECH_MS &&
+    uint32_t min_speech_ms = s_cont_barge_upload_raw_mic ? CONT_BARGE_RAW_UPLOAD_MIN_MS : CONT_VAD_MIN_SPEECH_MS;
+    if (speech_ms >= min_speech_ms &&
         stale_audio_ms >= CONT_VAD_STALE_AUDIO_MS &&
         (silence_ms >= CONT_VAD_STALE_SILENCE_MS || speech_ms >= CONT_VAD_MAX_SPEECH_MS)) {
         ESP_LOGW(TAG,
@@ -2275,6 +2491,7 @@ static void start_continuous_chat(void)
     s_cont_barge_env_pos = 0;
     s_cont_barge_env_count = 0;
     s_cont_barge_echo_gain_permille = CONT_BARGE_ECHO_GAIN_INIT;
+    barge_raw_upload_reset();
     cont_vad_reset_runtime();
     cont_vad_reset_noise_floor();
     cont_preroll_reset();
@@ -2340,6 +2557,7 @@ static void stop_continuous_chat(void)
     memset(s_cont_barge_mic_env, 0, sizeof(s_cont_barge_mic_env));
     s_cont_barge_env_pos = 0;
     s_cont_barge_env_count = 0;
+    barge_raw_upload_reset();
     cont_vad_reset_runtime();
     cont_preroll_reset();
     s_capture_session_id[0] = '\0';
@@ -2734,6 +2952,7 @@ static void on_cont_barge_raw_audio(const int16_t *interleaved, int frames, int 
         gain = clamp_int(gain, CONT_BARGE_ECHO_GAIN_MIN, CONT_BARGE_ECHO_GAIN_MAX);
         s_cont_barge_echo_gain_permille = (s_cont_barge_echo_gain_permille * 7 + gain) / 8;
     }
+    barge_raw_upload_push_mic(interleaved, frames, channels);
 }
 
 static void on_barge_diag_raw_audio(const int16_t *interleaved, int frames, int channels)

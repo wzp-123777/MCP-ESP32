@@ -30,7 +30,7 @@ extern const uint8_t barge_interrupt_prompt_wav_end[] asm("_binary_barge_interru
 #define PLAYER_I2S_BITS CODEC_ADC_BITS_PER_SAMPLE
 #define PLAYER_I2S_CHANNELS 2
 #define PLAYER_CHUNK_BYTES 2048
-#define PLAYER_INITIAL_VOLUME 75
+#define PLAYER_INITIAL_VOLUME 85
 #define PLAYER_SOFT_LIMIT 26000
 #define PLAYER_PREROLL_MS 40
 
