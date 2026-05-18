@@ -3701,6 +3701,14 @@ static void on_mcp_device_command(const char *command, void *ctx)
         send_cmd_nonblocking(VOICE_CMD_PLAY_ONCE, 0);
         return;
     }
+    if (command_equals(command, "loop") || command_equals(command, "play_loop")) {
+        send_cmd_nonblocking(VOICE_CMD_LOOP, 0);
+        return;
+    }
+    if (command_equals(command, "stop") || command_equals(command, "play_stop")) {
+        send_cmd_nonblocking(VOICE_CMD_STOP, 0);
+        return;
+    }
     if (command_has_token_prefix(command, "ask")) {
         const char *text = strchr(command, ' ');
         if (text) {

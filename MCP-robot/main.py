@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 import json
 import logging
+import os
+import socket
 import sys
+import threading
 import time
 from collections import deque
 from html import escape
@@ -1257,6 +1260,98 @@ trace_logger.propagate = False
 logger = logging.getLogger("MCP_Robot_Brain")
 
 app = FastAPI(title="云龙虾 (Cloud Lobster) 并行异构控制脑")
+
+ESP32_DISCOVERY_MAGIC = "MCP_ROBOT_DISCOVER_V1"
+ESP32_DISCOVERY_PORT = int(os.getenv("ESP32_MCP_DISCOVERY_PORT", "8081"))
+_discovery_stop = threading.Event()
+_discovery_thread: threading.Thread | None = None
+
+
+def _local_ip_for_peer(peer_ip: str) -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((peer_ip, 9))
+        host = probe.getsockname()[0]
+        if host and host != "0.0.0.0":
+            return host
+    finally:
+        probe.close()
+    return "127.0.0.1"
+
+
+def _esp32_discovery_endpoint(peer_ip: str) -> str:
+    endpoint = os.getenv("ESP32_MCP_DISCOVERY_ENDPOINT", "").strip()
+    if endpoint:
+        return endpoint
+    host = os.getenv("ESP32_MCP_DISCOVERY_HOST", "").strip() or _local_ip_for_peer(peer_ip)
+    return f"ws://{host}:8080/esp32_ws"
+
+
+def _run_esp32_discovery_responder(stop_event: threading.Event) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", ESP32_DISCOVERY_PORT))
+        sock.settimeout(1.0)
+        logger.info("ESP32 MCP discovery listening on UDP %s", ESP32_DISCOVERY_PORT)
+        while not stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if not stop_event.is_set():
+                    logger.warning("ESP32 MCP discovery socket error: %s", exc)
+                continue
+            text = data.decode("utf-8", errors="ignore")
+            if ESP32_DISCOVERY_MAGIC not in text:
+                continue
+            endpoint = _esp32_discovery_endpoint(addr[0])
+            payload = json.dumps(
+                {
+                    "type": "mcp_robot_discovery",
+                    "version": 1,
+                    "endpoint": endpoint,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            try:
+                sock.sendto(payload, addr)
+                logger.info("ESP32 MCP discovery reply: client=%s endpoint=%s", addr[0], endpoint)
+            except OSError as exc:
+                logger.warning("ESP32 MCP discovery reply failed: %s", exc)
+    except OSError as exc:
+        logger.warning("ESP32 MCP discovery disabled: %s", exc)
+    finally:
+        sock.close()
+
+
+def _start_esp32_discovery_responder() -> None:
+    global _discovery_thread
+    if ESP32_DISCOVERY_PORT <= 0:
+        logger.info("ESP32 MCP discovery disabled by port=%s", ESP32_DISCOVERY_PORT)
+        return
+    if _discovery_thread and _discovery_thread.is_alive():
+        return
+    _discovery_stop.clear()
+    _discovery_thread = threading.Thread(
+        target=_run_esp32_discovery_responder,
+        args=(_discovery_stop,),
+        name="esp32-mcp-discovery",
+        daemon=True,
+    )
+    _discovery_thread.start()
+
+
+@app.on_event("startup")
+async def _startup_esp32_discovery() -> None:
+    _start_esp32_discovery_responder()
+
+
+@app.on_event("shutdown")
+async def _shutdown_esp32_discovery() -> None:
+    _discovery_stop.set()
 
 
 class ConnectionManager:

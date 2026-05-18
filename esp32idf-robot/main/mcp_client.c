@@ -1,6 +1,7 @@
 #include "mcp_client.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,10 +25,13 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/inet.h"
 #include "lwip/apps/sntp.h"
+#include "lwip/sockets.h"
 #include "mbedtls/base64.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include <unistd.h>
 
 typedef enum {
     MCP_STATUS_NOT_CONFIGURED,
@@ -126,6 +130,7 @@ static bool s_ws_restart_requested;
 static bool s_ws_recreate_requested;
 static bool s_ws_stopping;
 static bool s_sntp_started;
+static bool s_endpoint_discovery_pending;
 static TickType_t s_last_ws_start_tick;
 static char *s_rx_buffer;
 static size_t s_rx_cap;
@@ -172,6 +177,10 @@ static void *s_device_command_ctx;
 #define MCP_AUDIO_UPLOAD_END_WAIT_MS 250
 #define MCP_TTS_QUEUE_WAIT_MS 250
 #define MCP_UI_EVENT_QUEUE_LEN 8
+#define MCP_DISCOVERY_PORT 8081
+#define MCP_DISCOVERY_MAGIC "MCP_ROBOT_DISCOVER_V1"
+#define MCP_DISCOVERY_TIMEOUT_MS 450
+#define MCP_DISCOVERY_ATTEMPTS 2
 #define MCP_ENDPOINT_NVS_NAMESPACE "mcp_robot"
 #define MCP_ENDPOINT_NVS_KEY "endpoint"
 #define MCP_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
@@ -185,6 +194,8 @@ static void websocket_request_recreate(void);
 static esp_err_t load_endpoint_from_nvs(void);
 static esp_err_t save_endpoint_to_nvs(const char *endpoint);
 static esp_err_t wifi_apply_profile(size_t index);
+static bool endpoint_discover_from_network(const esp_netif_ip_info_t *ip_info, char *endpoint, size_t endpoint_size);
+static void endpoint_try_discovery(void);
 static void endpoint_apply_wifi_profile(const esp_netif_ip_info_t *ip_info);
 static void tts_play_task(void *arg);
 static void audio_upload_task(void *arg);
@@ -611,6 +622,111 @@ static esp_err_t save_endpoint_to_nvs(const char *endpoint)
     }
     nvs_close(handle);
     return err;
+}
+
+static bool endpoint_string_is_ws(const char *endpoint)
+{
+    return endpoint &&
+           (strncmp(endpoint, "ws://", 5) == 0 || strncmp(endpoint, "wss://", 6) == 0);
+}
+
+static bool endpoint_discover_from_network(const esp_netif_ip_info_t *ip_info, char *endpoint, size_t endpoint_size)
+{
+    if (!ip_info || !endpoint || endpoint_size == 0) {
+        return false;
+    }
+    endpoint[0] = '\0';
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "endpoint discovery socket failed errno=%d", errno);
+        return false;
+    }
+
+    bool found = false;
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    struct timeval timeout = {
+        .tv_sec = 0,
+        .tv_usec = MCP_DISCOVERY_TIMEOUT_MS * 1000,
+    };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    uint32_t broadcast_addr = (ip_info->ip.addr & ip_info->netmask.addr) | ~ip_info->netmask.addr;
+    if (broadcast_addr == 0) {
+        broadcast_addr = htonl(INADDR_BROADCAST);
+    }
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(MCP_DISCOVERY_PORT),
+        .sin_addr.s_addr = broadcast_addr,
+    };
+
+    char request[128];
+    snprintf(request,
+             sizeof(request),
+             "{\"type\":\"mcp_robot_discover\",\"magic\":\"%s\",\"device_id\":\"%s\"}",
+             MCP_DISCOVERY_MAGIC,
+             ROBOT_DEVICE_ID);
+
+    ESP_LOGI(TAG, "endpoint discovery start udp=%u fallback=%s", (unsigned)MCP_DISCOVERY_PORT, s_endpoint);
+    for (int attempt = 0; attempt < MCP_DISCOVERY_ATTEMPTS && !found; ++attempt) {
+        int sent = sendto(sock, request, strlen(request), 0, (struct sockaddr *)&dest, sizeof(dest));
+        if (sent < 0) {
+            ESP_LOGW(TAG, "endpoint discovery send failed errno=%d", errno);
+            break;
+        }
+
+        char response[256];
+        struct sockaddr_storage source_addr;
+        socklen_t source_len = sizeof(source_addr);
+        int received = recvfrom(sock,
+                                response,
+                                sizeof(response) - 1,
+                                0,
+                                (struct sockaddr *)&source_addr,
+                                &source_len);
+        if (received <= 0) {
+            continue;
+        }
+        response[received] = '\0';
+
+        char discovered[sizeof(s_endpoint)];
+        if (json_get_string(response, "endpoint", discovered, sizeof(discovered)) &&
+            endpoint_string_is_ws(discovered)) {
+            strlcpy(endpoint, discovered, endpoint_size);
+            found = true;
+        }
+    }
+
+    close(sock);
+    return found;
+}
+
+static void endpoint_try_discovery(void)
+{
+    if (!s_endpoint_discovery_pending || s_endpoint_user_override || !s_last_ip_info_valid) {
+        return;
+    }
+
+    s_endpoint_discovery_pending = false;
+    char discovered[sizeof(s_endpoint)];
+    if (!endpoint_discover_from_network(&s_last_ip_info, discovered, sizeof(discovered))) {
+        ESP_LOGW(TAG, "endpoint discovery timeout, keep fallback=%s", s_endpoint[0] ? s_endpoint : "<empty>");
+        return;
+    }
+
+    if (strcmp(discovered, s_endpoint) != 0) {
+        strlcpy(s_endpoint, discovered, sizeof(s_endpoint));
+        ESP_LOGI(TAG, "endpoint discovered=%s", s_endpoint);
+        if (s_ws) {
+            websocket_request_recreate();
+        }
+    } else {
+        ESP_LOGI(TAG, "endpoint discovery matched fallback=%s", s_endpoint);
+    }
 }
 
 static bool rx_reserve(size_t needed)
@@ -1413,6 +1529,9 @@ static void wifi_select_next_profile(void)
 
 static void endpoint_apply_wifi_profile(const esp_netif_ip_info_t *ip_info)
 {
+    char previous_endpoint[sizeof(s_endpoint)];
+    strlcpy(previous_endpoint, s_endpoint, sizeof(previous_endpoint));
+
     if (s_endpoint_user_override) {
         return;
     }
@@ -1420,6 +1539,7 @@ static void endpoint_apply_wifi_profile(const esp_netif_ip_info_t *ip_info)
     const wifi_profile_t *profile = wifi_current_profile();
     if (profile && profile->endpoint && profile->endpoint[0]) {
         strlcpy(s_endpoint, profile->endpoint, sizeof(s_endpoint));
+        s_endpoint_discovery_pending = false;
     } else if (profile && profile->endpoint_host_octet != 0 && ip_info) {
         snprintf(s_endpoint,
                  sizeof(s_endpoint),
@@ -1428,13 +1548,18 @@ static void endpoint_apply_wifi_profile(const esp_netif_ip_info_t *ip_info)
                  esp_ip4_addr2_16(&ip_info->ip),
                  esp_ip4_addr3_16(&ip_info->ip),
                  (unsigned)profile->endpoint_host_octet);
+        s_endpoint_discovery_pending = true;
     } else {
         strlcpy(s_endpoint, ROBOT_MCP_URI, sizeof(s_endpoint));
+        s_endpoint_discovery_pending = true;
     }
     ESP_LOGI(TAG,
              "endpoint profile ssid=%s endpoint=%s",
              profile && profile->ssid ? profile->ssid : "<default>",
              s_endpoint[0] ? s_endpoint : "<empty>");
+    if (s_ws && strcmp(previous_endpoint, s_endpoint) != 0) {
+        websocket_request_recreate();
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -1451,6 +1576,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_wifi_connected = false;
         s_ws_connected = false;
         s_last_ip_info_valid = false;
+        s_endpoint_discovery_pending = false;
         audio_upload_drop_queued_items();
         websocket_request_restart();
         xEventGroupClearBits(s_event_group, MCP_WIFI_CONNECTED_BIT);
@@ -1537,6 +1663,7 @@ static esp_err_t wifi_start(void)
 
 static esp_err_t websocket_create_and_start(void)
 {
+    endpoint_try_discovery();
     if (!s_endpoint[0]) {
         s_status = MCP_STATUS_NOT_CONFIGURED;
         return ESP_ERR_INVALID_STATE;
@@ -1782,6 +1909,7 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
     if (!endpoint || endpoint[0] == '\0') {
         s_endpoint[0] = '\0';
         s_endpoint_user_override = true;
+        s_endpoint_discovery_pending = false;
         s_status = MCP_STATUS_NOT_CONFIGURED;
         esp_err_t nvs_ret = save_endpoint_to_nvs(NULL);
         if (nvs_ret != ESP_OK) {
@@ -1793,6 +1921,7 @@ esp_err_t mcp_client_set_endpoint(const char *endpoint)
 
     strlcpy(s_endpoint, endpoint, sizeof(s_endpoint));
     s_endpoint_user_override = true;
+    s_endpoint_discovery_pending = false;
     s_status = MCP_STATUS_CONFIGURED;
     esp_err_t nvs_ret = save_endpoint_to_nvs(s_endpoint);
     if (nvs_ret != ESP_OK) {
