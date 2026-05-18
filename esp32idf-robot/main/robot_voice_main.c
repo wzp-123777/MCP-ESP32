@@ -112,7 +112,8 @@
 #define CONT_BARGE_STRONG_EXTRA_PEAK 900
 #define CONT_PREROLL_CHUNKS 16
 #define CONT_BARGE_RAW_UPLOAD_CHUNKS 32
-#define CONT_BARGE_RAW_UPLOAD_PREROLL_MS 700
+#define CONT_BARGE_RAW_UPLOAD_PREROLL_MS 320
+#define CONT_BARGE_RAW_UPLOAD_POST_CANCEL_DROP_MS 180
 #define CONT_BARGE_RAW_UPLOAD_MIN_MS 2300
 #define CONT_BARGE_RAW_UPLOAD_TAIL_MS 1800
 #define RAW_TDM_DIAG_CHANNELS 4
@@ -309,6 +310,8 @@ static size_t s_barge_raw_upload_size;
 static size_t s_barge_raw_upload_dropped;
 static bool s_cont_barge_upload_raw_mic;
 static TickType_t s_cont_barge_upload_accept_tick;
+static TickType_t s_cont_barge_upload_skip_until_tick;
+static size_t s_barge_raw_upload_tail_discarded;
 static raw_tdm_channel_stats_t s_barge_upload_raw_stats;
 static raw_tdm_channel_stats_t s_barge_upload_afe_stats;
 static portMUX_TYPE s_barge_raw_upload_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -1511,6 +1514,8 @@ static void barge_raw_upload_reset(void)
     portEXIT_CRITICAL(&s_barge_raw_upload_mux);
     s_cont_barge_upload_raw_mic = false;
     s_cont_barge_upload_accept_tick = 0;
+    s_cont_barge_upload_skip_until_tick = 0;
+    s_barge_raw_upload_tail_discarded = 0;
     memset(&s_barge_upload_raw_stats, 0, sizeof(s_barge_upload_raw_stats));
     memset(&s_barge_upload_afe_stats, 0, sizeof(s_barge_upload_afe_stats));
 }
@@ -1594,6 +1599,17 @@ static size_t barge_raw_upload_pop(uint8_t *out, size_t out_cap)
     return copied;
 }
 
+static size_t barge_raw_upload_discard_pending(void)
+{
+    size_t discarded = 0;
+    portENTER_CRITICAL(&s_barge_raw_upload_mux);
+    discarded = s_barge_raw_upload_size;
+    s_barge_raw_upload_size = 0;
+    portEXIT_CRITICAL(&s_barge_raw_upload_mux);
+    s_barge_raw_upload_tail_discarded += discarded;
+    return discarded;
+}
+
 static void barge_raw_upload_drain_to_capture(void)
 {
     while (true) {
@@ -1612,11 +1628,13 @@ static void barge_raw_upload_log_and_reset(uint32_t duration_ms, const char *rea
     uint32_t afe_avg = diag_stats_avg(&s_barge_upload_afe_stats);
     uint32_t afe_rms = diag_stats_rms(&s_barge_upload_afe_stats);
     size_t dropped = 0;
+    size_t raw_tail_discard = s_barge_raw_upload_tail_discarded;
+    uint32_t raw_tail_discard_ms = (uint32_t)(((raw_tail_discard / sizeof(int16_t)) * 1000U) / CONT_SR_VAD_RATE);
     portENTER_CRITICAL(&s_barge_raw_upload_mux);
     dropped = s_barge_raw_upload_dropped;
     portEXIT_CRITICAL(&s_barge_raw_upload_mux);
     ESP_LOGI(TAG,
-             "barge upload raw_mic done reason=%s duration=%ums raw_samples=%u raw_avg=%u raw_rms=%u raw_peak=%d afe_avg=%u afe_rms=%u afe_peak=%d dropped=%u",
+             "barge upload raw_mic done reason=%s duration=%ums raw_samples=%u raw_avg=%u raw_rms=%u raw_peak=%d afe_avg=%u afe_rms=%u afe_peak=%d dropped=%u raw_tail_discard=%ums tail_source=afe",
              reason ? reason : "vad_silence",
              (unsigned)duration_ms,
              (unsigned)s_barge_upload_raw_stats.samples,
@@ -1626,7 +1644,8 @@ static void barge_raw_upload_log_and_reset(uint32_t duration_ms, const char *rea
              (unsigned)afe_avg,
              (unsigned)afe_rms,
              s_barge_upload_afe_stats.peak,
-             (unsigned)dropped);
+             (unsigned)dropped,
+             (unsigned)raw_tail_discard_ms);
     barge_raw_upload_reset();
 }
 
@@ -1983,7 +2002,10 @@ static bool cont_barge_accept_candidate(TickType_t now,
 {
     make_capture_session_id();
     s_capture_chunk_len = 0;
-    esp_err_t err = mcp_client_audio_stream_begin(s_capture_session_id);
+    bool have_raw_preroll = barge_raw_upload_has_audio();
+    esp_err_t err = mcp_client_audio_stream_begin_with_source(
+        s_capture_session_id,
+        have_raw_preroll ? "barge_raw_mic_afe_tail" : "barge_afe");
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "barge stream begin failed: %s", esp_err_to_name(err));
         s_capture_session_id[0] = '\0';
@@ -1998,16 +2020,18 @@ static bool cont_barge_accept_candidate(TickType_t now,
     s_cont_last_audio_tick = now;
     s_cont_silence_hits = 0;
     s_cont_utterance_peak_avg = avg_abs;
-    if (barge_raw_upload_has_audio()) {
+    if (have_raw_preroll) {
         s_cont_barge_upload_raw_mic = true;
         s_cont_barge_upload_accept_tick = now;
         barge_raw_upload_trim_to_ms(CONT_BARGE_RAW_UPLOAD_PREROLL_MS);
         barge_raw_upload_drain_to_capture();
+        s_cont_barge_upload_skip_until_tick = now + pdMS_TO_TICKS(CONT_BARGE_RAW_UPLOAD_POST_CANCEL_DROP_MS);
         cont_preroll_reset();
         ESP_LOGI(TAG,
-                 "barge upload source=raw_mic ch=%d preroll=%dms min=%dms tail=%dms",
+                 "barge upload source=raw_mic ch=%d preroll=%dms post_cancel_drop=%dms min=%dms tail=%dms tail_source=afe",
                  CONT_BARGE_MIC_CH,
                  CONT_BARGE_RAW_UPLOAD_PREROLL_MS,
+                 CONT_BARGE_RAW_UPLOAD_POST_CANCEL_DROP_MS,
                  CONT_BARGE_RAW_UPLOAD_MIN_MS,
                  CONT_BARGE_RAW_UPLOAD_TAIL_MS);
     } else {
@@ -2038,18 +2062,29 @@ static void finish_continuous_utterance(const char *reason)
     bool abort_upload = reason && (strcmp(reason, "manual_stop") == 0 ||
                                    strcmp(reason, "mcp_disconnect") == 0);
     bool barge_raw_upload = s_cont_barge_upload_raw_mic;
+    TickType_t now = xTaskGetTickCount();
     if (barge_raw_upload) {
         s_cont_barge_upload_raw_mic = false;
         if (!abort_upload) {
-            barge_raw_upload_drain_to_capture();
+            if (s_cont_barge_upload_skip_until_tick != 0 && now < s_cont_barge_upload_skip_until_tick) {
+                size_t discarded = barge_raw_upload_discard_pending();
+                if (discarded > 0) {
+                    ESP_LOGI(TAG,
+                             "barge upload raw tail dropped bytes=%u until=%ums",
+                             (unsigned)discarded,
+                             (unsigned)((s_cont_barge_upload_skip_until_tick - now) * portTICK_PERIOD_MS));
+                }
+            } else {
+                barge_raw_upload_discard_pending();
+            }
         }
+        s_cont_barge_upload_skip_until_tick = 0;
     }
     if (abort_upload) {
         drop_capture_chunk();
     } else {
         flush_capture_chunk();
     }
-    TickType_t now = xTaskGetTickCount();
     uint32_t duration_ms = (uint32_t)((now - s_cont_speech_start_tick) * portTICK_PERIOD_MS);
     if (s_capture_session_id[0] != '\0') {
         mcp_client_audio_stream_end(s_capture_session_id, duration_ms, reason ? reason : "vad_silence");
@@ -2320,7 +2355,13 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
 
         if (s_cont_barge_upload_raw_mic) {
             diag_stats_update_pcm(&s_barge_upload_afe_stats, data, len);
-            barge_raw_upload_drain_to_capture();
+            if (s_cont_barge_upload_skip_until_tick != 0 && now < s_cont_barge_upload_skip_until_tick) {
+                barge_raw_upload_discard_pending();
+            } else {
+                s_cont_barge_upload_skip_until_tick = 0;
+                barge_raw_upload_discard_pending();
+                append_capture_audio(data, len);
+            }
         } else if (!started_now) {
             append_capture_audio(data, len);
         }

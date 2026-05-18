@@ -63,6 +63,7 @@ typedef struct {
 typedef struct {
     audio_upload_item_kind_t kind;
     char session_id[32];
+    char source[32];
     uint8_t *data;
     size_t len;
     uint32_t duration_ms;
@@ -737,15 +738,18 @@ static bool audio_upload_queue_item(audio_upload_item_t *item, TickType_t wait_t
 
 static esp_err_t audio_upload_send_start(const audio_upload_item_t *item)
 {
-    char payload[256];
+    char source_escaped[48];
+    char payload[320];
+    json_escape(item ? item->source : "", source_escaped, sizeof(source_escaped));
     snprintf(payload,
              sizeof(payload),
-             "{\"type\":\"audio_stream_start\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sample_rate\":%d,\"sample_bits\":%d,\"channels\":%d,\"encoding\":\"pcm_s16le\"}",
+             "{\"type\":\"audio_stream_start\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sample_rate\":%d,\"sample_bits\":%d,\"channels\":%d,\"encoding\":\"pcm_s16le\",\"source\":\"%s\"}",
              ROBOT_DEVICE_ID,
              item ? item->session_id : "",
              ROBOT_AUDIO_SAMPLE_RATE,
              ROBOT_AUDIO_BITS,
-             ROBOT_AUDIO_CHANNELS);
+             ROBOT_AUDIO_CHANNELS,
+             source_escaped[0] ? source_escaped : "afe");
     return ws_send_json(payload);
 }
 
@@ -1985,6 +1989,11 @@ esp_err_t mcp_client_send_diagnostic_event(const char *name, const char *phase, 
 
 esp_err_t mcp_client_audio_stream_begin(const char *session_id)
 {
+    return mcp_client_audio_stream_begin_with_source(session_id, "afe");
+}
+
+esp_err_t mcp_client_audio_stream_begin_with_source(const char *session_id, const char *source)
+{
     if (!session_id || !session_id[0]) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1992,7 +2001,8 @@ esp_err_t mcp_client_audio_stream_begin(const char *session_id)
         .kind = AUDIO_UPLOAD_ITEM_START,
     };
     strlcpy(item.session_id, session_id, sizeof(item.session_id));
-    ESP_LOGI(TAG, "audio stream begin session=%s", session_id);
+    strlcpy(item.source, source && source[0] ? source : "afe", sizeof(item.source));
+    ESP_LOGI(TAG, "audio stream begin session=%s source=%s", session_id, item.source);
     strlcpy(s_current_session_id, session_id, sizeof(s_current_session_id));
     ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_RECORDING, NULL);
     return audio_upload_queue_item(&item,

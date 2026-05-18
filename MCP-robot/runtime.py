@@ -144,6 +144,7 @@ class PendingAudioStream:
     sample_bits: int
     channels: int
     encoding: str
+    source: str = ""
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     bytes_received: int = 0
@@ -234,6 +235,35 @@ def _normalize_esp32_dialog_input_pcm(
     return normalized_bytes, before, after, gain
 
 
+def _condition_esp32_dialog_input_pcm(
+    pcm_bytes: bytes,
+    *,
+    audio_source: str,
+    sample_rate: int = 16000,
+) -> tuple[bytes, dict[str, int | str]]:
+    source = str(audio_source or "").strip().lower()
+    if "barge" not in source or not pcm_bytes:
+        return pcm_bytes, {"source": source, "leading_drop_ms": 0}
+
+    requested_drop_ms = max(0, _ESP32_BARGE_DIALOG_LEADING_DROP_MS)
+    min_keep_ms = max(200, _ESP32_BARGE_DIALOG_MIN_KEEP_MS)
+    bytes_per_ms = max(1, sample_rate * 2 // 1000)
+    requested_drop = requested_drop_ms * bytes_per_ms
+    min_keep = min_keep_ms * bytes_per_ms
+    max_drop = max(0, len(pcm_bytes) - min_keep)
+    drop_bytes = min(requested_drop, max_drop)
+    drop_bytes -= drop_bytes % 2
+    if drop_bytes <= 0:
+        return pcm_bytes, {"source": source, "leading_drop_ms": 0}
+    conditioned = pcm_bytes[drop_bytes:]
+    return conditioned, {
+        "source": source,
+        "leading_drop_ms": int(drop_bytes / bytes_per_ms),
+        "input_bytes": len(pcm_bytes),
+        "output_bytes": len(conditioned),
+    }
+
+
 _TTS_AUDIO_B64_CHUNK_CHARS = 4096
 _TTS_AUDIO_CHUNK_DELAY_SECONDS = 0.005
 _TTS_STRONG_PUNCT_MIN_CHARS = 2
@@ -249,6 +279,8 @@ _ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "80"))
 _ESP32_DIALOG_INPUT_TARGET_RMS = float(os.getenv("ESP32_DIALOG_INPUT_TARGET_RMS", "900"))
 _ESP32_DIALOG_INPUT_TARGET_PEAK = int(os.getenv("ESP32_DIALOG_INPUT_TARGET_PEAK", "16000"))
 _ESP32_DIALOG_INPUT_MAX_GAIN = float(os.getenv("ESP32_DIALOG_INPUT_MAX_GAIN", "4"))
+_ESP32_BARGE_DIALOG_LEADING_DROP_MS = int(os.getenv("ESP32_BARGE_DIALOG_LEADING_DROP_MS", "120"))
+_ESP32_BARGE_DIALOG_MIN_KEEP_MS = int(os.getenv("ESP32_BARGE_DIALOG_MIN_KEEP_MS", "700"))
 _TTS_DEBUG_DIR = Path(__file__).resolve().parent / "data" / "esp32_tts"
 _EMOJI_RE = re.compile(
     "["
@@ -2437,6 +2469,7 @@ class RobotRuntime:
             sample_bits=int(payload.get("sample_bits") or 16),
             channels=int(payload.get("channels") or 1),
             encoding=str(payload.get("encoding") or "pcm_s16le"),
+            source=str(payload.get("source") or "").strip()[:32],
         )
         self._pending_audio_streams[session_id] = stream
         self._trace(
@@ -2448,6 +2481,7 @@ class RobotRuntime:
             sample_bits=stream.sample_bits,
             channels=stream.channels,
             encoding=stream.encoding,
+            audio_source=stream.source,
         )
         await _send_esp32_status(
             self.connection_manager,
@@ -2543,6 +2577,7 @@ class RobotRuntime:
                 bytes_received=stream.bytes_received,
                 duration_ms=int(payload.get("duration_ms") or 0),
                 reason=str(payload.get("reason") or ""),
+                audio_source=stream.source,
                 audio_peak=audio_stats["peak"],
                 audio_rms=round(float(audio_stats["rms"]), 2),
                 audio_nonzero_ratio=round(float(audio_stats["nonzero_ratio"]), 6),
@@ -2572,6 +2607,7 @@ class RobotRuntime:
                     device_id=device_id,
                     wav_path=wav_path,
                     duration_ms=int(payload.get("duration_ms") or 0),
+                    audio_source=stream.source,
                 ),
                 task_type="esp32.audio_asr",
                 source="ESP32",
@@ -2595,6 +2631,7 @@ class RobotRuntime:
         device_id: str,
         wav_path: Path,
         duration_ms: int,
+        audio_source: str = "",
     ) -> None:
         if not self.config.doubao_dialog.enabled:
             error_text = "ESP32 语音链路要求豆包 Dialog 一体化，请先启用 ESP32_DOUBAO_DIALOG_ENABLED。"
@@ -2650,6 +2687,7 @@ class RobotRuntime:
             device_id=device_id,
             wav_path=wav_path,
             duration_ms=duration_ms,
+            audio_source=audio_source,
         )
         if handled:
             return
@@ -2678,6 +2716,7 @@ class RobotRuntime:
         device_id: str,
         wav_path: Path,
         duration_ms: int,
+        audio_source: str = "",
     ) -> bool:
         try:
             with wave.open(str(wav_path), "rb") as wav_file:
@@ -2693,9 +2732,29 @@ class RobotRuntime:
                 source_channels=source_channels,
                 target_rate=16000,
             )
+            source_audio_stats = _analyze_pcm_s16le(pcm16)
+            source_pcm_bytes = len(pcm16)
+            pcm16, input_conditioning = _condition_esp32_dialog_input_pcm(
+                pcm16,
+                audio_source=audio_source,
+                sample_rate=16000,
+            )
             audio_stats = _analyze_pcm_s16le(pcm16)
             raw_audio_stats = audio_stats
             dialog_input_gain = 1.0
+            if int(input_conditioning.get("leading_drop_ms") or 0) > 0:
+                logger.info(
+                    "ESP32 dialog input conditioned: session=%s source=%s leading_drop=%dms bytes=%d->%d rms=%.2f->%.2f peak=%d->%d",
+                    session_id,
+                    audio_source or "",
+                    int(input_conditioning.get("leading_drop_ms") or 0),
+                    source_pcm_bytes,
+                    len(pcm16),
+                    float(source_audio_stats.get("rms") or 0.0),
+                    float(audio_stats.get("rms") or 0.0),
+                    int(source_audio_stats.get("peak") or 0),
+                    int(audio_stats.get("peak") or 0),
+                )
             if int(audio_stats.get("nonzero_samples") or 0) == 0 or int(audio_stats.get("peak") or 0) == 0:
                 await self.connection_manager.send_to_esp32(
                     {
@@ -2778,7 +2837,11 @@ class RobotRuntime:
             device_id=device_id,
             session_id=session_id,
             wav_path=str(wav_path),
+            audio_source=audio_source,
             duration_ms=duration_ms,
+            audio_peak_source=source_audio_stats["peak"],
+            audio_rms_source=round(float(source_audio_stats["rms"]), 2),
+            audio_condition_leading_drop_ms=int(input_conditioning.get("leading_drop_ms") or 0),
             audio_peak_raw=raw_audio_stats["peak"],
             audio_rms_raw=round(float(raw_audio_stats["rms"]), 2),
             audio_peak=audio_stats["peak"],

@@ -28,6 +28,7 @@ void mcp_client_set_device_command_callback(mcp_client_device_command_cb_t cb, v
 esp_err_t mcp_client_send_text_request(const char *text);
 esp_err_t mcp_client_send_diagnostic_event(const char *name, const char *phase, const char *detail);
 esp_err_t mcp_client_audio_stream_begin(const char *session_id);
+esp_err_t mcp_client_audio_stream_begin_with_source(const char *session_id, const char *source);
 esp_err_t mcp_client_audio_stream_chunk(const char *session_id, const uint8_t *data, size_t len);
 esp_err_t mcp_client_audio_stream_end(const char *session_id, uint32_t duration_ms, const char *reason);
 esp_err_t mcp_client_send_config(const char *persona_id,
