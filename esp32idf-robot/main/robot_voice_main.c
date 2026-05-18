@@ -3701,6 +3701,26 @@ static void on_mcp_device_command(const char *command, void *ctx)
         send_cmd_nonblocking(VOICE_CMD_PLAY_ONCE, 0);
         return;
     }
+    if (command_has_token_prefix(command, "ask")) {
+        const char *text = strchr(command, ' ');
+        if (text) {
+            while (*text && isspace((unsigned char)*text)) {
+                ++text;
+            }
+        }
+        if (text && text[0]) {
+            app_ui_set_recent_text(text);
+            app_ui_set_assistant_state(APP_UI_STATE_THINKING);
+            esp_err_t err = mcp_client_send_text_request(text);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ASK device command send failed: %s", esp_err_to_name(err));
+                app_ui_set_mcp_status("MCP SEND FAIL");
+            }
+        } else {
+            ESP_LOGW(TAG, "ASK device command missing text");
+        }
+        return;
+    }
     if (command_has_token_prefix(command, "raw_tdm_diag") ||
         command_has_token_prefix(command, "raw_diag") ||
         command_has_token_prefix(command, "tdm_diag")) {
