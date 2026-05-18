@@ -42,9 +42,17 @@ Espressif-aligned full-duplex AEC candidate.
 - Keeps the v1.5 asynchronous upload queue and playback-aware barge-in gate as fallback protection while hardware tuning continues.
 - The `v2.0-espressif-fd-aec` branch also keeps ESP32-S3 defaults aligned with the development firmware by enabling the `wn9_hiesp` WakeNet model and conservative PSRAM/internal allocation defaults.
 - Adds runtime AEC profile switching through serial and MCP commands so `AEC_MODE_FD_LOW_COST` and `AEC_MODE_FD_HIGH_PERF` can be compared without rebuilding firmware.
+- Adds Wi-Fi profile failover support while keeping the published `app_config.h` placeholder-only.
+- Reopens playback barge-in candidates after echo rejection cooldown and adds a local mic override path for stronger near-end speech.
+- Moves MCP/TTS/upload helper tasks and queues to PSRAM-capable allocations and logs heap state around WebSocket startup.
+
+Current validation:
+
+- Build-only passes in the publish tree with the placeholder `app_config.h`.
+- COM3 runtime validation on the development firmware confirms `input=RNNM`, `ch0` reference, `ch3` mic, `AFE_TYPE_FD`, `AEC_MODE_FD_LOW_COST`, and aggressive NLP.
+- During the latest continuous-chat run, no `AFE Ringbuffer of AFE(FEED) is full`, audio upload queue high, audio chunk queue full, or panic was observed.
 
 Validation still required:
 
-- Flash on COM3 and confirm logs show the managed ESP-SR 2.4.4 component.
-- Re-run `BARGE` and continuous-chat interruption tests.
-- Compare `ref_corr`, `ref_lag_ms`, self-echo VAD behavior, and whether real near-end speech remains accepted.
+- Re-run a deliberate real-human playback interruption test and confirm `barge playback suppressed`, playback cancel, and upload start happen in the same interaction.
+- Compare low-cost and high-performance AEC profiles after the low-cost path is stable.
