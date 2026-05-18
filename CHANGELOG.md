@@ -45,6 +45,7 @@ Espressif-aligned full-duplex AEC candidate.
 - Adds Wi-Fi profile failover support while keeping the published `app_config.h` placeholder-only.
 - Reopens playback barge-in candidates after echo rejection cooldown and adds a local mic override path for stronger near-end speech.
 - Moves MCP/TTS/upload helper tasks and queues to PSRAM-capable allocations and logs heap state around WebSocket startup.
+- Keeps the high-performance AEC profile behind the `ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF` compile-time guard after a crash was traced into ESP-SR's internal `esp_aec3_dlfft_process()` path.
 
 Current validation:
 
@@ -55,4 +56,4 @@ Current validation:
 Validation still required:
 
 - Re-run a deliberate real-human playback interruption test and confirm `barge playback suppressed`, playback cancel, and upload start happen in the same interaction.
-- Compare low-cost and high-performance AEC profiles after the low-cost path is stable.
+- Compare low-cost and high-performance AEC profiles only in a separate experimental build with the high-performance guard enabled.

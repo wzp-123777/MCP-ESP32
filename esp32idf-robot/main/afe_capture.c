@@ -53,6 +53,9 @@
 #define AFE_CAPTURE_AFE_MODE AFE_MODE_LOW_COST
 #define AFE_CAPTURE_DEFAULT_AEC_PROFILE AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST
 #define AFE_CAPTURE_AEC_NLP_LEVEL AEC_NLP_LEVEL_AGGR
+#ifndef ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF
+#define ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF 0
+#endif
 #define AFE_CAPTURE_I2S_OUT_RB_SIZE (2 * 1024)
 #define AFE_CAPTURE_RAW_OUT_RB_SIZE (4 * 1024)
 #define AFE_CAPTURE_FILTER_OUT_RB_SIZE (2 * 1024)
@@ -136,8 +139,15 @@ static void *capture_malloc(size_t size)
 
 static bool aec_profile_is_valid(afe_capture_aec_profile_t profile)
 {
-    return profile == AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST ||
-           profile == AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF;
+    if (profile == AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST) {
+        return true;
+    }
+#if ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF
+    if (profile == AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 static aec_mode_t resolve_aec_mode(afe_capture_aec_profile_t profile)
@@ -1028,6 +1038,12 @@ const char *afe_capture_get_aec_profile_name(void)
 esp_err_t afe_capture_set_aec_profile(afe_capture_aec_profile_t profile)
 {
     if (!aec_profile_is_valid(profile)) {
+#if !ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF
+        if (profile == AFE_CAPTURE_AEC_PROFILE_FD_HIGH_PERF) {
+            ESP_LOGW(TAG, "AEC high performance profile disabled; define ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF=1 to test it");
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+#endif
         return ESP_ERR_INVALID_ARG;
     }
     if (s_aec_profile == profile) {
