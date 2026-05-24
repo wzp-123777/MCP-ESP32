@@ -596,6 +596,7 @@ static void handle_fetch_result(afe_fetch_result_t *result)
     bool speech = result->vad_state == VAD_SPEECH;
     bool wake = result->wakeup_state == WAKENET_DETECTED ||
                 result->wakeup_state == WAKENET_CHANNEL_VERIFIED;
+    bool should_log_activity = s_running || s_raw_monitor_enabled || s_processed_audio_cb != NULL;
 
     if (wake && s_wake_enabled && !s_wake_latched) {
         s_wake_latched = true;
@@ -613,14 +614,18 @@ static void handle_fetch_result(afe_fetch_result_t *result)
 
     if (speech && !s_vad_speech) {
         s_vad_speech = true;
-        ESP_LOGI(TAG, "afe vad start volume=%.1f cache=%d", (double)result->data_volume, result->vad_cache_size);
+        if (should_log_activity) {
+            ESP_LOGI(TAG, "afe vad start volume=%.1f cache=%d", (double)result->data_volume, result->vad_cache_size);
+        }
         emit_event(AFE_CAPTURE_EVENT_VAD_START);
         forward_audio(result->vad_cache, result->vad_cache_size);
     }
 
     if (result->data && result->data_size > 0) {
         TickType_t now = xTaskGetTickCount();
-        if ((uint32_t)((now - s_fetch_log_tick) * portTICK_PERIOD_MS) >= AFE_CAPTURE_LOG_INTERVAL_MS) {
+        bool should_log_fetch = s_running || s_raw_monitor_enabled || s_processed_audio_cb != NULL;
+        if (should_log_fetch &&
+            (uint32_t)((now - s_fetch_log_tick) * portTICK_PERIOD_MS) >= AFE_CAPTURE_LOG_INTERVAL_MS) {
             int peak = 0;
             int avg_abs = 0;
             analyze_level(result->data, result->data_size, &peak, &avg_abs);
@@ -644,7 +649,9 @@ static void handle_fetch_result(afe_fetch_result_t *result)
 
     if (!speech && s_vad_speech) {
         s_vad_speech = false;
-        ESP_LOGI(TAG, "afe vad end volume=%.1f", (double)result->data_volume);
+        if (should_log_activity) {
+            ESP_LOGI(TAG, "afe vad end volume=%.1f", (double)result->data_volume);
+        }
         emit_event(AFE_CAPTURE_EVENT_VAD_END);
     }
 }

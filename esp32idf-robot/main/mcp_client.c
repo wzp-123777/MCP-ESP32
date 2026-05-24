@@ -151,6 +151,8 @@ static char s_current_session_id[32];
 static app_ui_assistant_state_t s_last_ui_state = APP_UI_STATE_IDLE;
 static TickType_t s_last_ui_state_tick;
 static volatile bool s_assistant_busy;
+static TickType_t s_assistant_busy_since_tick;
+static TickType_t s_assistant_activity_tick;
 static bool s_tts_playback_busy;
 static char s_cfg_persona_id[48] = "default";
 static char s_cfg_persona_label[64] = "默认人设";
@@ -171,6 +173,9 @@ static void *s_device_command_ctx;
 #define MCP_MAX_RX_MESSAGE (256 * 1024)
 #define MCP_MAX_TTS_BYTES (384 * 1024)
 #define MCP_MIN_TTS_BYTES 1024
+#define MCP_ASSISTANT_STALE_MS 25000
+#define MCP_TTS_STALE_MS 20000
+#define MCP_ASSISTANT_HARD_TIMEOUT_MS 90000
 #define MCP_TTS_PLAY_QUEUE_LEN 12
 #define MCP_AUDIO_UPLOAD_QUEUE_LEN 64
 #define MCP_AUDIO_UPLOAD_BEGIN_WAIT_MS 250
@@ -236,10 +241,21 @@ static esp_err_t create_spiram_task(TaskFunction_t task_func,
 
 static void set_assistant_busy(bool busy)
 {
+    TickType_t now = xTaskGetTickCount();
     if (s_assistant_busy == busy) {
+        if (busy) {
+            s_assistant_activity_tick = now;
+        }
         return;
     }
     s_assistant_busy = busy;
+    if (busy) {
+        s_assistant_busy_since_tick = now;
+        s_assistant_activity_tick = now;
+    } else {
+        s_assistant_busy_since_tick = 0;
+        s_assistant_activity_tick = 0;
+    }
     if (s_busy_cb) {
         s_busy_cb(busy, s_busy_ctx);
     }
@@ -274,7 +290,7 @@ static void start_sntp_once(void)
 static app_ui_assistant_state_t assistant_state_from_status(const char *status)
 {
     if (!status) {
-        return APP_UI_STATE_IDLE;
+        return s_cfg_continuous_chat ? APP_UI_STATE_RECORDING : APP_UI_STATE_IDLE;
     }
     if (strcmp(status, "listening") == 0 || strcmp(status, "recording") == 0) {
         return APP_UI_STATE_RECORDING;
@@ -297,7 +313,12 @@ static app_ui_assistant_state_t assistant_state_from_status(const char *status)
     if (strcmp(status, "error") == 0) {
         return APP_UI_STATE_ERROR;
     }
-    return APP_UI_STATE_IDLE;
+    return s_cfg_continuous_chat ? APP_UI_STATE_RECORDING : APP_UI_STATE_IDLE;
+}
+
+static app_ui_assistant_state_t assistant_ready_state(void)
+{
+    return s_cfg_continuous_chat ? APP_UI_STATE_RECORDING : APP_UI_STATE_IDLE;
 }
 
 static void ui_post_event(mcp_ui_event_type_t type, app_ui_assistant_state_t state, const char *text)
@@ -811,6 +832,54 @@ static void audio_upload_drop_queued_items(void)
     }
 }
 
+static void assistant_watchdog_reset(const char *reason)
+{
+    ESP_LOGW(TAG,
+             "assistant watchdog reset reason=%s busy=%d playback=%d tts_active=%d session=%s",
+             reason ? reason : "unknown",
+             s_assistant_busy,
+             s_tts_playback_busy,
+             s_tts_pcm_active,
+             s_current_session_id);
+    audio_player_cancel();
+    tts_reset();
+    tts_drop_queued_items();
+    s_tts_pcm_active = false;
+    s_tts_pcm_first_chunk = false;
+    s_tts_pcm_chunk_no = 0;
+    s_tts_segment_no = 0;
+    set_tts_playback_busy(false);
+    set_assistant_busy(false);
+    ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
+}
+
+static void assistant_watchdog_poll(void)
+{
+    if (!s_assistant_busy) {
+        return;
+    }
+    TickType_t now = xTaskGetTickCount();
+    uint32_t busy_ms = s_assistant_busy_since_tick
+                           ? (uint32_t)((now - s_assistant_busy_since_tick) * portTICK_PERIOD_MS)
+                           : 0;
+    uint32_t idle_ms = s_assistant_activity_tick
+                           ? (uint32_t)((now - s_assistant_activity_tick) * portTICK_PERIOD_MS)
+                           : busy_ms;
+    if (busy_ms >= MCP_ASSISTANT_HARD_TIMEOUT_MS) {
+        assistant_watchdog_reset("hard_timeout");
+        return;
+    }
+    if (s_tts_pcm_active) {
+        if (!s_tts_playback_busy && idle_ms >= MCP_TTS_STALE_MS) {
+            assistant_watchdog_reset("tts_stale");
+        }
+        return;
+    }
+    if (!s_tts_playback_busy && idle_ms >= MCP_ASSISTANT_STALE_MS) {
+        assistant_watchdog_reset("assistant_stale");
+    }
+}
+
 void mcp_client_cancel_playback(void)
 {
     audio_player_cancel();
@@ -820,7 +889,7 @@ void mcp_client_cancel_playback(void)
     s_tts_pcm_first_chunk = false;
     set_tts_playback_busy(false);
     set_assistant_busy(false);
-    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+    ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
     ESP_LOGI(TAG, "tts playback canceled and queue cleared");
 }
 
@@ -1177,7 +1246,7 @@ static void tts_finish(void)
 
     if (!tts_queue_item(&item, "tts wav")) {
         set_assistant_busy(false);
-        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+        ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
         return;
     }
     ESP_LOGI(TAG, "tts queued len=%u", (unsigned)item.len);
@@ -1198,7 +1267,7 @@ static void tts_play_task(void *arg)
             s_tts_pcm_first_chunk = false;
             set_tts_playback_busy(false);
             set_assistant_busy(false);
-            ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+            ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
             continue;
         }
         if (!item.data || item.len == 0) {
@@ -1233,7 +1302,7 @@ static void tts_play_task(void *arg)
         item.len = 0;
         set_tts_playback_busy(false);
         set_assistant_busy(false);
-        ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+        ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
     }
 }
 
@@ -1242,7 +1311,8 @@ static void ui_event_task(void *arg)
     (void)arg;
     mcp_ui_event_t event = {0};
     while (true) {
-        if (xQueueReceive(s_ui_event_queue, &event, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_ui_event_queue, &event, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            assistant_watchdog_poll();
             continue;
         }
         switch (event.type) {
@@ -1262,12 +1332,13 @@ static void ui_event_task(void *arg)
             case MCP_UI_EVENT_STATUS:
                 app_ui_note_mcp_activity();
                 if (event.state == APP_UI_STATE_IDLE ||
+                    event.state == APP_UI_STATE_RECORDING ||
                     event.state == APP_UI_STATE_ERROR ||
                     event.state == APP_UI_STATE_OFFLINE) {
                     if (!s_tts_pcm_active) {
                         set_assistant_busy(false);
                     }
-                } else if (event.state != APP_UI_STATE_RECORDING) {
+                } else {
                     set_assistant_busy(true);
                 }
                 if (should_apply_ui_state(event.state)) {
@@ -1296,6 +1367,7 @@ static void ui_event_task(void *arg)
             default:
                 break;
         }
+        assistant_watchdog_poll();
     }
 }
 
@@ -1315,6 +1387,9 @@ static void handle_ws_text(const char *message)
         json_get_string(message, "text", text, sizeof(text));
         ESP_LOGI(TAG, "assistant_done: %s", text);
         ui_post_event(MCP_UI_EVENT_TEXT, APP_UI_STATE_IDLE, text);
+        if (!s_tts_pcm_active) {
+            ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
+        }
         return;
     }
 
@@ -1416,7 +1491,7 @@ static void handle_ws_text(const char *message)
             s_tts_pcm_active = false;
             s_tts_pcm_first_chunk = false;
             set_assistant_busy(false);
-            ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_IDLE, NULL);
+            ui_post_event(MCP_UI_EVENT_STATUS, assistant_ready_state(), NULL);
         }
         return;
     }
@@ -2174,12 +2249,11 @@ esp_err_t mcp_client_audio_stream_end(const char *session_id, uint32_t duration_
     strlcpy(item.session_id, session_id, sizeof(item.session_id));
     strlcpy(item.reason, reason ? reason : "set_release", sizeof(item.reason));
     ESP_LOGI(TAG, "audio stream end session=%s duration=%ums", session_id, (unsigned)duration_ms);
-    ui_post_event(MCP_UI_EVENT_STATUS, APP_UI_STATE_UPLOADING, NULL);
-    return audio_upload_queue_item(&item,
-                                   pdMS_TO_TICKS(MCP_AUDIO_UPLOAD_END_WAIT_MS),
-                                   "audio end")
-               ? ESP_OK
-               : ESP_FAIL;
+    bool queued = audio_upload_queue_item(&item,
+                                          pdMS_TO_TICKS(MCP_AUDIO_UPLOAD_END_WAIT_MS),
+                                          "audio end");
+    ui_post_event(MCP_UI_EVENT_STATUS, queued ? APP_UI_STATE_UPLOADING : assistant_ready_state(), NULL);
+    return queued ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t send_config_payload(const char *persona_id,

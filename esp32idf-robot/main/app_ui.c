@@ -169,7 +169,7 @@ static const char *state_text(app_ui_assistant_state_t state)
 {
     switch (state) {
         case APP_UI_STATE_RECORDING:
-            return "录音中";
+            return s_chat_continuous ? "倾听中" : "录音中";
         case APP_UI_STATE_UPLOADING:
             return "上传中";
         case APP_UI_STATE_ASR:

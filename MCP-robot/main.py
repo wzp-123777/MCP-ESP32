@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import json
 import logging
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 import wave
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from starlette.websockets import WebSocketState
 
@@ -1598,6 +1599,150 @@ async def api_audio_waveforms(limit: int = 8, search: str = "") -> dict[str, Any
 async def api_esp32_tts_test(text: str = "小乐测试语音。") -> dict[str, Any]:
     await runtime.send_esp32_tts_test(text[:120])
     return {"ok": True, "text": text[:120]}
+
+
+def _select_esp32_replay_wav(file: str = "", min_bytes: int = 32000) -> tuple[Path, int]:
+    audio_dir = (config.data_dir / "esp32_audio").resolve()
+    wav_path: Path | None = None
+    if file.strip():
+        candidate = (audio_dir / Path(file).name).resolve()
+        if candidate.parent != audio_dir or not candidate.is_file() or candidate.suffix.lower() != ".wav":
+            raise HTTPException(status_code=404, detail="ESP32 replay WAV not found")
+        wav_path = candidate
+    else:
+        wavs = sorted(
+            (path for path in audio_dir.glob("*.wav") if path.is_file() and path.stat().st_size >= max(0, min_bytes)),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if wavs:
+            wav_path = wavs[0]
+    if wav_path is None:
+        raise HTTPException(status_code=404, detail="No ESP32 replay WAV available")
+
+    try:
+        with wave.open(str(wav_path), "rb") as wav_file:
+            rate = wav_file.getframerate()
+            frames = wav_file.getnframes()
+            duration_ms = int((frames * 1000) / rate) if rate > 0 else 0
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid WAV: {exc}") from exc
+    return wav_path, duration_ms
+
+
+def _parse_diagnostic_detail(detail: str) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for item in str(detail or "").split():
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        try:
+            parsed[key] = int(value)
+        except ValueError:
+            parsed[key] = value
+    return parsed
+
+
+@app.get("/api/esp32/dialog-replay")
+async def api_esp32_dialog_replay(file: str = "", min_bytes: int = 32000) -> dict[str, Any]:
+    wav_path, duration_ms = _select_esp32_replay_wav(file=file, min_bytes=min_bytes)
+    device_id = "ESP32_KORVO_2"
+    session_id = f"esp32-dialog-replay-{int(time.time() * 1000)}"
+    runtime._track_task(
+        runtime._run_esp32_audio_pipeline(
+            session_id=session_id,
+            device_id=device_id,
+            wav_path=wav_path,
+            duration_ms=duration_ms,
+            audio_source="dialog_replay",
+        ),
+        task_type="esp32.dialog_replay",
+        source="ESP32",
+        metadata={"device_id": device_id, "session_id": session_id, "wav": wav_path.name},
+    )
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "wav": wav_path.name,
+        "duration_ms": duration_ms,
+    }
+
+
+@app.get("/api/esp32/barge-tts-diag")
+async def api_esp32_barge_tts_diag(
+    fmt: str = "RNNM",
+    duration_ms: int = 12000,
+    file: str = "",
+    min_bytes: int = 32000,
+    arm_delay_ms: int = 800,
+    wait: bool = True,
+) -> dict[str, Any]:
+    connection = manager.snapshot()
+    if not connection["esp32_connected"]:
+        raise HTTPException(status_code=409, detail="ESP32 is not connected")
+
+    fmt_clean = re.sub(r"[^A-Za-z]", "", fmt).upper()[:7] or "RNNM"
+    if any(ch not in "RMN" for ch in fmt_clean):
+        raise HTTPException(status_code=400, detail="fmt must contain only R/M/N channel tokens")
+    duration_ms = max(1500, min(12000, int(duration_ms or 12000)))
+    arm_delay_ms = max(100, min(3000, int(arm_delay_ms or 800)))
+
+    wav_path, replay_duration_ms = _select_esp32_replay_wav(file=file, min_bytes=min_bytes)
+    device_id = "ESP32_KORVO_2"
+    command = f"BARGE {fmt_clean} TTS {duration_ms}"
+    started_at = time.time()
+    await manager.send_to_esp32({"type": "device_command", "command": command})
+    await asyncio.sleep(arm_delay_ms / 1000.0)
+
+    session_id = f"esp32-dialog-replay-{int(time.time() * 1000)}"
+    runtime._track_task(
+        runtime._run_esp32_audio_pipeline(
+            session_id=session_id,
+            device_id=device_id,
+            wav_path=wav_path,
+            duration_ms=replay_duration_ms,
+            audio_source="dialog_replay",
+        ),
+        task_type="esp32.barge_tts_diag",
+        source="ESP32",
+        metadata={
+            "device_id": device_id,
+            "session_id": session_id,
+            "wav": wav_path.name,
+            "command": command,
+        },
+    )
+
+    diagnostic: dict[str, Any] | None = None
+    if wait:
+        deadline = time.time() + (duration_ms / 1000.0) + 8.0
+        while time.time() < deadline:
+            diagnostic = runtime.latest_esp32_diagnostic_event(
+                name="barge_diag",
+                phase="done",
+                device_id=device_id,
+                after_ts=started_at,
+            )
+            if diagnostic:
+                break
+            await asyncio.sleep(0.25)
+
+    diagnostic_fields = _parse_diagnostic_detail(diagnostic.get("detail", "")) if diagnostic else None
+    return {
+        "ok": diagnostic is not None if wait else True,
+        "command": command,
+        "session_id": session_id,
+        "wav": wav_path.name,
+        "replay_duration_ms": replay_duration_ms,
+        "diag_duration_ms": duration_ms,
+        "diagnostic": diagnostic,
+        "diagnostic_fields": diagnostic_fields,
+        "note": "Uses Doubao Realtime Dialog TTS playback, not local embedded prompt audio.",
+    }
 
 
 @app.get("/api/esp32/device-command")

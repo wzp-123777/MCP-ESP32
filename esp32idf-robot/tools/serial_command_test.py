@@ -26,6 +26,7 @@ KEY_PATTERNS = [
     re.compile(r"audio stream begin|audio stream end", re.I),
     re.compile(r"capture started|capture stopped", re.I),
     re.compile(r"assistant_status|assistant_done|assistant_error|tts_error", re.I),
+    re.compile(r"assistant playback busy", re.I),
     re.compile(r"tts segment", re.I),
     re.compile(r"tts stream end", re.I),
     re.compile(r"play tts wav", re.I),
@@ -95,6 +96,7 @@ def main() -> int:
     saw_connected = False
     saw_command = False
     saw_play_finished = False
+    saw_playback_started = False
     saw_failure = False
     command_sent = False
 
@@ -117,13 +119,18 @@ def main() -> int:
 
             if any(pattern.search(line) for pattern in KEY_PATTERNS) or line.startswith("[host]"):
                 print(line)
-            if "websocket connected" in line.lower():
+            if re.search(r"\bMCP_CLIENT:\s+websocket connected\b", line, re.I):
                 saw_connected = True
             if "ASK debug" in line or "REC debug" in line or "SET press" in line:
                 saw_command = True
             if any(pattern.search(line) for pattern in FAIL_PATTERNS):
                 saw_failure = True
+            if "assistant playback busy=1" in line.lower():
+                saw_playback_started = True
             if "tts play finished" in line.lower() and "ESP_OK" in line:
+                saw_play_finished = True
+                break
+            if saw_playback_started and "assistant playback busy=0" in line.lower():
                 saw_play_finished = True
                 break
 

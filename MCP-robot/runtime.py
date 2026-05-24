@@ -281,6 +281,9 @@ _ESP32_DIALOG_INPUT_TARGET_PEAK = int(os.getenv("ESP32_DIALOG_INPUT_TARGET_PEAK"
 _ESP32_DIALOG_INPUT_MAX_GAIN = float(os.getenv("ESP32_DIALOG_INPUT_MAX_GAIN", "4"))
 _ESP32_BARGE_DIALOG_LEADING_DROP_MS = int(os.getenv("ESP32_BARGE_DIALOG_LEADING_DROP_MS", "120"))
 _ESP32_BARGE_DIALOG_MIN_KEEP_MS = int(os.getenv("ESP32_BARGE_DIALOG_MIN_KEEP_MS", "700"))
+_ESP32_POST_TTS_ECHO_GUARD_SECONDS = float(os.getenv("ESP32_POST_TTS_ECHO_GUARD_SECONDS", "9.0"))
+_ESP32_POST_TTS_ECHO_MAX_RMS = float(os.getenv("ESP32_POST_TTS_ECHO_MAX_RMS", "1150"))
+_ESP32_POST_TTS_ECHO_MAX_MS = int(os.getenv("ESP32_POST_TTS_ECHO_MAX_MS", "5000"))
 _TTS_DEBUG_DIR = Path(__file__).resolve().parent / "data" / "esp32_tts"
 _EMOJI_RE = re.compile(
     "["
@@ -843,6 +846,8 @@ class RobotRuntime:
         self._pending_image_jobs: dict[str, PendingImageJob] = {}
         self._pending_audio_streams: dict[str, PendingAudioStream] = {}
         self._esp32_runtime_config: dict[str, ESP32RuntimeConfig] = {}
+        self._esp32_diagnostic_events: list[dict[str, Any]] = []
+        self._esp32_tts_echo_guard_until: dict[str, float] = {}
         self._voice_presets_cache: dict[str, str] | None = None
         self._voice_presets_mtime: float = 0.0
         self._offline_gap_analysis_keys: set[str] = set()
@@ -857,6 +862,99 @@ class RobotRuntime:
     def _tool_model_for(self, request_or_source: TextRequest | str) -> ToolModelService:
         source = request_or_source.source if isinstance(request_or_source, TextRequest) else str(request_or_source)
         return self.qq_tool_model if source == "NapCatQQ" else self.tool_model
+
+    def _record_esp32_diagnostic_event(self, *, device_id: str, name: str, phase: str, detail: str) -> None:
+        self._esp32_diagnostic_events.append(
+            {
+                "timestamp": time.time(),
+                "device_id": device_id,
+                "name": name,
+                "phase": phase,
+                "detail": detail,
+            }
+        )
+        if len(self._esp32_diagnostic_events) > 100:
+            del self._esp32_diagnostic_events[:-100]
+
+    def latest_esp32_diagnostic_event(
+        self,
+        *,
+        name: str = "",
+        phase: str = "",
+        device_id: str = "",
+        after_ts: float = 0.0,
+    ) -> dict[str, Any] | None:
+        for event in reversed(self._esp32_diagnostic_events):
+            if after_ts and float(event.get("timestamp") or 0.0) < after_ts:
+                continue
+            if name and event.get("name") != name:
+                continue
+            if phase and event.get("phase") != phase:
+                continue
+            if device_id and event.get("device_id") != device_id:
+                continue
+            return dict(event)
+        return None
+
+    def _mark_esp32_tts_echo_guard(self, *, device_id: str, session_id: str, chunks: int) -> None:
+        if _ESP32_POST_TTS_ECHO_GUARD_SECONDS <= 0:
+            return
+        until = time.time() + _ESP32_POST_TTS_ECHO_GUARD_SECONDS
+        self._esp32_tts_echo_guard_until[device_id] = max(
+            until,
+            self._esp32_tts_echo_guard_until.get(device_id, 0.0),
+        )
+        logger.info(
+            "ESP32 post-TTS echo guard armed: device=%s session=%s chunks=%d window=%.1fs",
+            device_id,
+            session_id,
+            chunks,
+            _ESP32_POST_TTS_ECHO_GUARD_SECONDS,
+        )
+
+    def _should_drop_post_tts_echo(
+        self,
+        *,
+        device_id: str,
+        session_id: str,
+        audio_source: str,
+        duration_ms: int,
+        audio_stats: dict[str, float | int],
+    ) -> bool:
+        source = (audio_source or "").strip().lower()
+        if source not in {"", "continuous", "continuous_afe"}:
+            return False
+        guard_until = self._esp32_tts_echo_guard_until.get(device_id, 0.0)
+        now = time.time()
+        if now >= guard_until:
+            return False
+        rms = float(audio_stats.get("rms") or 0.0)
+        peak = int(audio_stats.get("peak") or 0)
+        if duration_ms > _ESP32_POST_TTS_ECHO_MAX_MS:
+            return False
+        if rms > _ESP32_POST_TTS_ECHO_MAX_RMS:
+            return False
+        self._trace(
+            "audio.capture.post_tts_echo_dropped",
+            source="ESP32",
+            device_id=device_id,
+            session_id=session_id,
+            audio_source=audio_source or "",
+            duration_ms=duration_ms,
+            audio_peak=peak,
+            audio_rms=round(rms, 2),
+            guard_left_s=round(guard_until - now, 2),
+        )
+        logger.info(
+            "ESP32 post-TTS echo upload dropped: session=%s source=%s duration=%dms rms=%.2f peak=%d guard_left=%.2fs",
+            session_id,
+            audio_source or "",
+            duration_ms,
+            rms,
+            peak,
+            guard_until - now,
+        )
+        return True
 
     def _cleanup_stale_audio_streams(self) -> None:
         if not self._pending_audio_streams:
@@ -899,6 +997,10 @@ class RobotRuntime:
         registry.register(HighResVisionTool(self.frame_store, self.vision_highres_model))
         return registry
 
+    def _esp32_ready_status(self, device_id: str) -> str:
+        cfg = self._esp32_runtime_config.get(device_id)
+        return "listening" if cfg and cfg.continuous_chat else "idle"
+
     async def send_esp32_tts_test(self, text: str = "小乐测试语音。") -> None:
         if self.tts_model is None:
             raise RuntimeError("TTS model not configured")
@@ -917,7 +1019,7 @@ class RobotRuntime:
         )
         await _send_esp32_status(
             self.connection_manager,
-            status="idle",
+            status=self._esp32_ready_status("ESP32_KORVO_2"),
             device_id="ESP32_KORVO_2",
             text=text,
         )
@@ -2273,6 +2375,7 @@ class RobotRuntime:
             name = str(payload.get("name") or "unknown")
             phase = str(payload.get("phase") or "")
             detail = str(payload.get("detail") or "")
+            self._record_esp32_diagnostic_event(device_id=device_id, name=name, phase=phase, detail=detail)
             logger.info("ESP32 诊断事件 [%s]: name=%s phase=%s detail=%s", device_id, name, phase, detail)
             self._trace(
                 "esp32.diagnostic",
@@ -2548,7 +2651,7 @@ class RobotRuntime:
             )
             await _send_esp32_status(
                 self.connection_manager,
-                status="idle",
+                status=self._esp32_ready_status(device_id),
                 device_id=device_id,
                 session_id=session_id,
                 text="已取消本次录音。",
@@ -2595,7 +2698,7 @@ class RobotRuntime:
                 )
                 await _send_esp32_status(
                     self.connection_manager,
-                    status="idle",
+                    status=self._esp32_ready_status(device_id),
                     device_id=device_id,
                     session_id=session_id,
                     text=f"Raw TDM 诊断已保存: {wav_path.name}",
@@ -2755,6 +2858,21 @@ class RobotRuntime:
                     int(source_audio_stats.get("peak") or 0),
                     int(audio_stats.get("peak") or 0),
                 )
+            if self._should_drop_post_tts_echo(
+                device_id=device_id,
+                session_id=session_id,
+                audio_source=audio_source,
+                duration_ms=duration_ms,
+                audio_stats=audio_stats,
+            ):
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status=self._esp32_ready_status(device_id),
+                    device_id=device_id,
+                    session_id=session_id,
+                    text="已忽略播放后的尾音。",
+                )
+                return True
             if int(audio_stats.get("nonzero_samples") or 0) == 0 or int(audio_stats.get("peak") or 0) == 0:
                 await self.connection_manager.send_to_esp32(
                     {
@@ -2773,7 +2891,8 @@ class RobotRuntime:
                 return True
             if float(audio_stats.get("rms") or 0.0) < _ESP32_DIALOG_MIN_RMS:
                 logger.info(
-                    "ESP32 dialog audio dropped before Doubao: rms=%.2f peak=%d min_rms=%.2f",
+                    "ESP32 dialog audio dropped before Doubao: source=%s rms=%.2f peak=%d min_rms=%.2f",
+                    audio_source or "",
                     float(audio_stats.get("rms") or 0.0),
                     int(audio_stats.get("peak") or 0),
                     _ESP32_DIALOG_MIN_RMS,
@@ -2797,9 +2916,10 @@ class RobotRuntime:
             pcm16, raw_audio_stats, audio_stats, dialog_input_gain = _normalize_esp32_dialog_input_pcm(pcm16)
             if dialog_input_gain > 1.01:
                 logger.info(
-                    "ESP32 dialog input normalized: session=%s gain=%.2f rms=%.2f->%.2f peak=%d->%d "
+                    "ESP32 dialog input normalized: session=%s source=%s gain=%.2f rms=%.2f->%.2f peak=%d->%d "
                     "target_rms=%.1f target_peak=%d",
                     session_id,
+                    audio_source or "",
                     dialog_input_gain,
                     float(raw_audio_stats.get("rms") or 0.0),
                     float(audio_stats.get("rms") or 0.0),
@@ -3004,6 +3124,7 @@ class RobotRuntime:
                                 "chunks": chunk_no,
                             }
                         )
+                        self._mark_esp32_tts_echo_guard(device_id=device_id, session_id=session_id, chunks=chunk_no)
                 elif event.event == EVENT_SESSION_FAILED:
                     raise RuntimeError(f"Doubao dialog session failed: {payload!r}")
         except Exception as exc:
@@ -3014,19 +3135,21 @@ class RobotRuntime:
                 and not sent_pcm_start
             ):
                 logger.info(
-                    "ESP32 Doubao dialog ignored no-speech idle timeout: session=%s",
+                    "ESP32 Doubao dialog ignored no-speech idle timeout: session=%s source=%s",
                     session_id,
+                    audio_source or "",
                 )
                 self._trace(
                     "dialog.no_speech",
                     source="ESP32",
                     device_id=device_id,
                     session_id=session_id,
+                    audio_source=audio_source,
                     error=error_text,
                 )
                 await _send_esp32_status(
                     self.connection_manager,
-                    status="idle",
+                    status=self._esp32_ready_status(device_id),
                     device_id=device_id,
                     session_id=session_id,
                     text="刚刚这段没有检测到清楚的人声。",
@@ -3065,7 +3188,7 @@ class RobotRuntime:
             )
         await _send_esp32_status(
             self.connection_manager,
-            status="idle",
+            status=self._esp32_ready_status(device_id),
             device_id=device_id,
             session_id=session_id,
             text=final_reply or final_asr,
@@ -3664,7 +3787,7 @@ class RobotRuntime:
             )
             await _send_esp32_status(
                 self.connection_manager,
-                status="idle",
+                status=self._esp32_ready_status(request.device_id),
                 device_id=request.device_id,
                 session_id=audio_session_id,
                 text=final_reply,
@@ -3973,7 +4096,7 @@ class RobotRuntime:
             )
             await _send_esp32_status(
                 self.connection_manager,
-                status="idle",
+                status=self._esp32_ready_status(request.device_id),
                 device_id=request.device_id,
                 text=text,
             )
