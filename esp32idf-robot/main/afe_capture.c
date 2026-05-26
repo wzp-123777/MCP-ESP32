@@ -951,7 +951,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     vad_model = find_model_by_prefix(s_models, ESP_VADN_PREFIX, NULL);
 #endif
 
-    bool init_wakenet = s_wake_enabled && wn_model != NULL;
+    bool init_wakenet = wn_model != NULL;
     bool rnnm_tuned = strcmp(s_input_format, "RNNM") == 0;
     int vad_min_speech_ms = rnnm_tuned ? AFE_CAPTURE_RNNM_VAD_START_MS : AFE_CAPTURE_VAD_START_MS;
     int vad_min_noise_ms = rnnm_tuned ? AFE_CAPTURE_RNNM_VAD_OFF_MS : AFE_CAPTURE_VAD_OFF_MS;

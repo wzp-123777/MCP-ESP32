@@ -190,6 +190,9 @@ static void *s_device_command_ctx;
 #define MCP_ENDPOINT_NVS_KEY "endpoint"
 #define MCP_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define MCP_QUEUE_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define MCP_WS_TASK_STACK_BYTES 3072
+#define MCP_WS_BUFFER_SIZE_BYTES 8192
+#define MCP_SERVICE_TASK_STACK_BYTES 6144
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static void websocket_restart(void);
@@ -651,6 +654,96 @@ static bool endpoint_string_is_ws(const char *endpoint)
            (strncmp(endpoint, "ws://", 5) == 0 || strncmp(endpoint, "wss://", 6) == 0);
 }
 
+static bool endpoint_uri_ipv4_octets(const char *endpoint, uint8_t out[4])
+{
+    if (!endpoint || !out || !endpoint_string_is_ws(endpoint)) {
+        return false;
+    }
+
+    const char *host = strstr(endpoint, "://");
+    if (!host) {
+        return false;
+    }
+    host += 3;
+    if (*host == '[') {
+        return false;
+    }
+
+    char host_buf[32];
+    size_t len = 0;
+    while (host[len] && host[len] != ':' && host[len] != '/' && host[len] != '?' && host[len] != '#') {
+        if (len + 1 >= sizeof(host_buf)) {
+            return false;
+        }
+        host_buf[len] = host[len];
+        len++;
+    }
+    if (len == 0) {
+        return false;
+    }
+    host_buf[len] = '\0';
+
+    unsigned a = 0;
+    unsigned b = 0;
+    unsigned c = 0;
+    unsigned d = 0;
+    char tail = '\0';
+    if (sscanf(host_buf, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) {
+        return false;
+    }
+    if (a > 255 || b > 255 || c > 255 || d > 255) {
+        return false;
+    }
+
+    out[0] = (uint8_t)a;
+    out[1] = (uint8_t)b;
+    out[2] = (uint8_t)c;
+    out[3] = (uint8_t)d;
+    return true;
+}
+
+static bool sockaddr_ipv4_octets(const struct sockaddr_storage *addr, uint8_t out[4])
+{
+    if (!addr || !out || addr->ss_family != AF_INET) {
+        return false;
+    }
+
+    const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)addr;
+    uint32_t host = ntohl(ipv4->sin_addr.s_addr);
+    out[0] = (uint8_t)((host >> 24) & 0xFF);
+    out[1] = (uint8_t)((host >> 16) & 0xFF);
+    out[2] = (uint8_t)((host >> 8) & 0xFF);
+    out[3] = (uint8_t)(host & 0xFF);
+    return true;
+}
+
+static bool ipv4_octets_same_subnet(const esp_netif_ip_info_t *ip_info, const uint8_t candidate[4])
+{
+    if (!ip_info || !candidate) {
+        return false;
+    }
+
+    const uint8_t sta[4] = {
+        (uint8_t)esp_ip4_addr1_16(&ip_info->ip),
+        (uint8_t)esp_ip4_addr2_16(&ip_info->ip),
+        (uint8_t)esp_ip4_addr3_16(&ip_info->ip),
+        (uint8_t)esp_ip4_addr4_16(&ip_info->ip),
+    };
+    const uint8_t mask[4] = {
+        (uint8_t)esp_ip4_addr1_16(&ip_info->netmask),
+        (uint8_t)esp_ip4_addr2_16(&ip_info->netmask),
+        (uint8_t)esp_ip4_addr3_16(&ip_info->netmask),
+        (uint8_t)esp_ip4_addr4_16(&ip_info->netmask),
+    };
+
+    for (size_t i = 0; i < 4; ++i) {
+        if ((candidate[i] & mask[i]) != (sta[i] & mask[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool endpoint_discover_from_network(const esp_netif_ip_info_t *ip_info, char *endpoint, size_t endpoint_size)
 {
     if (!ip_info || !endpoint || endpoint_size == 0) {
@@ -717,6 +810,33 @@ static bool endpoint_discover_from_network(const esp_netif_ip_info_t *ip_info, c
         char discovered[sizeof(s_endpoint)];
         if (json_get_string(response, "endpoint", discovered, sizeof(discovered)) &&
             endpoint_string_is_ws(discovered)) {
+            uint8_t endpoint_ip[4];
+            uint8_t source_ip[4];
+            bool endpoint_ipv4 = endpoint_uri_ipv4_octets(discovered, endpoint_ip);
+            bool source_ipv4 = sockaddr_ipv4_octets(&source_addr, source_ip);
+            bool endpoint_same_subnet = endpoint_ipv4 && ipv4_octets_same_subnet(ip_info, endpoint_ip);
+            bool source_same_subnet = source_ipv4 && ipv4_octets_same_subnet(ip_info, source_ip);
+            if (!endpoint_same_subnet || !source_same_subnet) {
+                ESP_LOGW(TAG,
+                         "endpoint discovery rejected endpoint=%s source=%s%u.%u.%u.%u sta=%u.%u.%u.%u mask=%u.%u.%u.%u endpoint_subnet=%d source_subnet=%d",
+                         discovered,
+                         source_ipv4 ? "" : "non-ipv4/",
+                         source_ipv4 ? source_ip[0] : 0,
+                         source_ipv4 ? source_ip[1] : 0,
+                         source_ipv4 ? source_ip[2] : 0,
+                         source_ipv4 ? source_ip[3] : 0,
+                         esp_ip4_addr1_16(&ip_info->ip),
+                         esp_ip4_addr2_16(&ip_info->ip),
+                         esp_ip4_addr3_16(&ip_info->ip),
+                         esp_ip4_addr4_16(&ip_info->ip),
+                         esp_ip4_addr1_16(&ip_info->netmask),
+                         esp_ip4_addr2_16(&ip_info->netmask),
+                         esp_ip4_addr3_16(&ip_info->netmask),
+                         esp_ip4_addr4_16(&ip_info->netmask),
+                         endpoint_same_subnet,
+                         source_same_subnet);
+                continue;
+            }
             strlcpy(endpoint, discovered, endpoint_size);
             found = true;
         }
@@ -1750,8 +1870,8 @@ static esp_err_t websocket_create_and_start(void)
     esp_websocket_client_config_t ws_cfg = {
         .uri = s_endpoint,
         .disable_auto_reconnect = false,
-        .task_stack = 4096,
-        .buffer_size = 16384,
+        .task_stack = MCP_WS_TASK_STACK_BYTES,
+        .buffer_size = MCP_WS_BUFFER_SIZE_BYTES,
         .network_timeout_ms = 10000,
         .reconnect_timeout_ms = 3000,
         .ping_interval_sec = 15,
@@ -2039,7 +2159,14 @@ esp_err_t mcp_client_connect(void)
     }
     if (!s_started) {
         s_started = true;
-        xTaskCreate(mcp_service_task, "mcp_service", 6144, NULL, 4, NULL);
+        esp_err_t ret = create_spiram_task(mcp_service_task,
+                                           "mcp_service",
+                                           MCP_SERVICE_TASK_STACK_BYTES,
+                                           4);
+        if (ret != ESP_OK) {
+            s_started = false;
+            return ret;
+        }
     }
     return ESP_OK;
 }
@@ -2276,7 +2403,7 @@ static esp_err_t send_config_payload(const char *persona_id,
              sizeof(payload),
              "{\"type\":\"client_config\",\"device_id\":\"%s\",\"persona_id\":\"%s\",\"persona_label\":\"%s\","
              "\"voice_id\":\"%s\",\"voice_label\":\"%s\",\"continuous_chat\":%s,\"wake_enabled\":%s,"
-             "\"wake_word\":\"doubao\"}",
+             "\"wake_word\":\"hi_esp\"}",
              ROBOT_DEVICE_ID,
              persona_id_escaped,
              persona_label_escaped,

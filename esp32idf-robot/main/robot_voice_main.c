@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
@@ -27,6 +28,9 @@
 #define DEBUG_REC_MIN_MS 300
 #define DEBUG_REC_MAX_MS 10000
 #define PTT_CAPTURE_MAX_MS 20000
+#define WAKE_DEFAULT_ENABLED true
+#define WAKE_WORD_LABEL "Hi ESP"
+#define VOICE_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define CONT_VAD_START_AVG 520
 #define CONT_VAD_START_PEAK 2600
 #define CONT_VAD_STOP_AVG 260
@@ -175,6 +179,8 @@ typedef enum {
     VOICE_CMD_SET_PRESS,
     VOICE_CMD_SET_RELEASE,
     VOICE_CMD_CHAT_TOGGLE,
+    VOICE_CMD_CHAT_START,
+    VOICE_CMD_CHAT_STOP,
     VOICE_CMD_WAKE_TOGGLE,
     VOICE_CMD_PERSONA_NEXT,
     VOICE_CMD_VOICE_NEXT,
@@ -465,7 +471,7 @@ static uint32_t diag_stats_rms(const raw_tdm_channel_stats_t *stats);
 
 static void print_help(void)
 {
-    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT, WAKE, CONT SRC AUTO/RAW/AFE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt|tts] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>|DEFAULT, MCP CONNECT, HELP");
+    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT/CHAT ON/CHAT OFF, WAKE/WAKE ON/WAKE OFF (%s), CONT SRC AUTO/RAW/AFE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt|tts] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>|DEFAULT, MCP CONNECT, HELP", WAKE_WORD_LABEL);
 }
 
 static void send_cmd(voice_cmd_type_t type, int value)
@@ -961,9 +967,21 @@ static void on_afe_event(afe_capture_event_t event, void *ctx)
             }
             break;
         case AFE_CAPTURE_EVENT_WAKE:
-            ESP_LOGI(TAG, "afe wake");
-            if (s_wake_enabled && !s_continuous_chat) {
-                send_cmd_nonblocking(VOICE_CMD_CHAT_TOGGLE, 0);
+            ESP_LOGI(TAG,
+                     "afe wake enabled=%d continuous=%d mode=%d mcp=%d",
+                     s_wake_enabled,
+                     s_continuous_chat,
+                     (int)s_capture_mode,
+                     mcp_client_is_connected());
+            if (s_wake_enabled && !s_continuous_chat && s_capture_mode == CAPTURE_MODE_NONE) {
+                app_ui_set_voice_state("WAKE HIT");
+                if (mcp_client_is_connected()) {
+                    send_cmd_nonblocking(VOICE_CMD_CHAT_START, 0);
+                } else {
+                    app_ui_set_mcp_status(mcp_client_get_status_text());
+                    app_ui_set_assistant_state(APP_UI_STATE_OFFLINE);
+                    ESP_LOGW(TAG, "wake ignored: MCP disconnected status=%s", mcp_client_get_status_text());
+                }
             }
             break;
         case AFE_CAPTURE_EVENT_ERROR:
@@ -1015,6 +1033,30 @@ static bool ensure_afe_ready(void)
                  afe_capture_get_vad_mute_playback());
     }
     return s_afe_ready;
+}
+
+static void set_wake_enabled(bool enabled, const char *reason)
+{
+    s_wake_enabled = enabled;
+    if (s_wake_enabled) {
+        ensure_afe_ready();
+    }
+    app_ui_set_wake_enabled(s_wake_enabled);
+    if (s_afe_ready) {
+        afe_capture_set_wake_enabled(s_wake_enabled);
+    }
+    bool model_ready = s_afe_ready && afe_capture_has_wake_model();
+    app_ui_set_voice_state(s_wake_enabled
+                               ? (model_ready ? "WAKE LISTEN" : "WAKE TODO")
+                               : "VOICE READY");
+    send_runtime_config();
+    ESP_LOGI(TAG,
+             "wake word %s reason=%s afe_ready=%d model=%d label=%s",
+             s_wake_enabled ? "enabled" : "disabled",
+             reason ? reason : "-",
+             s_afe_ready,
+             model_ready,
+             WAKE_WORD_LABEL);
 }
 
 static void log_afe_status(void)
@@ -4000,14 +4042,14 @@ static void on_mcp_device_command(const char *command, void *ctx)
     if (command_equals(command, "chat_start") || command_equals(command, "chat_on") ||
         command_equals(command, "continuous_on")) {
         if (!s_continuous_chat) {
-            send_cmd_nonblocking(VOICE_CMD_CHAT_TOGGLE, 0);
+            send_cmd_nonblocking(VOICE_CMD_CHAT_START, 0);
         }
         return;
     }
     if (command_equals(command, "chat_stop") || command_equals(command, "chat_off") ||
         command_equals(command, "continuous_off")) {
         if (s_continuous_chat) {
-            send_cmd_nonblocking(VOICE_CMD_CHAT_TOGGLE, 0);
+            send_cmd_nonblocking(VOICE_CMD_CHAT_STOP, 0);
         }
         return;
     }
@@ -4244,24 +4286,14 @@ static void playback_task(void *arg)
             case VOICE_CMD_CHAT_TOGGLE:
                 toggle_continuous_chat();
                 break;
+            case VOICE_CMD_CHAT_START:
+                start_continuous_chat();
+                break;
+            case VOICE_CMD_CHAT_STOP:
+                stop_continuous_chat();
+                break;
             case VOICE_CMD_WAKE_TOGGLE:
-                s_wake_enabled = !s_wake_enabled;
-                if (s_wake_enabled) {
-                    ensure_afe_ready();
-                }
-                app_ui_set_wake_enabled(s_wake_enabled);
-                if (s_afe_ready) {
-                    afe_capture_set_wake_enabled(s_wake_enabled);
-                }
-                app_ui_set_voice_state(s_wake_enabled
-                                           ? (s_afe_ready && afe_capture_has_wake_model() ? "WAKE ON" : "WAKE TODO")
-                                           : "VOICE READY");
-                send_runtime_config();
-                ESP_LOGI(TAG,
-                         "wake word UI flag=%d afe_ready=%d wake_model=%d",
-                         s_wake_enabled,
-                         s_afe_ready,
-                         s_afe_ready ? afe_capture_has_wake_model() : 0);
+                set_wake_enabled(!s_wake_enabled, "toggle");
                 break;
             case VOICE_CMD_PERSONA_NEXT:
                 s_persona_index = (s_persona_index + 1) % (sizeof(s_personas) / sizeof(s_personas[0]));
@@ -4463,6 +4495,30 @@ static void command_task(void *arg)
     }
 }
 
+static esp_err_t create_voice_task(TaskFunction_t task_func,
+                                   const char *name,
+                                   uint32_t stack_bytes,
+                                   UBaseType_t prio)
+{
+    BaseType_t ok = xTaskCreateWithCaps(task_func,
+                                        name,
+                                        stack_bytes,
+                                        NULL,
+                                        prio,
+                                        NULL,
+                                        VOICE_TASK_STACK_CAPS);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG,
+                 "voice task create failed name=%s stack=%u internal_free=%u internal_largest=%u",
+                 name ? name : "?",
+                 (unsigned)stack_bytes,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
@@ -4489,7 +4545,7 @@ void app_main(void)
     app_ui_set_voice_state("VOICE READY");
     app_ui_set_bluetooth_available(false);
     app_ui_set_chat_continuous(false);
-    app_ui_set_wake_enabled(false);
+    app_ui_set_wake_enabled(WAKE_DEFAULT_ENABLED);
     app_ui_set_persona(s_personas[s_persona_index].label);
     app_ui_set_voice_profile(s_voice_profiles[s_voice_index].label);
 
@@ -4510,16 +4566,24 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(900));
     }
 
+    if (WAKE_DEFAULT_ENABLED) {
+        set_wake_enabled(true, "boot_default");
+    }
+
     app_ui_set_mic_state("MIC READY");
     ESP_LOGI(TAG,
              "full duplex AFE/AEC experimental path=%d lazy_ready=%d; capture path=%s",
              ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL,
              s_afe_ready,
              ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL ? "AFE/AEC lazy" : "mono PCM");
-    send_runtime_config();
+    if (!WAKE_DEFAULT_ENABLED) {
+        send_runtime_config();
+    }
 
-    xTaskCreate(playback_task, "voice_playback", 6144, NULL, 5, NULL);
-    xTaskCreate(command_task, "voice_command", 4096, NULL, 4, NULL);
+    if (create_voice_task(playback_task, "voice_playback", 6144, 5) != ESP_OK ||
+        create_voice_task(command_task, "voice_command", 4096, 4) != ESP_OK) {
+        return;
+    }
 
     if (app_buttons_init(on_button_event, NULL) != ESP_OK) {
         ESP_LOGW(TAG, "button init failed");
