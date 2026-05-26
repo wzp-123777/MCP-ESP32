@@ -1188,9 +1188,9 @@ static void create_chat_page(lv_obj_t *page)
 
     s_talk_button = make_text_button(page,
                                      18,
-                                     212,
+                                     210,
                                      112,
-                                     30,
+                                     28,
                                      "开始聊天",
                                      lv_color_hex(UI_ACCENT_SOFT_COLOR),
                                      lv_color_hex(UI_TEXT_COLOR));
@@ -1200,9 +1200,9 @@ static void create_chat_page(lv_obj_t *page)
 
     lv_obj_t *wake_btn = make_text_button(page,
                                           136,
-                                          212,
+                                          210,
                                           80,
-                                          30,
+                                          28,
                                           "唤醒词",
                                           lv_color_hex(UI_PANEL_COLOR),
                                           lv_color_hex(UI_TEXT_COLOR));
@@ -1211,9 +1211,9 @@ static void create_chat_page(lv_obj_t *page)
 
     lv_obj_t *ptt_btn = make_text_button(page,
                                          222,
-                                         212,
+                                         210,
                                          80,
-                                         30,
+                                         28,
                                          "按住说",
                                          lv_color_hex(UI_PANEL_COLOR),
                                          lv_color_hex(UI_TEXT_COLOR));
@@ -1502,16 +1502,58 @@ static void mark_dirty(void)
     s_dirty = true;
 }
 
+static const char *action_name(app_ui_action_t action)
+{
+    switch (action) {
+        case APP_UI_ACTION_TALK_PRESS:
+            return "talk_press";
+        case APP_UI_ACTION_TALK_RELEASE:
+            return "talk_release";
+        case APP_UI_ACTION_MCP_CONNECT:
+            return "mcp_connect";
+        case APP_UI_ACTION_MCP_DISCONNECT:
+            return "mcp_disconnect";
+        case APP_UI_ACTION_MCP_RECONNECT:
+            return "mcp_reconnect";
+        case APP_UI_ACTION_VOL_UP:
+            return "vol_up";
+        case APP_UI_ACTION_VOL_DOWN:
+            return "vol_down";
+        case APP_UI_ACTION_PLAY_TEST:
+            return "play_test";
+        case APP_UI_ACTION_BLUETOOTH_TOGGLE:
+            return "bluetooth_toggle";
+        case APP_UI_ACTION_CHAT_TOGGLE:
+            return "chat_toggle";
+        case APP_UI_ACTION_WAKE_TOGGLE:
+            return "wake_toggle";
+        case APP_UI_ACTION_PERSONA_NEXT:
+            return "persona_next";
+        case APP_UI_ACTION_VOICE_NEXT:
+            return "voice_next";
+        default:
+            return "unknown";
+    }
+}
+
 static void emit_action(app_ui_action_t action)
 {
     if (!s_action_queue) {
+        ESP_LOGW(TAG, "ui action dropped before queue ready action=%s(%d)", action_name(action), (int)action);
         return;
     }
     if (xQueueSend(s_action_queue, &action, 0) != pdTRUE) {
         app_ui_action_t dropped = APP_UI_ACTION_PLAY_TEST;
         xQueueReceive(s_action_queue, &dropped, 0);
+        ESP_LOGW(TAG,
+                 "ui action queue full dropped=%s(%d) new=%s(%d)",
+                 action_name(dropped),
+                 (int)dropped,
+                 action_name(action),
+                 (int)action);
         xQueueSend(s_action_queue, &action, 0);
     }
+    ESP_LOGI(TAG, "ui emit action=%s(%d)", action_name(action), (int)action);
 }
 
 static void action_dispatch_task(void *arg)
@@ -1522,6 +1564,7 @@ static void action_dispatch_task(void *arg)
         if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        ESP_LOGI(TAG, "ui dispatch action=%s(%d)", action_name(action), (int)action);
         app_ui_action_cb_t cb = s_action_cb;
         void *ctx = s_action_ctx;
         if (cb) {
@@ -1632,7 +1675,7 @@ esp_err_t app_ui_init(void)
     s_page_dirty = true;
     s_clock_dirty = true;
     xTaskCreate(ui_task, "app_ui", 4096, NULL, 2, NULL);
-    xTaskCreate(action_dispatch_task, "ui_actions", 2048, NULL, 2, NULL);
+    xTaskCreate(action_dispatch_task, "ui_actions", 4096, NULL, 2, NULL);
     ESP_LOGI(TAG, "ready using LVGL %dx%d, page UI, touch=%s", UI_W, UI_H, s_touch_ready ? "yes" : "no");
     return ESP_OK;
 }

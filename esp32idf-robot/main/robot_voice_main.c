@@ -23,6 +23,7 @@
 
 #define VOICE_LOOP_GAP_MS 500
 #define CAPTURE_CHUNK_BYTES 4096
+#define CONT_CHAT_TOGGLE_MIN_INTERVAL_MS 1200
 #define DEBUG_REC_MIN_MS 300
 #define DEBUG_REC_MAX_MS 10000
 #define PTT_CAPTURE_MAX_MS 20000
@@ -38,7 +39,7 @@
 #define CONT_VAD_WATCHDOG_MS 300
 #define CONT_VAD_STALE_AUDIO_MS 1600
 #define CONT_VAD_STALE_SILENCE_MS 1400
-#define CONT_STARTUP_REARM_MS 1200
+#define CONT_STARTUP_REARM_MS 350
 #define CONT_REARM_DELAY_MS 1200
 #define CONT_PLAYBACK_TAIL_IGNORE_MS 1200
 #define CONT_PLAYBACK_TAIL_REJECT_MS 1000
@@ -75,17 +76,17 @@
 #define CONT_AFE_LOCAL_START_PEAK 1400
 #define CONT_AFE_LOCAL_START_MARGIN 120
 #define CONT_AFE_LOCAL_START_HITS 5
-#define CONT_RNNM_AFE_VAD_CONFIRM_AVG 300
-#define CONT_RNNM_AFE_VAD_CONFIRM_PEAK 1400
-#define CONT_RNNM_AFE_VAD_CONFIRM_MARGIN 150
+#define CONT_RNNM_AFE_VAD_CONFIRM_AVG 260
+#define CONT_RNNM_AFE_VAD_CONFIRM_PEAK 1100
+#define CONT_RNNM_AFE_VAD_CONFIRM_MARGIN 120
 #define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_AVG 520
 #define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_PEAK 3500
 #define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_MARGIN 260
-#define CONT_RNNM_AFE_VAD_CONFIRM_HITS 6
-#define CONT_RNNM_AFE_LOCAL_START_AVG 380
-#define CONT_RNNM_AFE_LOCAL_START_PEAK 2200
-#define CONT_RNNM_AFE_LOCAL_START_MARGIN 220
-#define CONT_RNNM_AFE_LOCAL_START_HITS 6
+#define CONT_RNNM_AFE_VAD_CONFIRM_HITS 4
+#define CONT_RNNM_AFE_LOCAL_START_AVG 300
+#define CONT_RNNM_AFE_LOCAL_START_PEAK 1600
+#define CONT_RNNM_AFE_LOCAL_START_MARGIN 160
+#define CONT_RNNM_AFE_LOCAL_START_HITS 4
 #define CONT_AFE_REJECT_REARM_MS 1200
 #define CONT_BARGE_REF_CH 0
 #define CONT_BARGE_MIC_CH 3
@@ -270,6 +271,7 @@ static bool s_audio_busy;
 static bool s_assistant_playback_busy;
 static volatile bool s_loop_enabled;
 static volatile bool s_barge_playback_cancelled;
+static TickType_t s_last_chat_toggle_tick;
 static TickType_t s_cont_speech_start_tick;
 static TickType_t s_cont_last_voice_tick;
 static TickType_t s_cont_last_audio_tick;
@@ -799,6 +801,7 @@ static void send_cmd_from_isr_safe(voice_cmd_type_t type, int value)
 static void on_ui_action(app_ui_action_t action, void *ctx)
 {
     (void)ctx;
+    ESP_LOGI(TAG, "ui action=%d", (int)action);
     switch (action) {
         case APP_UI_ACTION_TALK_PRESS:
             send_cmd_nonblocking(VOICE_CMD_SET_PRESS, 0);
@@ -2481,9 +2484,6 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
         if (afe_vad_path && !s_continuous_speaking && now < s_afe_vad_reject_until_tick) {
             return;
         }
-        if (afe_vad_path && !s_continuous_speaking) {
-            return;
-        }
         if (!s_continuous_speaking) {
             if (!afe_vad_path) {
                 cont_preroll_store(data, len);
@@ -2509,7 +2509,10 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
                          peak >= start_peak;
                 bool strong_energy_hit = avg_abs >= strong_avg &&
                                          peak >= strong_peak;
-                voice_hit = strong_energy_hit || sr_hit;
+                voice_hit = sr_hit;
+                if (strong_energy_hit && !sr_hit) {
+                    cont_vad_update_noise_floor(avg_abs);
+                }
             } else {
                 bool avg_hit = avg_abs >= start_threshold;
                 bool peak_hit = peak >= start_peak && avg_abs >= start_threshold;
@@ -2540,7 +2543,7 @@ static void on_capture_audio(const uint8_t *data, int len, void *ctx)
                      avg_abs,
                      peak,
                      s_cont_noise_floor,
-                     cont_vad_start_threshold(),
+                     start_threshold,
                      cont_vad_stop_threshold(),
                      s_cont_start_hits,
                      sr_vad_state == VAD_SPEECH ? 1 : 0);
@@ -2746,11 +2749,17 @@ static void stop_set_capture(void)
 static void start_continuous_chat(void)
 {
     if (s_continuous_chat) {
+        ESP_LOGI(TAG, "continuous chat start ignored: already enabled");
         return;
     }
+    ESP_LOGI(TAG, "continuous chat start requested");
+    app_ui_set_mic_state("CHAT STARTING");
+    app_ui_set_assistant_state(APP_UI_STATE_RECORDING);
     if (!mcp_client_is_connected()) {
+        ESP_LOGW(TAG, "continuous chat start blocked: MCP disconnected status=%s", mcp_client_get_status_text());
         app_ui_set_mcp_status(mcp_client_get_status_text());
         app_ui_set_assistant_state(APP_UI_STATE_OFFLINE);
+        app_ui_set_mic_state("MIC READY");
         return;
     }
     ensure_afe_ready();
@@ -2798,6 +2807,7 @@ static void start_continuous_chat(void)
         s_capture_mode = CAPTURE_MODE_NONE;
         s_continuous_chat = false;
         app_ui_set_mic_state("MIC ERROR");
+        app_ui_set_assistant_state(APP_UI_STATE_ERROR);
         app_ui_set_chat_continuous(false);
         return;
     }
@@ -2817,6 +2827,7 @@ static void stop_continuous_chat(void)
     if (!s_continuous_chat && s_capture_mode != CAPTURE_MODE_CONTINUOUS) {
         return;
     }
+    app_ui_set_mic_state("CHAT STOPPING");
     if (s_continuous_speaking) {
         finish_continuous_utterance("manual_stop");
     }
@@ -3851,6 +3862,17 @@ static void barge_diag_housekeeping(void)
 
 static void toggle_continuous_chat(void)
 {
+    TickType_t now = xTaskGetTickCount();
+    if (s_last_chat_toggle_tick != 0 &&
+        now - s_last_chat_toggle_tick < pdMS_TO_TICKS(CONT_CHAT_TOGGLE_MIN_INTERVAL_MS)) {
+        ESP_LOGW(TAG,
+                 "continuous chat toggle ignored: debounce current=%d elapsed=%lums",
+                 s_continuous_chat,
+                 (unsigned long)pdTICKS_TO_MS(now - s_last_chat_toggle_tick));
+        return;
+    }
+    s_last_chat_toggle_tick = now;
+    ESP_LOGI(TAG, "continuous chat toggle current=%d", s_continuous_chat);
     if (s_continuous_chat) {
         stop_continuous_chat();
     } else {
