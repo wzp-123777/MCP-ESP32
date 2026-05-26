@@ -35,7 +35,7 @@
 
 `esp32idf-robot/main/idf_component.yml` 会通过 ESP Component Registry 拉取固件组件依赖：
 
-- `espressif/esp-sr: 2.4.4`
+- `espressif/esp-sr: 2.4.6`
 - `lvgl/lvgl: ^8.4.0`
 - `esp_lcd_touch_gt911`
 - `esp_lcd_touch_tt21100`

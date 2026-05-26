@@ -53,6 +53,11 @@
 #define AFE_CAPTURE_AFE_MODE AFE_MODE_LOW_COST
 #define AFE_CAPTURE_DEFAULT_AEC_PROFILE AFE_CAPTURE_AEC_PROFILE_FD_LOW_COST
 #define AFE_CAPTURE_AEC_NLP_LEVEL AEC_NLP_LEVEL_AGGR
+#define AFE_CAPTURE_ESP_SR_FD_MIN_VERSION "2.4.3"
+#define AFE_CAPTURE_ESP_SR_PINNED_VERSION "2.4.6"
+#define AFE_CAPTURE_OUTPUT_PLAYBACK_CHANNEL 0
+#define AFE_CAPTURE_FIXED_OUTPUT_CHANNEL 1
+#define AFE_CAPTURE_FIXED_FIRST_CHANNEL 1
 #ifndef ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF
 #define ROBOT_ALLOW_EXPERIMENTAL_AEC_HIGH_PERF 0
 #endif
@@ -173,6 +178,21 @@ static bool input_format_has_ref(const char *fmt)
     return fmt && strchr(fmt, 'R') != NULL;
 }
 
+static int input_format_count_channel(const char *fmt, char channel)
+{
+    if (!fmt) {
+        return 0;
+    }
+    int count = 0;
+    char wanted = (char)toupper((unsigned char)channel);
+    for (const char *p = fmt; *p; ++p) {
+        if (toupper((unsigned char)*p) == wanted) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 static bool input_format_is_supported(const char *fmt)
 {
     if (!fmt || !fmt[0]) {
@@ -213,6 +233,72 @@ static esp_err_t normalize_input_format(const char *fmt, char *out, size_t out_s
     }
     out[len] = '\0';
     return ESP_OK;
+}
+
+static esp_err_t validate_official_fd_afe_config(const afe_config_t *cfg)
+{
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg->afe_type != AFE_TYPE_FD) {
+        ESP_LOGE(TAG, "official full-duplex AFE requires AFE_TYPE_FD, got %d", cfg->afe_type);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!cfg->aec_init || cfg->pcm_config.ref_num <= 0) {
+        ESP_LOGE(TAG,
+                 "official full-duplex AEC requires an active playback reference channel, input=%s ref_num=%d",
+                 s_input_format,
+                 cfg->pcm_config.ref_num);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (cfg->aec_mode != AEC_MODE_FD_LOW_COST && cfg->aec_mode != AEC_MODE_FD_HIGH_PERF) {
+        ESP_LOGE(TAG, "official full-duplex AEC requires FD AEC mode, got %d", cfg->aec_mode);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (cfg->output_playback_channel) {
+        ESP_LOGE(TAG, "AFE fetch output must not include playback reference for Doubao upload");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!cfg->fixed_output_channel || !cfg->fixed_first_channel) {
+        ESP_LOGE(TAG,
+                 "AFE fetch output must stay fixed to the selected microphone path, fixed_output=%d fixed_first=%d",
+                 cfg->fixed_output_channel,
+                 cfg->fixed_first_channel);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+static void log_official_fd_afe_config(const afe_config_t *cfg)
+{
+    if (!cfg) {
+        return;
+    }
+    ESP_LOGI(TAG,
+             "esp-sr fd-aec contract: min_version=%s pinned=%s api=AFE_TYPE_FD/AEC_MODE_FD_*",
+             AFE_CAPTURE_ESP_SR_FD_MIN_VERSION,
+             AFE_CAPTURE_ESP_SR_PINNED_VERSION);
+    ESP_LOGI(TAG,
+             "fd-aec input=%s fmt_mic=%d fmt_ref=%d pcm_total=%d pcm_mic=%d pcm_ref=%d sample_rate=%d",
+             s_input_format,
+             input_format_count_channel(s_input_format, 'M'),
+             input_format_count_channel(s_input_format, 'R'),
+             cfg->pcm_config.total_ch_num,
+             cfg->pcm_config.mic_num,
+             cfg->pcm_config.ref_num,
+             cfg->pcm_config.sample_rate);
+    ESP_LOGI(TAG,
+             "fd-aec modes afe_type=%d afe_mode=%d aec_init=%d aec_mode=%d filter=%d nlp=%d ns=%d fixed_first=%d fixed_output=%d output_ref=%d",
+             cfg->afe_type,
+             cfg->afe_mode,
+             cfg->aec_init,
+             cfg->aec_mode,
+             cfg->aec_filter_length,
+             cfg->aec_nlp_level,
+             cfg->ns_init,
+             cfg->fixed_first_channel,
+             cfg->fixed_output_channel,
+             cfg->output_playback_channel);
 }
 
 static void analyze_level(const int16_t *samples, int bytes, int *peak, int *avg_abs)
@@ -798,6 +884,12 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     s_event_cb = event_cb;
     s_event_ctx = event_ctx;
     s_has_ref_channel = input_format_has_ref(s_input_format);
+    if (!s_has_ref_channel) {
+        ESP_LOGE(TAG,
+                 "AFE init rejected: official full-duplex AEC needs an R playback reference channel, input=%s",
+                 s_input_format);
+        return ESP_ERR_INVALID_ARG;
+    }
     log_heap("init begin");
 
     audio_board_handle_t board = audio_board_get_handle();
@@ -870,7 +962,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     afe_cfg->aec_filter_length = AFE_CAPTURE_AEC_FILTER_LENGTH;
     afe_cfg->aec_nlp_level = AFE_CAPTURE_AEC_NLP_LEVEL;
     afe_cfg->se_init = false;
-    afe_cfg->ns_init = s_has_ref_channel;
+    afe_cfg->ns_init = true;
     afe_cfg->vad_init = true;
     afe_cfg->vad_mode = VAD_MODE_2;
     afe_cfg->vad_model_name = vad_model;
@@ -887,6 +979,9 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     afe_cfg->afe_perferred_priority = AFE_CAPTURE_AFE_TASK_PRIO;
     afe_cfg->afe_ringbuf_size = AFE_CAPTURE_AFE_RINGBUF_FRAMES;
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afe_cfg->fixed_first_channel = AFE_CAPTURE_FIXED_FIRST_CHANNEL;
+    afe_cfg->fixed_output_channel = AFE_CAPTURE_FIXED_OUTPUT_CHANNEL;
+    afe_cfg->output_playback_channel = AFE_CAPTURE_OUTPUT_PLAYBACK_CHANNEL;
     if (rnnm_tuned) {
         ESP_LOGI(TAG,
                  "RNNM VAD tuned: min_speech=%dms min_noise=%dms delay=%dms",
@@ -896,6 +991,18 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
     }
     afe_cfg->afe_linear_gain = 1.0f;
     afe_cfg = afe_config_check(afe_cfg);
+    if (!afe_cfg) {
+        ESP_LOGE(TAG, "afe_config_check failed");
+        afe_capture_cleanup_failed_init();
+        return ESP_FAIL;
+    }
+    esp_err_t fd_check = validate_official_fd_afe_config(afe_cfg);
+    if (fd_check != ESP_OK) {
+        afe_config_free(afe_cfg);
+        afe_capture_cleanup_failed_init();
+        return fd_check;
+    }
+    log_official_fd_afe_config(afe_cfg);
     afe_config_print(afe_cfg);
 
     s_afe_handle = esp_afe_handle_from_config(afe_cfg);

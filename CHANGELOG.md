@@ -35,10 +35,11 @@ Known limitation:
 
 Espressif-aligned full-duplex AEC candidate.
 
-- Adds an explicit firmware dependency on Espressif ESP-SR 2.4.4 instead of relying on the ADF-vendored ESP-SR 2.1.5 component.
+- Adds an explicit firmware dependency on Espressif ESP-SR 2.4.6 instead of relying on the ADF-vendored ESP-SR 2.1.5 component.
 - Switches AFE creation to `AFE_TYPE_FD` for the official full-duplex scenario.
 - Uses `AEC_MODE_FD_LOW_COST` first to keep ESP32-S3 CPU load conservative.
 - Enables aggressive AEC NLP and keeps noise suppression active when a playback reference channel is present.
+- Hardens the AFE startup contract: full-duplex init now rejects formats without an `R` reference channel, validates that `afe_config_check()` kept `AFE_TYPE_FD` plus `AEC_MODE_FD_*`, fixes AFE fetch output to the microphone channel, and prevents playback reference audio from being uploaded to Doubao.
 - Keeps the v1.5 asynchronous upload queue and playback-aware barge-in gate as fallback protection while hardware tuning continues.
 - The `v2.0-espressif-fd-aec` branch also keeps ESP32-S3 defaults aligned with the development firmware by enabling the `wn9_hiesp` WakeNet model and conservative PSRAM/internal allocation defaults.
 - Adds runtime AEC profile switching through serial and MCP commands so `AEC_MODE_FD_LOW_COST` and `AEC_MODE_FD_HIGH_PERF` can be compared without rebuilding firmware.
