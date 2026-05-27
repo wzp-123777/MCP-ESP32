@@ -190,7 +190,7 @@ static void *s_device_command_ctx;
 #define MCP_ENDPOINT_NVS_KEY "endpoint"
 #define MCP_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define MCP_QUEUE_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-#define MCP_WS_TASK_STACK_BYTES 3072
+#define MCP_WS_TASK_STACK_BYTES 4096
 #define MCP_WS_BUFFER_SIZE_BYTES 8192
 #define MCP_SERVICE_TASK_STACK_BYTES 6144
 
@@ -1530,6 +1530,32 @@ static void handle_ws_text(const char *message)
         return;
     }
 
+    if (strcmp(type, "dashboard_update") == 0) {
+        char weather_title[80];
+        char weather_detail[96];
+        char weather_alert[96];
+        char calendar_title[96];
+        char calendar_detail[96];
+        char reminder_text[96];
+        char updated_at[24];
+        json_get_string(message, "weather_title", weather_title, sizeof(weather_title));
+        json_get_string(message, "weather_detail", weather_detail, sizeof(weather_detail));
+        json_get_string(message, "weather_alert", weather_alert, sizeof(weather_alert));
+        json_get_string(message, "calendar_title", calendar_title, sizeof(calendar_title));
+        json_get_string(message, "calendar_detail", calendar_detail, sizeof(calendar_detail));
+        json_get_string(message, "reminder_text", reminder_text, sizeof(reminder_text));
+        json_get_string(message, "updated_at", updated_at, sizeof(updated_at));
+        app_ui_set_dashboard(weather_title,
+                             weather_detail,
+                             weather_alert,
+                             calendar_title,
+                             calendar_detail,
+                             reminder_text,
+                             updated_at);
+        ESP_LOGI(TAG, "dashboard update weather=%s calendar=%s", weather_title, calendar_title);
+        return;
+    }
+
     if (strcmp(type, "assistant_error") == 0 || strcmp(type, "tts_error") == 0 || strcmp(type, "vision_error") == 0) {
         json_get_string(message, "error", text, sizeof(text));
         ESP_LOGW(TAG, "%s: %s", type, text);
@@ -1944,7 +1970,7 @@ static void mcp_service_task(void *arg)
     if (err != ESP_OK) {
         s_status = MCP_STATUS_ERROR;
         app_ui_set_mcp_status(mcp_client_get_status_text());
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 

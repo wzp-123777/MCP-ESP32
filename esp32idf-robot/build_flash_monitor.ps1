@@ -65,7 +65,7 @@ if (-not (Test-Path (Join-Path $ProjectDir "sdkconfig"))) {
   }
 }
 
-Invoke-Checked idf.py build
+Invoke-Checked idf.py -DCCACHE_ENABLE=0 build
 
 if (-not $NoFlash) {
   Invoke-Checked idf.py -p $Port flash

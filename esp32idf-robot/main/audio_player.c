@@ -172,6 +172,11 @@ void audio_player_cancel(void)
     ESP_LOGI(TAG, "playback cancel requested");
 }
 
+bool audio_player_cancel_requested(void)
+{
+    return s_cancel_requested;
+}
+
 static void emit_reference_tap(const int16_t *samples, int frames)
 {
     audio_player_reference_tap_cb_t cb = s_reference_tap_cb;
@@ -319,6 +324,35 @@ esp_err_t audio_player_write_silence_ms(uint32_t duration_ms, const char *tag)
     return ESP_OK;
 }
 
+esp_err_t audio_player_stream_begin(const char *tag, bool preroll)
+{
+    audio_player_begin_playback();
+    if (!preroll) {
+        return ESP_OK;
+    }
+    return audio_player_write_preroll(tag ? tag : "stream_preroll");
+}
+
+esp_err_t audio_player_stream_write_pcm16(const uint8_t *pcm, size_t len, const char *tag)
+{
+    if (!pcm || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    len &= ~(size_t)1;
+    if (len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return audio_player_write_pcm(pcm, len, tag ? tag : "stream_pcm16");
+}
+
+void audio_player_stream_end(const char *tag, uint32_t tail_delay_ms)
+{
+    if (tail_delay_ms > 0 && !s_cancel_requested) {
+        ESP_LOGD(TAG, "%s stream tail delay=%ums", tag ? tag : "stream", (unsigned)tail_delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(tail_delay_ms));
+    }
+}
+
 void audio_player_set_volume(int volume)
 {
     s_volume = clamp_volume(volume);
@@ -385,6 +419,7 @@ esp_err_t audio_player_init(void)
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(I2S_NUM_0, PLAYER_SAMPLE_RATE, PLAYER_I2S_BITS, AUDIO_STREAM_WRITER);
     i2s_cfg.type = AUDIO_STREAM_WRITER;
     i2s_cfg.task_stack = 4096;
+    i2s_cfg.stack_in_ext = true;
     i2s_cfg.out_rb_size = 32 * 1024;
     i2s_cfg.need_expand = true;
     i2s_cfg.expand_src_bits = I2S_DATA_BIT_WIDTH_16BIT;

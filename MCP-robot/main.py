@@ -1348,6 +1348,7 @@ def _start_esp32_discovery_responder() -> None:
 @app.on_event("startup")
 async def _startup_esp32_discovery() -> None:
     _start_esp32_discovery_responder()
+    runtime.start_background_workers()
 
 
 @app.on_event("shutdown")
@@ -1575,9 +1576,61 @@ async def healthz() -> dict[str, Any]:
             "memory_count": runtime.structured_memory_store.memory_count(),
             "profile_count": runtime.structured_memory_store.profile_count(),
         },
+        "aiot": runtime.proactive_snapshot(),
         "mcp_facade_enabled": bool(app_mount is not None),
         "mcp_mount_path": config.mcp_mount_path,
     }
+
+
+@app.get("/api/aiot/dashboard")
+async def api_aiot_dashboard(refresh: bool = False) -> dict[str, Any]:
+    if refresh:
+        dashboard = await runtime.refresh_proactive_dashboard()
+    else:
+        dashboard = runtime.proactive_snapshot()
+    return {"ok": True, "dashboard": dashboard}
+
+
+@app.get("/api/aiot/calendar")
+async def api_aiot_calendar() -> dict[str, Any]:
+    path = config.aiot_calendar_file
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", encoding="utf-8")
+    try:
+        events = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"calendar read failed: {exc}") from exc
+    return {"ok": True, "file": str(path), "events": events}
+
+
+@app.post("/api/aiot/calendar")
+async def api_aiot_calendar_add(payload: dict[str, Any]) -> dict[str, Any]:
+    title = str(payload.get("title") or "").strip()[:60]
+    start = str(payload.get("start") or "").strip()[:32]
+    if not title or not start:
+        raise HTTPException(status_code=400, detail="title and start are required")
+    path = config.aiot_calendar_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        events = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except Exception:
+        events = []
+    if not isinstance(events, list):
+        events = []
+    item = {
+        "title": title,
+        "start": start,
+        "end": str(payload.get("end") or "").strip()[:32],
+        "location": str(payload.get("location") or "").strip()[:40],
+        "note": str(payload.get("note") or "").strip()[:80],
+        "remind_minutes": max(1, min(1440, int(payload.get("remind_minutes") or 20))),
+        "enabled": bool(payload.get("enabled", True)),
+    }
+    events.append(item)
+    path.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
+    dashboard = await runtime.refresh_proactive_dashboard()
+    return {"ok": True, "event": item, "dashboard": dashboard}
 
 
 @app.get("/api/logs")

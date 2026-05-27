@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 #include "audio_element.h"
@@ -15,6 +16,7 @@
 #include "es7210.h"
 #endif
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "i2s_stream.h"
 #include "raw_stream.h"
 
@@ -22,6 +24,7 @@
 #define MIC_BITS 16
 #define MIC_READ_BYTES 1024
 #define MIC_LOG_INTERVAL_MS 1000
+#define MIC_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 static const char *TAG = "MIC_DIAG";
 static audio_pipeline_handle_t s_pipeline;
@@ -46,7 +49,7 @@ static void mic_diag_task(void *arg)
     int16_t *samples = calloc(1, MIC_READ_BYTES);
     if (!samples) {
         ESP_LOGE(TAG, "failed to allocate mic buffer");
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 
@@ -131,6 +134,7 @@ esp_err_t mic_diag_init(mic_diag_level_cb_t level_cb)
                                                                         I2S_SLOT_MODE_MONO);
     i2s_cfg.type = AUDIO_STREAM_READER;
     i2s_cfg.task_stack = 4096;
+    i2s_cfg.stack_in_ext = true;
     i2s_cfg.out_rb_size = 8 * 1024;
     s_i2s_reader = i2s_stream_init(&i2s_cfg);
     if (!s_i2s_reader) {
@@ -165,7 +169,10 @@ esp_err_t mic_diag_init(mic_diag_level_cb_t level_cb)
         return ESP_FAIL;
     }
 
-    xTaskCreate(mic_diag_task, "mic_diag", 4096, NULL, 4, NULL);
+    if (xTaskCreateWithCaps(mic_diag_task, "mic_diag", 4096, NULL, 4, NULL, MIC_TASK_STACK_CAPS) != pdPASS) {
+        ESP_LOGE(TAG, "mic task create failed");
+        return ESP_ERR_NO_MEM;
+    }
     s_initialized = true;
     ESP_LOGI(TAG, "ready; type MIC ON to print levels");
     return ESP_OK;

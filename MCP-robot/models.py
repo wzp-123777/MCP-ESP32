@@ -576,6 +576,44 @@ class LanguageModelService:
             logger.warning("QQ 回复压缩失败，改用截断结果: %s", exc)
             return assistant_reply[:max_chars]
 
+    async def compose_proactive_notice(
+        self,
+        *,
+        event_type: str,
+        event_text: str,
+        context: str = "",
+    ) -> str:
+        system_prompt = (
+            "你是一个自然的桌面 AIoT 管家。"
+            "你要把后台事件改写成一句自然提醒，像人顺口提醒一样。\n"
+            "硬性要求：\n"
+            "1. 只输出一句中文，20 字以内。\n"
+            "2. 不要解释原因，不要寒暄。\n"
+            "3. 不要说“系统”“后台”“API”“接口”“传感器”“检测到”“根据数据”“模型”。\n"
+            "4. 不要暴露你是 AI 或程序。\n"
+            "5. 语气自然、简短、适合直接播报。"
+        )
+        user_prompt = (
+            f"事件类型：{event_type}\n"
+            f"事件内容：{event_text.strip()}\n"
+            f"上下文：{context.strip() or '无'}"
+        )
+        text = await self._client.complete_text(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=80,
+        )
+        cleaned = re.sub(r"[\r\n]+", " ", text).strip().strip("「」“”\"'`")
+        for token in ("系统", "后台", "API", "接口", "传感器", "检测到", "根据数据", "模型"):
+            cleaned = cleaned.replace(token, "")
+        cleaned = re.sub(r"\s+", "", cleaned)
+        if len(cleaned) > 32:
+            cleaned = cleaned[:32].rstrip("，。！？；、 ")
+        return cleaned or event_text.strip()[:24]
+
     async def summarize_agent_result(
         self,
         *,

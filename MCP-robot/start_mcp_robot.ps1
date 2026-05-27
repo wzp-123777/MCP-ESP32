@@ -1,7 +1,21 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$pythonExe = Join-Path $projectRoot "venv\\Scripts\\python.exe"
+$pythonExe = $env:MCP_ROBOT_PYTHON
+if ([string]::IsNullOrWhiteSpace($pythonExe)) {
+    $localPython = Join-Path $projectRoot "venv\\Scripts\\python.exe"
+    $sharedPython = "D:\\esp32\\MCP-robot\\venv\\Scripts\\python.exe"
+    if (Test-Path $localPython) {
+        $pythonExe = $localPython
+    } elseif (Test-Path $sharedPython) {
+        $pythonExe = $sharedPython
+    } else {
+        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+        if ($pythonCommand) {
+            $pythonExe = $pythonCommand.Source
+        }
+    }
+}
 $mainFile = Join-Path $projectRoot "main.py"
 
 if (-not (Test-Path $pythonExe)) {

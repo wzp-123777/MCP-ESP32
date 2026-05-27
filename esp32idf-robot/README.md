@@ -24,19 +24,6 @@ ESP32-S3-Korvo-2 硬件支持全双工 AEC，但不能只改阈值实现。官�
 
 ## 构建和烧录
 
-首次构建前请先安装 ESP-IDF `v5.5.x`，并设置目标芯片：
-
-```powershell
-idf.py set-target esp32s3
-```
-
-固件组件依赖由 `main/idf_component.yml` 管理，构建时会自动下载：
-
-- `espressif/esp-sr: 2.4.4`
-- `lvgl/lvgl: ^8.4.0`
-- `esp_lcd_touch_gt911`
-- `esp_lcd_touch_tt21100`
-
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\esp32\esp32idf-robot\build_flash_monitor.ps1 -Port COM3
 ```

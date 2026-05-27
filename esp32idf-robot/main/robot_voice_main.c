@@ -20,6 +20,8 @@
 #include "esp_vad.h"
 #include "mcp_client.h"
 #include "mic_diag.h"
+#include "music_player.h"
+#include "robot_peripherals.h"
 #include "sdkconfig.h"
 
 #define VOICE_LOOP_GAP_MS 500
@@ -37,17 +39,17 @@
 #define CONT_VAD_STOP_PEAK 1400
 #define CONT_VAD_START_HITS 6
 #define CONT_VAD_SILENCE_HITS 3
-#define CONT_VAD_TAIL_MS 1400
-#define CONT_VAD_MIN_SPEECH_MS 320
+#define CONT_VAD_TAIL_MS 1600
+#define CONT_VAD_MIN_SPEECH_MS 240
 #define CONT_VAD_MAX_SPEECH_MS 12000
 #define CONT_VAD_WATCHDOG_MS 300
 #define CONT_VAD_STALE_AUDIO_MS 1600
 #define CONT_VAD_STALE_SILENCE_MS 1400
 #define CONT_STARTUP_REARM_MS 350
-#define CONT_REARM_DELAY_MS 1200
-#define CONT_PLAYBACK_TAIL_IGNORE_MS 1200
-#define CONT_PLAYBACK_TAIL_REJECT_MS 1000
-#define CONT_PLAYBACK_TAIL_GATE_MS 3600
+#define CONT_REARM_DELAY_MS 800
+#define CONT_PLAYBACK_TAIL_IGNORE_MS 650
+#define CONT_PLAYBACK_TAIL_REJECT_MS 700
+#define CONT_PLAYBACK_TAIL_GATE_MS 1800
 #define CONT_VAD_NOISE_FLOOR_INIT 140
 #define CONT_VAD_NOISE_FLOOR_MIN 60
 #define CONT_VAD_NOISE_FLOOR_MAX 460
@@ -69,29 +71,29 @@
 #define CONT_AEC_VAD_STOP_MARGIN 90
 #define CONT_AEC_VAD_RELATIVE_RELEASE_DIV 4
 #define CONT_AFE_VAD_CONFIRM_MS 1200
-#define CONT_AFE_VAD_CONFIRM_AVG 220
-#define CONT_AFE_VAD_CONFIRM_PEAK 1000
-#define CONT_AFE_VAD_CONFIRM_MARGIN 80
+#define CONT_AFE_VAD_CONFIRM_AVG 190
+#define CONT_AFE_VAD_CONFIRM_PEAK 850
+#define CONT_AFE_VAD_CONFIRM_MARGIN 65
 #define CONT_AFE_VAD_CONFIRM_STRONG_AVG 380
 #define CONT_AFE_VAD_CONFIRM_STRONG_PEAK 2500
 #define CONT_AFE_VAD_CONFIRM_STRONG_MARGIN 180
 #define CONT_AFE_VAD_CONFIRM_HITS 3
-#define CONT_AFE_LOCAL_START_AVG 280
-#define CONT_AFE_LOCAL_START_PEAK 1400
-#define CONT_AFE_LOCAL_START_MARGIN 120
-#define CONT_AFE_LOCAL_START_HITS 5
-#define CONT_RNNM_AFE_VAD_CONFIRM_AVG 260
-#define CONT_RNNM_AFE_VAD_CONFIRM_PEAK 1100
-#define CONT_RNNM_AFE_VAD_CONFIRM_MARGIN 120
-#define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_AVG 520
-#define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_PEAK 3500
-#define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_MARGIN 260
-#define CONT_RNNM_AFE_VAD_CONFIRM_HITS 4
-#define CONT_RNNM_AFE_LOCAL_START_AVG 300
-#define CONT_RNNM_AFE_LOCAL_START_PEAK 1600
-#define CONT_RNNM_AFE_LOCAL_START_MARGIN 160
-#define CONT_RNNM_AFE_LOCAL_START_HITS 4
-#define CONT_AFE_REJECT_REARM_MS 1200
+#define CONT_AFE_LOCAL_START_AVG 230
+#define CONT_AFE_LOCAL_START_PEAK 1100
+#define CONT_AFE_LOCAL_START_MARGIN 90
+#define CONT_AFE_LOCAL_START_HITS 4
+#define CONT_RNNM_AFE_VAD_CONFIRM_AVG 145
+#define CONT_RNNM_AFE_VAD_CONFIRM_PEAK 600
+#define CONT_RNNM_AFE_VAD_CONFIRM_MARGIN 45
+#define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_AVG 420
+#define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_PEAK 2800
+#define CONT_RNNM_AFE_VAD_CONFIRM_STRONG_MARGIN 190
+#define CONT_RNNM_AFE_VAD_CONFIRM_HITS 2
+#define CONT_RNNM_AFE_LOCAL_START_AVG 150
+#define CONT_RNNM_AFE_LOCAL_START_PEAK 650
+#define CONT_RNNM_AFE_LOCAL_START_MARGIN 45
+#define CONT_RNNM_AFE_LOCAL_START_HITS 2
+#define CONT_AFE_REJECT_REARM_MS 700
 #define CONT_BARGE_REF_CH 0
 #define CONT_BARGE_MIC_CH 3
 #define CONT_BARGE_RAW_CORR_WINDOW 8
@@ -121,7 +123,7 @@
 #define CONT_BARGE_TAIL_STRONG_EXTRA_AVG 260
 #define CONT_BARGE_TAIL_STRONG_EXTRA_PEAK 1200
 #define CONT_PREROLL_CHUNKS 16
-#define CONT_RAW_UPLOAD_PREROLL_MS 600
+#define CONT_RAW_UPLOAD_PREROLL_MS 850
 #define CONT_BARGE_RAW_UPLOAD_CHUNKS 32
 #define CONT_BARGE_RAW_UPLOAD_PREROLL_MS 320
 #define CONT_BARGE_RAW_UPLOAD_POST_CANCEL_DROP_MS 180
@@ -192,6 +194,14 @@ typedef enum {
     VOICE_CMD_AFE_AEC_PROFILE_SET,
     VOICE_CMD_AFE_STATUS,
     VOICE_CMD_CONT_UPLOAD_MODE_SET,
+    VOICE_CMD_MUSIC_PLAY,
+    VOICE_CMD_MUSIC_STOP,
+    VOICE_CMD_MUSIC_NEXT,
+    VOICE_CMD_CAMERA_CAPTURE,
+    VOICE_CMD_ENV_STATUS,
+    VOICE_CMD_LIGHT_ON,
+    VOICE_CMD_LIGHT_OFF,
+    VOICE_CMD_LIGHT_TOGGLE,
 } voice_cmd_type_t;
 
 typedef enum {
@@ -301,6 +311,7 @@ static int s_cont_sr_vad_frame_used;
 static bool s_cont_sr_vad_available;
 static bool s_afe_ready;
 static bool s_afe_init_attempted;
+static bool s_wake_afe_deferred;
 static bool s_afe_vad_pending;
 static TickType_t s_afe_vad_pending_tick;
 static TickType_t s_afe_vad_reject_until_tick;
@@ -471,7 +482,7 @@ static uint32_t diag_stats_rms(const raw_tdm_channel_stats_t *stats);
 
 static void print_help(void)
 {
-    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT/CHAT ON/CHAT OFF, WAKE/WAKE ON/WAKE OFF (%s), CONT SRC AUTO/RAW/AFE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt|tts] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>|DEFAULT, MCP CONNECT, HELP", WAKE_WORD_LABEL);
+    ESP_LOGI(TAG, "commands: ASK <text>, REC <ms>, CHAT/CHAT ON/CHAT OFF, WAKE/WAKE ON/WAKE OFF (%s), CONT SRC AUTO/RAW/AFE, RAW TDM [ms], BARGE [fmt] [xiaole|after|interrupt|tts] [ms], AFE STATUS, AFE AEC MODE LOW/HIGH, AFE VAD MUTE ON/OFF, PERSONA, VOICE, PLAY/XIAOLE, MUSIC/MUSIC STOP/MUSIC NEXT, CAMERA, ENV, LIGHT ON/OFF/TOGGLE, LOOP, STOP, MIC ON, MIC OFF, VOL 0-100, VOL+, VOL-, MCP URL <url>|DEFAULT, MCP CONNECT, HELP", WAKE_WORD_LABEL);
 }
 
 static void send_cmd(voice_cmd_type_t type, int value)
@@ -1038,7 +1049,20 @@ static bool ensure_afe_ready(void)
 static void set_wake_enabled(bool enabled, const char *reason)
 {
     s_wake_enabled = enabled;
-    if (s_wake_enabled) {
+    if (s_wake_enabled && !s_afe_ready) {
+        if (mcp_client_is_connected()) {
+            s_wake_afe_deferred = false;
+        } else {
+            s_wake_afe_deferred = true;
+            ESP_LOGI(TAG,
+                     "wake AFE init deferred until MCP connected reason=%s status=%s",
+                     reason ? reason : "-",
+                     mcp_client_get_status_text());
+        }
+    } else if (!s_wake_enabled) {
+        s_wake_afe_deferred = false;
+    }
+    if (s_wake_enabled && !s_wake_afe_deferred) {
         ensure_afe_ready();
     }
     app_ui_set_wake_enabled(s_wake_enabled);
@@ -1047,7 +1071,7 @@ static void set_wake_enabled(bool enabled, const char *reason)
     }
     bool model_ready = s_afe_ready && afe_capture_has_wake_model();
     app_ui_set_voice_state(s_wake_enabled
-                               ? (model_ready ? "WAKE LISTEN" : "WAKE TODO")
+                               ? (model_ready ? "WAKE LISTEN" : (s_wake_afe_deferred ? "WAKE WAIT" : "WAKE TODO"))
                                : "VOICE READY");
     send_runtime_config();
     ESP_LOGI(TAG,
@@ -1057,6 +1081,25 @@ static void set_wake_enabled(bool enabled, const char *reason)
              s_afe_ready,
              model_ready,
              WAKE_WORD_LABEL);
+}
+
+static void wake_afe_deferred_housekeeping(void)
+{
+    if (!s_wake_afe_deferred || !s_wake_enabled || s_afe_ready) {
+        return;
+    }
+    if (!mcp_client_is_connected()) {
+        return;
+    }
+    ESP_LOGI(TAG, "wake AFE deferred init start after MCP connected");
+    s_wake_afe_deferred = false;
+    if (ensure_afe_ready()) {
+        afe_capture_set_wake_enabled(true);
+        app_ui_set_voice_state(afe_capture_has_wake_model() ? "WAKE LISTEN" : "WAKE TODO");
+        send_runtime_config();
+    } else {
+        app_ui_set_voice_state("WAKE TODO");
+    }
 }
 
 static void log_afe_status(void)
@@ -3994,6 +4037,10 @@ static void barge_diag_note_external_tts_playback(bool busy)
 static void on_mcp_playback_busy(bool busy, void *ctx)
 {
     (void)ctx;
+    if (busy && music_player_is_playing()) {
+        music_player_stop();
+        app_ui_set_voice_state("MUSIC PAUSE");
+    }
     barge_diag_note_external_tts_playback(busy);
     mark_assistant_playback_busy(busy);
 }
@@ -4069,9 +4116,55 @@ static void on_mcp_device_command(const char *command, void *ctx)
         }
         return;
     }
+    if (command_equals(command, "music_play") || command_equals(command, "play_music") ||
+        command_equals(command, "music") || command_equals(command, "mp3_play")) {
+        send_cmd_nonblocking(VOICE_CMD_MUSIC_PLAY, 0);
+        return;
+    }
+    if (command_equals(command, "music_stop") || command_equals(command, "stop_music") ||
+        command_equals(command, "mp3_stop")) {
+        send_cmd_nonblocking(VOICE_CMD_MUSIC_STOP, 0);
+        return;
+    }
+    if (command_equals(command, "music_next") || command_equals(command, "next_music") ||
+        command_equals(command, "next_song") || command_equals(command, "mp3_next")) {
+        send_cmd_nonblocking(VOICE_CMD_MUSIC_NEXT, 0);
+        return;
+    }
+    if (command_equals(command, "env_status") || command_equals(command, "environment") ||
+        command_equals(command, "humidity") || command_equals(command, "temperature") ||
+        command_equals(command, "sensor_status")) {
+        send_cmd_nonblocking(VOICE_CMD_ENV_STATUS, 0);
+        return;
+    }
+    if (command_equals(command, "room_light_on") || command_equals(command, "light_on") ||
+        command_equals(command, "lamp_on")) {
+        send_cmd_nonblocking(VOICE_CMD_LIGHT_ON, 0);
+        return;
+    }
+    if (command_equals(command, "room_light_off") || command_equals(command, "light_off") ||
+        command_equals(command, "lamp_off")) {
+        send_cmd_nonblocking(VOICE_CMD_LIGHT_OFF, 0);
+        return;
+    }
+    if (command_equals(command, "room_light_toggle") || command_equals(command, "light_toggle") ||
+        command_equals(command, "lamp_toggle")) {
+        send_cmd_nonblocking(VOICE_CMD_LIGHT_TOGGLE, 0);
+        return;
+    }
     if (command_equals(command, "play") || command_equals(command, "xiaole") ||
         command_equals(command, "play_test")) {
         send_cmd_nonblocking(VOICE_CMD_PLAY_ONCE, 0);
+        return;
+    }
+    if (command_equals(command, "vol_up") || command_equals(command, "volume_up") ||
+        command_equals(command, "volume+")) {
+        send_cmd_nonblocking(VOICE_CMD_VOL_UP, 0);
+        return;
+    }
+    if (command_equals(command, "vol_down") || command_equals(command, "volume_down") ||
+        command_equals(command, "volume-")) {
+        send_cmd_nonblocking(VOICE_CMD_VOL_DOWN, 0);
         return;
     }
     if (command_equals(command, "loop") || command_equals(command, "play_loop")) {
@@ -4164,6 +4257,11 @@ static void on_mcp_device_command(const char *command, void *ctx)
         send_cmd_nonblocking(VOICE_CMD_AFE_STATUS, 0);
         return;
     }
+    if (command_equals(command, "camera_capture") || command_equals(command, "photo") ||
+        command_equals(command, "capture")) {
+        send_cmd_nonblocking(VOICE_CMD_CAMERA_CAPTURE, 0);
+        return;
+    }
 }
 
 static void on_button_event(app_button_event_t event, void *ctx)
@@ -4206,6 +4304,7 @@ static void playback_task(void *arg)
                 cmd.type = VOICE_CMD_PLAY_ONCE;
             }
         } else if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(CONT_VAD_WATCHDOG_MS)) != pdTRUE) {
+            wake_afe_deferred_housekeeping();
             raw_tdm_diag_housekeeping();
             barge_diag_housekeeping();
             ptt_capture_housekeeping();
@@ -4236,6 +4335,59 @@ static void playback_task(void *arg)
                 ESP_LOGI(TAG, "loop stopped");
                 app_ui_set_voice_state("VOICE STOP");
                 break;
+            case VOICE_CMD_MUSIC_PLAY:
+                mcp_client_cancel_playback();
+                if (music_player_play() == ESP_OK) {
+                    app_ui_set_recent_text("播放 TF 卡音乐");
+                    app_ui_set_voice_state("MUSIC PLAY");
+                } else {
+                    app_ui_set_voice_state("MUSIC ERR");
+                }
+                break;
+            case VOICE_CMD_MUSIC_STOP:
+                music_player_stop();
+                app_ui_set_recent_text("停止音乐");
+                app_ui_set_voice_state("MUSIC STOP");
+                break;
+            case VOICE_CMD_MUSIC_NEXT:
+                if (music_player_next() == ESP_OK) {
+                    app_ui_set_recent_text("下一首音乐");
+                    app_ui_set_voice_state("MUSIC NEXT");
+                } else {
+                    app_ui_set_voice_state("MUSIC ERR");
+                }
+                break;
+            case VOICE_CMD_CAMERA_CAPTURE: {
+                char detail[192];
+                esp_err_t ret = robot_peripherals_camera_capture(detail, sizeof(detail));
+                app_ui_set_recent_text(ret == ESP_OK ? "摄像头拍照完成" : "摄像头等待硬件接入");
+                app_ui_set_voice_state(ret == ESP_OK ? "CAMERA OK" : "CAMERA WAIT");
+                mcp_client_send_diagnostic_event("camera", ret == ESP_OK ? "capture" : "not_ready", detail);
+                break;
+            }
+            case VOICE_CMD_ENV_STATUS: {
+                robot_env_reading_t reading = {0};
+                esp_err_t ret = robot_peripherals_read_environment(&reading);
+                app_ui_set_recent_text(reading.detail[0] ? reading.detail : "温湿度传感器未接入");
+                app_ui_set_voice_state(ret == ESP_OK ? "ENV OK" : "ENV WAIT");
+                mcp_client_send_diagnostic_event("environment", ret == ESP_OK ? "status" : "not_ready", reading.detail);
+                break;
+            }
+            case VOICE_CMD_LIGHT_ON:
+            case VOICE_CMD_LIGHT_OFF:
+            case VOICE_CMD_LIGHT_TOGGLE: {
+                char detail[160];
+                esp_err_t ret = ESP_OK;
+                if (cmd.type == VOICE_CMD_LIGHT_TOGGLE) {
+                    ret = robot_peripherals_room_light_toggle(detail, sizeof(detail));
+                } else {
+                    ret = robot_peripherals_room_light_set(cmd.type == VOICE_CMD_LIGHT_ON, detail, sizeof(detail));
+                }
+                app_ui_set_recent_text(detail);
+                app_ui_set_voice_state(ret == ESP_OK ? "LIGHT OK" : "LIGHT ERR");
+                mcp_client_send_diagnostic_event("room_light", ret == ESP_OK ? "state" : "error", detail);
+                break;
+            }
             case VOICE_CMD_VOL_SET:
                 audio_player_set_volume(cmd.value);
                 app_ui_set_volume(audio_player_get_volume());
@@ -4371,8 +4523,24 @@ static void command_task(void *arg)
             send_cmd(VOICE_CMD_PLAY_ONCE, 0);
         } else if (strcmp(line, "CHAT") == 0) {
             send_cmd(VOICE_CMD_CHAT_TOGGLE, 0);
+        } else if (strcmp(line, "CHAT ON") == 0 || strcmp(line, "CHAT START") == 0) {
+            send_cmd(VOICE_CMD_CHAT_START, 0);
+        } else if (strcmp(line, "CHAT OFF") == 0 || strcmp(line, "CHAT STOP") == 0) {
+            send_cmd(VOICE_CMD_CHAT_STOP, 0);
         } else if (strcmp(line, "WAKE") == 0) {
             send_cmd(VOICE_CMD_WAKE_TOGGLE, 0);
+        } else if (strcmp(line, "WAKE ON") == 0) {
+            if (!s_wake_enabled) {
+                send_cmd(VOICE_CMD_WAKE_TOGGLE, 0);
+            } else {
+                ESP_LOGI(TAG, "wake already enabled");
+            }
+        } else if (strcmp(line, "WAKE OFF") == 0) {
+            if (s_wake_enabled) {
+                send_cmd(VOICE_CMD_WAKE_TOGGLE, 0);
+            } else {
+                ESP_LOGI(TAG, "wake already disabled");
+            }
         } else if (strncmp(line, "CONT SRC ", 9) == 0 || strncmp(line, "UPLOAD SRC ", 11) == 0 ||
                    strncmp(line, "AUDIO SRC ", 10) == 0) {
             const char *value_text = strchr(raw_line, ' ');
@@ -4438,6 +4606,22 @@ static void command_task(void *arg)
             send_cmd(VOICE_CMD_PERSONA_NEXT, 0);
         } else if (strcmp(line, "VOICE") == 0) {
             send_cmd(VOICE_CMD_VOICE_NEXT, 0);
+        } else if (strcmp(line, "MUSIC") == 0 || strcmp(line, "MUSIC PLAY") == 0 || strcmp(line, "MP3") == 0) {
+            send_cmd(VOICE_CMD_MUSIC_PLAY, 0);
+        } else if (strcmp(line, "MUSIC STOP") == 0 || strcmp(line, "MP3 STOP") == 0) {
+            send_cmd(VOICE_CMD_MUSIC_STOP, 0);
+        } else if (strcmp(line, "MUSIC NEXT") == 0 || strcmp(line, "MP3 NEXT") == 0 || strcmp(line, "NEXT") == 0) {
+            send_cmd(VOICE_CMD_MUSIC_NEXT, 0);
+        } else if (strcmp(line, "CAMERA") == 0 || strcmp(line, "PHOTO") == 0 || strcmp(line, "CAPTURE") == 0) {
+            send_cmd(VOICE_CMD_CAMERA_CAPTURE, 0);
+        } else if (strcmp(line, "ENV") == 0 || strcmp(line, "HUMIDITY") == 0 || strcmp(line, "TEMP") == 0) {
+            send_cmd(VOICE_CMD_ENV_STATUS, 0);
+        } else if (strcmp(line, "LIGHT ON") == 0 || strcmp(line, "LAMP ON") == 0) {
+            send_cmd(VOICE_CMD_LIGHT_ON, 0);
+        } else if (strcmp(line, "LIGHT OFF") == 0 || strcmp(line, "LAMP OFF") == 0) {
+            send_cmd(VOICE_CMD_LIGHT_OFF, 0);
+        } else if (strcmp(line, "LIGHT") == 0 || strcmp(line, "LIGHT TOGGLE") == 0 || strcmp(line, "LAMP") == 0) {
+            send_cmd(VOICE_CMD_LIGHT_TOGGLE, 0);
         } else if (strcmp(line, "LOOP") == 0) {
             send_cmd(VOICE_CMD_LOOP, 0);
         } else if (strcmp(line, "STOP") == 0) {
@@ -4519,6 +4703,24 @@ static esp_err_t create_voice_task(TaskFunction_t task_func,
     return ESP_OK;
 }
 
+static esp_err_t create_internal_voice_task(TaskFunction_t task_func,
+                                            const char *name,
+                                            uint32_t stack_bytes,
+                                            UBaseType_t prio)
+{
+    BaseType_t ok = xTaskCreate(task_func, name, stack_bytes, NULL, prio, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG,
+                 "internal voice task create failed name=%s stack=%u internal_free=%u internal_largest=%u",
+                 name ? name : "?",
+                 (unsigned)stack_bytes,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
@@ -4536,9 +4738,15 @@ void app_main(void)
         ESP_LOGE(TAG, "audio player init failed");
         return;
     }
+    if (music_player_init() != ESP_OK) {
+        ESP_LOGW(TAG, "music player init failed; TF mp3 playback unavailable");
+    }
 
     if (app_ui_init() != ESP_OK) {
         ESP_LOGW(TAG, "ui init failed; continue without lcd");
+    }
+    if (robot_peripherals_init() != ESP_OK) {
+        ESP_LOGW(TAG, "peripheral scaffold init failed");
     }
     app_ui_set_action_callback(on_ui_action, NULL);
     app_ui_set_volume(audio_player_get_volume());
@@ -4561,6 +4769,10 @@ void app_main(void)
         return;
     }
 
+    if (app_buttons_init(on_button_event, NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "button init failed");
+    }
+
     if (mcp_client_connect() == ESP_OK) {
         app_ui_set_mcp_status(mcp_client_get_status_text());
         vTaskDelay(pdMS_TO_TICKS(900));
@@ -4580,13 +4792,9 @@ void app_main(void)
         send_runtime_config();
     }
 
-    if (create_voice_task(playback_task, "voice_playback", 6144, 5) != ESP_OK ||
+    if (create_internal_voice_task(playback_task, "voice_playback", 6144, 5) != ESP_OK ||
         create_voice_task(command_task, "voice_command", 4096, 4) != ESP_OK) {
         return;
-    }
-
-    if (app_buttons_init(on_button_event, NULL) != ESP_OK) {
-        ESP_LOGW(TAG, "button init failed");
     }
 
     if (!mcp_client_is_connected()) {

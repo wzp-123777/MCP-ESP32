@@ -38,6 +38,7 @@ from doubao_dialog import (
 from frame_store import FrameStore
 from generic_agent_bridge import GenericAgentBridge
 from memory_store import SubconsciousMemoryStore
+from proactive import ProactiveEngine
 from structured_memory_store import StructuredMemoryStore
 from models import (
     ASRModelService,
@@ -275,15 +276,15 @@ _ESP32_TTS_TARGET_PEAK = 12000
 _ESP32_TTS_SOFT_LIMIT = 26000
 _DIALOG_TTS_TARGET_PEAK = 14000
 _DIALOG_TTS_MAX_GAIN = 8.0
-_ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "80"))
-_ESP32_DIALOG_INPUT_TARGET_RMS = float(os.getenv("ESP32_DIALOG_INPUT_TARGET_RMS", "900"))
+_ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "28"))
+_ESP32_DIALOG_INPUT_TARGET_RMS = float(os.getenv("ESP32_DIALOG_INPUT_TARGET_RMS", "1000"))
 _ESP32_DIALOG_INPUT_TARGET_PEAK = int(os.getenv("ESP32_DIALOG_INPUT_TARGET_PEAK", "16000"))
-_ESP32_DIALOG_INPUT_MAX_GAIN = float(os.getenv("ESP32_DIALOG_INPUT_MAX_GAIN", "4"))
+_ESP32_DIALOG_INPUT_MAX_GAIN = float(os.getenv("ESP32_DIALOG_INPUT_MAX_GAIN", "8"))
 _ESP32_BARGE_DIALOG_LEADING_DROP_MS = int(os.getenv("ESP32_BARGE_DIALOG_LEADING_DROP_MS", "120"))
 _ESP32_BARGE_DIALOG_MIN_KEEP_MS = int(os.getenv("ESP32_BARGE_DIALOG_MIN_KEEP_MS", "700"))
-_ESP32_POST_TTS_ECHO_GUARD_SECONDS = float(os.getenv("ESP32_POST_TTS_ECHO_GUARD_SECONDS", "9.0"))
-_ESP32_POST_TTS_ECHO_MAX_RMS = float(os.getenv("ESP32_POST_TTS_ECHO_MAX_RMS", "1150"))
-_ESP32_POST_TTS_ECHO_MAX_MS = int(os.getenv("ESP32_POST_TTS_ECHO_MAX_MS", "5000"))
+_ESP32_POST_TTS_ECHO_GUARD_SECONDS = float(os.getenv("ESP32_POST_TTS_ECHO_GUARD_SECONDS", "2.5"))
+_ESP32_POST_TTS_ECHO_MAX_RMS = float(os.getenv("ESP32_POST_TTS_ECHO_MAX_RMS", "700"))
+_ESP32_POST_TTS_ECHO_MAX_MS = int(os.getenv("ESP32_POST_TTS_ECHO_MAX_MS", "1500"))
 _TTS_DEBUG_DIR = Path(__file__).resolve().parent / "data" / "esp32_tts"
 _EMOJI_RE = re.compile(
     "["
@@ -842,6 +843,7 @@ class RobotRuntime:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._memory_queue: asyncio.Queue[tuple[str, str] | None] | None = None
         self._memory_worker: asyncio.Task[Any] | None = None
+        self._proactive_worker: asyncio.Task[Any] | None = None
         self._queued_memory_sessions: set[str] = set()
         self._pending_image_jobs: dict[str, PendingImageJob] = {}
         self._pending_audio_streams: dict[str, PendingAudioStream] = {}
@@ -854,6 +856,14 @@ class RobotRuntime:
         self.audio_capture_dir = self.config.data_dir / "esp32_audio"
         self.audio_capture_dir.mkdir(parents=True, exist_ok=True)
         self.config.doubao_dialog.persona_dir.mkdir(parents=True, exist_ok=True)
+        self.proactive_engine = ProactiveEngine(
+            config=config,
+            weather_tool=SeniverseWeatherTool(config.tool_api.seniverse_key),
+            compose_notice=self._compose_proactive_notice,
+            send_dashboard=self._send_proactive_dashboard,
+            send_notice=self._send_proactive_notice,
+            trace=lambda event, payload: self._trace(event, **payload),
+        )
 
     def _language_model_for(self, request_or_source: TextRequest | str) -> LanguageModelService:
         source = request_or_source.source if isinstance(request_or_source, TextRequest) else str(request_or_source)
@@ -2051,7 +2061,11 @@ class RobotRuntime:
         except Exception:
             logger.exception("后台任务执行失败")
 
+    def start_background_workers(self) -> None:
+        self._ensure_background_workers()
+
     def _ensure_background_workers(self) -> None:
+        self._ensure_proactive_worker()
         if self._memory_worker is not None and not self._memory_worker.done():
             self._trace("worker.state", worker="memory_maintenance", state="reused", pending=len(self._queued_memory_sessions))
             return
@@ -2061,6 +2075,55 @@ class RobotRuntime:
         self._memory_worker.add_done_callback(self._tasks.discard)
         self._memory_worker.add_done_callback(self._log_background_task)
         self._trace("worker.state", worker="memory_maintenance", state="started", pending=0)
+
+    def _ensure_proactive_worker(self) -> None:
+        if not self.config.proactive_enabled:
+            return
+        if self._proactive_worker is not None and not self._proactive_worker.done():
+            return
+        self._proactive_worker = asyncio.create_task(self.proactive_engine.run())
+        self._tasks.add(self._proactive_worker)
+        self._proactive_worker.add_done_callback(self._tasks.discard)
+        self._proactive_worker.add_done_callback(self._log_background_task)
+        self._trace("worker.state", worker="aiot_proactive", state="started")
+
+    def proactive_snapshot(self) -> dict[str, Any]:
+        return self.proactive_engine.snapshot()
+
+    async def refresh_proactive_dashboard(self) -> dict[str, Any]:
+        self._ensure_proactive_worker()
+        return await self.proactive_engine.poll_once(force_weather=True, force_dashboard=True)
+
+    async def _compose_proactive_notice(self, event_type: str, event_text: str, context: str) -> str:
+        return await self.language_model.compose_proactive_notice(
+            event_type=event_type,
+            event_text=event_text,
+            context=context,
+        )
+
+    async def _send_proactive_dashboard(self, payload: dict[str, Any]) -> None:
+        await self.connection_manager.send_to_esp32(payload)
+
+    async def _send_proactive_notice(self, event: dict[str, Any], notice: str) -> None:
+        payload = self.proactive_engine.snapshot()
+        payload["reminder_text"] = notice[:96]
+        await self.connection_manager.send_to_esp32(payload)
+        await _send_esp32_status(
+            self.connection_manager,
+            status="thinking",
+            device_id="ESP32_KORVO_2",
+            text=notice,
+        )
+        if self.config.proactive_voice_enabled and self.tts_model is not None:
+            logger.warning("AIoT proactive voice uses configured TTS model; keep disabled unless ESP32 voice policy allows it.")
+            await _send_single_tts_segment(self.tts_model, self.connection_manager.send_to_esp32, notice)
+        await self.connection_manager.send_to_esp32(
+            {
+                "type": "assistant_done",
+                "device_id": "ESP32_KORVO_2",
+                "text": notice,
+            }
+        )
 
     def _enqueue_memory_maintenance(self, session_id: str, reason: str) -> None:
         if not session_id:
@@ -2240,6 +2303,107 @@ class RobotRuntime:
                 error=str(exc),
             )
 
+    def _normalize_esp32_prefixed_command(self, command: str) -> str:
+        text = re.sub(r"\s+", " ", str(command or "")).strip()
+        lowered = text.lower()
+        compact = re.sub(r"\s+", "", lowered)
+        if not text:
+            return ""
+        if compact in {"拍照", "拍一张", "拍张照", "camera", "photo", "capture", "camera_capture"}:
+            return "camera_capture"
+        if compact in {"温湿度", "湿度", "温度", "环境", "环境状态", "传感器", "sensor", "env", "env_status", "humidity", "temperature"}:
+            return "env_status"
+        if compact in {"开灯", "打开灯", "打开房间灯", "房间灯开", "lighton", "light_on", "room_light_on", "lampon"}:
+            return "room_light_on"
+        if compact in {"关灯", "关闭灯", "关闭房间灯", "房间灯关", "lightoff", "light_off", "room_light_off", "lampoff"}:
+            return "room_light_off"
+        if compact in {"切换灯", "灯切换", "房间灯切换", "light", "lighttoggle", "light_toggle", "room_light_toggle"}:
+            return "room_light_toggle"
+        if compact in {"播放音乐", "放音乐", "开始播放音乐", "听歌", "播放歌曲", "music", "musicplay", "playmusic", "music_play", "mp3"}:
+            return "music_play"
+        if compact in {"停止音乐", "关闭音乐", "暂停音乐", "停止播放音乐", "stopmusic", "musicstop", "music_stop", "mp3stop"}:
+            return "music_stop"
+        if compact in {"下一首", "切歌", "换一首", "下一曲", "next", "nextsong", "musicnext", "music_next", "mp3next"}:
+            return "music_next"
+        if compact in {"开始对话", "连续对话", "打开连续对话", "chat", "chaton", "chat_start", "continuous_on"}:
+            return "chat_start"
+        if compact in {"停止对话", "关闭连续对话", "chatoff", "chat_stop", "continuous_off"}:
+            return "chat_stop"
+        if compact in {"唤醒开", "打开唤醒", "wakeon", "wake_on"}:
+            return "wake_on"
+        if compact in {"唤醒关", "关闭唤醒", "wakeoff", "wake_off"}:
+            return "wake_off"
+        if compact in {"唤醒切换", "wake", "wake_toggle"}:
+            return "wake_toggle"
+        if compact in {"测试播放", "播放测试", "play", "xiaole"}:
+            return "play"
+        if compact in {"停止", "停止播放", "stop"}:
+            return "stop"
+        if compact in {"音量+", "音量加", "加大音量", "vol+", "volumeup", "vol_up"}:
+            return "vol_up"
+        if compact in {"音量-", "音量减", "降低音量", "vol-", "volumedown", "vol_down"}:
+            return "vol_down"
+        if compact in {"状态", "afe状态", "afe_status", "status"}:
+            return "afe_status"
+        if lowered.startswith("说 "):
+            return f"ask {text[2:].strip()}"
+        if lowered.startswith("ask "):
+            return text
+        return text[:80]
+
+    def _normalize_esp32_voice_device_command(self, text: str) -> str:
+        normalized = re.sub(r"[，。！？,.!?]", "", str(text or "")).strip().lower()
+        compact = re.sub(r"\s+", "", normalized)
+        if not compact:
+            return ""
+        if any(marker in compact for marker in ("拍照", "拍张照", "拍一张", "照相")):
+            return "camera_capture"
+        if any(marker in compact for marker in ("温湿度", "湿度", "温度", "环境状态", "传感器状态")):
+            return "env_status"
+        if any(marker in compact for marker in ("开灯", "打开灯", "打开房间灯")):
+            return "room_light_on"
+        if any(marker in compact for marker in ("关灯", "关闭灯", "关闭房间灯")):
+            return "room_light_off"
+        if any(marker in compact for marker in ("切换灯", "灯切换")):
+            return "room_light_toggle"
+        if any(marker in compact for marker in ("下一首", "切歌", "换一首", "下一曲")) or compact in {"next", "nextsong"}:
+            return "music_next"
+        if "音乐" in compact or "歌曲" in compact or compact in {"听歌", "放歌", "music", "playmusic"}:
+            if any(marker in compact for marker in ("停止", "关闭", "暂停", "关掉", "不要放", "别放")):
+                return "music_stop"
+            if any(marker in compact for marker in ("播放", "开始", "放", "听", "来点", "来一首")):
+                return "music_play"
+        if compact in {"停止播放", "别放了", "暂停播放"}:
+            return "music_stop"
+        return ""
+
+    async def _run_esp32_prefixed_command(self, request: TextRequest, *, raw_command: str) -> None:
+        command = self._normalize_esp32_prefixed_command(raw_command)
+        if not command:
+            await self._send_qq_reply(request, "esp// 后面需要带命令，例如 esp// 拍照、esp// 开始对话。")
+            return
+        await self.connection_manager.send_to_esp32({"type": "device_command", "command": command})
+        self._trace(
+            "qq.esp32.command",
+            source=request.source,
+            user_id=request.user_id,
+            group_id=request.group_id,
+            raw_command=raw_command,
+            command=command,
+        )
+        extras = {
+            "camera_capture": "摄像头硬件接好后会执行拍摄；当前固件会返回摄像头状态。",
+            "env_status": "会读取 AHT20/SHT30 温湿度；未接传感器时会返回未就绪状态。",
+            "room_light_on": "会打开房间灯控制输出；当前先映射到 Korvo-2 板载 LED。",
+            "room_light_off": "会关闭房间灯控制输出；当前先映射到 Korvo-2 板载 LED。",
+            "room_light_toggle": "会切换房间灯控制输出；当前先映射到 Korvo-2 板载 LED。",
+            "music_play": "会播放 TF 卡 /music 目录下的 MP3。",
+            "music_stop": "会停止 TF 卡音乐。",
+            "music_next": "会切换到下一首 TF 卡音乐。",
+        }
+        extra = extras.get(command, "已送达 ESP32。")
+        await self._send_qq_reply(request, f"ESP32 命令：{command}\n{extra}")
+
     async def handle_napcat_payload(self, payload: dict[str, Any]) -> None:
         self._ensure_background_workers()
         if payload.get("meta_event_type") == "heartbeat":
@@ -2294,7 +2458,14 @@ class RobotRuntime:
         root_command = normalized_message[len("root/") :].strip() if normalized_message.startswith("root/") else ""
         direct_change_command = self._extract_change_command(normalized_message)
         root_change_command = self._extract_change_command(root_command) if root_command else None
-        if root_change_command is not None:
+        if lowered_message.startswith("esp//"):
+            self._track_task(
+                self._run_esp32_prefixed_command(request, raw_command=normalized_message[5:].strip()),
+                task_type="esp32.qq_command",
+                source=request.source,
+                metadata={"user_id": request.user_id},
+            )
+        elif root_change_command is not None:
             self._track_task(
                 self._run_change_command(request, command_override=root_change_command),
                 task_type="change.command",
@@ -2980,6 +3151,7 @@ class RobotRuntime:
         final_asr = ""
         assistant_text_parts: list[str] = []
         sent_dialog_statuses: set[str] = set()
+        dialog_device_command = ""
 
         async def send_dialog_status_once(status: str, text: str = "") -> None:
             if status in sent_dialog_statuses:
@@ -3083,22 +3255,45 @@ class RobotRuntime:
                         if text:
                             final_asr = text
                             if not bool(results[0].get("is_interim")):
+                                command = self._normalize_esp32_voice_device_command(text)
+                                if command and not dialog_device_command:
+                                    dialog_device_command = command
+                                    await self.connection_manager.send_to_esp32({"type": "device_command", "command": command})
+                                    self._trace(
+                                        "esp32.voice.device_command",
+                                        source="ESP32",
+                                        device_id=device_id,
+                                        session_id=session_id,
+                                        transcript=text,
+                                        command=command,
+                                    )
+                                    await send_dialog_status_once("device", "已执行本地音乐控制。")
                                 await send_dialog_status_once("thinking", text[:120])
                 elif event.event == EVENT_ASR_ENDED:
                     await send_dialog_status_once("thinking", final_asr or "正在思考。")
                 elif event.event == EVENT_TTS_SENTENCE_START:
+                    if dialog_device_command:
+                        continue
                     await send_dialog_status_once("tts", "豆包实时合成中。")
                 elif event.event == EVENT_CHAT_RESPONSE and isinstance(payload, dict):
+                    if dialog_device_command:
+                        continue
                     content = str(payload.get("content") or "")
                     if content:
                         assistant_text_parts.append(content)
                 elif event.event == EVENT_TTS_RESPONSE:
+                    if dialog_device_command:
+                        continue
                     if isinstance(event.payload, (bytes, bytearray)):
                         audio_pcm_buffer.extend(bytes(event.payload))
                         await flush_dialog_audio()
                 elif event.event == EVENT_TTS_SENTENCE_END:
+                    if dialog_device_command:
+                        continue
                     await flush_dialog_audio(final=True)
                 elif event.event == EVENT_CHAT_ENDED:
+                    if dialog_device_command:
+                        continue
                     final_reply = "".join(assistant_text_parts).strip()
                     if final_reply:
                         await self.connection_manager.send_to_esp32(
@@ -3110,6 +3305,8 @@ class RobotRuntime:
                             }
                         )
                 elif event.event == EVENT_TTS_ENDED:
+                    if dialog_device_command:
+                        continue
                     await flush_dialog_audio(final=True)
                     if debug_pcm_chunks:
                         _save_tts_debug_wav(
@@ -3184,14 +3381,14 @@ class RobotRuntime:
                 session_id=self._session_id_for("ESP32", device_id=device_id),
                 source="ESP32",
                 user_text=final_asr or "[voice]",
-                assistant_text=final_reply or "",
+                assistant_text=final_reply or (f"[device_command:{dialog_device_command}]" if dialog_device_command else ""),
             )
         await _send_esp32_status(
             self.connection_manager,
             status=self._esp32_ready_status(device_id),
             device_id=device_id,
             session_id=session_id,
-            text=final_reply or final_asr,
+            text=("已执行本地音乐控制。" if dialog_device_command else (final_reply or final_asr)),
         )
         self._trace(
             "dialog.done",
@@ -3200,6 +3397,7 @@ class RobotRuntime:
             session_id=session_id,
             transcript=final_asr,
             assistant_text=final_reply,
+            device_command=dialog_device_command,
         )
         return True
 

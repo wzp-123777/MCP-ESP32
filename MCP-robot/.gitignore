@@ -1,4 +1,7 @@
 local_keys.py
 __pycache__/
+**/__pycache__/
+*.pyc
 venv/
 data/
+debug_logs/

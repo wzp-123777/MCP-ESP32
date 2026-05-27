@@ -17,6 +17,7 @@
 #include "esp_peripherals.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -25,14 +26,14 @@
 
 #define UI_W LCD_H_RES
 #define UI_H LCD_V_RES
-#define UI_DRAW_LINES 40
+#define UI_DRAW_LINES 20
 #define UI_LEVEL_REFRESH_MS 200
 #define UI_LOOP_INTERVAL_MS 50
 #define UI_RENDER_INTERVAL_MS 300
 #define UI_CLOCK_REFRESH_MS 1000
 #define UI_MCP_OFFLINE_TIMEOUT_MS 45000
 #define UI_LVGL_TICK_MS 5
-#define UI_PAGE_COUNT 4
+#define UI_PAGE_COUNT 6
 #define UI_ACTION_QUEUE_LEN 8
 #define UI_TOUCH_I2C_CLK 100000
 #define UI_TOUCH_TT21100_ADDR 0x24
@@ -56,6 +57,8 @@
 #define UI_TOUCH_MIRROR_X 0
 #define UI_TOUCH_MIRROR_Y 0
 #define UI_HEARTBEAT_INTERVAL_MS 5000
+#define UI_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define UI_QUEUE_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 #define UI_BG_COLOR 0xFFEAF5
 #define UI_PANEL_COLOR 0xFFF8FC
@@ -113,6 +116,13 @@ static char s_mcp_status[48] = "MCP NOT CONFIGURED";
 static char s_recent_text[128] = "";
 static char s_persona_label[64] = "默认人设";
 static char s_voice_profile_label[64] = "默认音色";
+static char s_weather_title[80] = "天津东丽 天气待更新";
+static char s_weather_detail[96] = "等待服务器天气扫描";
+static char s_weather_alert[96] = "";
+static char s_calendar_title[96] = "日历待更新";
+static char s_calendar_detail[96] = "等待日期/日程";
+static char s_reminder_text[96] = "";
+static char s_dashboard_updated_at[24] = "";
 static int s_volume = 85;
 static bool s_chat_continuous;
 static bool s_wake_enabled;
@@ -152,6 +162,15 @@ static lv_obj_t *s_talk_button_label;
 static lv_obj_t *s_chat_in_label;
 static lv_obj_t *s_chat_out_label;
 static lv_obj_t *s_chat_system_label;
+
+static lv_obj_t *s_weather_title_label;
+static lv_obj_t *s_weather_detail_label;
+static lv_obj_t *s_weather_alert_label;
+static lv_obj_t *s_weather_update_label;
+static lv_obj_t *s_calendar_title_label;
+static lv_obj_t *s_calendar_detail_label;
+static lv_obj_t *s_calendar_reminder_label;
+static lv_obj_t *s_calendar_update_label;
 
 static lv_obj_t *s_net_wifi_label;
 static lv_obj_t *s_net_mcp_label;
@@ -229,10 +248,14 @@ static const char *page_title(uint8_t page)
 {
     switch (page) {
         case 1:
-            return "网络";
+            return "天气";
         case 2:
-            return "设置";
+            return "日历";
         case 3:
+            return "网络";
+        case 4:
+            return "设置";
+        case 5:
             return "调试";
         case 0:
         default:
@@ -884,7 +907,13 @@ static void start_touch_task(void)
     if (!s_touch_ready || s_touch_task_handle) {
         return;
     }
-    BaseType_t ok = xTaskCreate(touch_poll_task, "ui_touch", 3072, NULL, 1, &s_touch_task_handle);
+    BaseType_t ok = xTaskCreateWithCaps(touch_poll_task,
+                                        "ui_touch",
+                                        3072,
+                                        NULL,
+                                        1,
+                                        &s_touch_task_handle,
+                                        UI_TASK_STACK_CAPS);
     if (ok != pdPASS) {
         s_touch_task_handle = NULL;
         ESP_LOGW(TAG, "touch poll task start failed");
@@ -1337,6 +1366,56 @@ static void create_network_page(lv_obj_t *page)
                         (void *)(uintptr_t)APP_UI_ACTION_MCP_DISCONNECT);
 }
 
+static void create_weather_page(lv_obj_t *page)
+{
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "天气");
+    lv_obj_set_pos(title, 42, 44);
+
+    lv_obj_t *main_card = make_card(page, 18, 76, UI_W - 36, 54);
+    s_weather_title_label = make_label(main_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_size(s_weather_title_label, UI_W - 54, 20);
+    lv_obj_align(s_weather_title_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    s_weather_detail_label = make_label(main_card, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
+    lv_obj_set_size(s_weather_detail_label, UI_W - 54, 18);
+    lv_obj_align(s_weather_detail_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    lv_obj_t *alert_card = make_card(page, 18, 138, UI_W - 36, 50);
+    s_weather_alert_label = make_label(alert_card, UI_FONT_TEXT, lv_color_hex(UI_ACCENT_COLOR));
+    lv_obj_set_size(s_weather_alert_label, UI_W - 54, 34);
+    lv_obj_align(s_weather_alert_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    s_weather_update_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
+    lv_obj_set_size(s_weather_update_label, UI_W - 60, 18);
+    lv_obj_set_pos(s_weather_update_label, 42, 208);
+    lv_obj_set_style_text_align(s_weather_update_label, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+static void create_calendar_page(lv_obj_t *page)
+{
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "日历");
+    lv_obj_set_pos(title, 42, 44);
+
+    lv_obj_t *event_card = make_card(page, 18, 76, UI_W - 36, 64);
+    s_calendar_title_label = make_label(event_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_size(s_calendar_title_label, UI_W - 54, 22);
+    lv_obj_align(s_calendar_title_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    s_calendar_detail_label = make_label(event_card, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
+    lv_obj_set_size(s_calendar_detail_label, UI_W - 54, 22);
+    lv_obj_align(s_calendar_detail_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    lv_obj_t *reminder_card = make_card(page, 18, 150, UI_W - 36, 44);
+    s_calendar_reminder_label = make_label(reminder_card, UI_FONT_TEXT, lv_color_hex(UI_ACCENT_COLOR));
+    lv_obj_set_size(s_calendar_reminder_label, UI_W - 54, 28);
+    lv_obj_align(s_calendar_reminder_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    s_calendar_update_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
+    lv_obj_set_size(s_calendar_update_label, UI_W - 60, 18);
+    lv_obj_set_pos(s_calendar_update_label, 42, 208);
+    lv_obj_set_style_text_align(s_calendar_update_label, LV_TEXT_ALIGN_CENTER, 0);
+}
+
 static void create_settings_page(lv_obj_t *page)
 {
     lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
@@ -1443,9 +1522,11 @@ static void create_ui_objects(void)
         lv_obj_add_event_cb(s_pages[i], screen_gesture_cb, LV_EVENT_GESTURE, NULL);
     }
     create_home_page(s_pages[0]);
-    create_network_page(s_pages[1]);
-    create_settings_page(s_pages[2]);
-    create_debug_page(s_pages[3]);
+    create_weather_page(s_pages[1]);
+    create_calendar_page(s_pages[2]);
+    create_network_page(s_pages[3]);
+    create_settings_page(s_pages[4]);
+    create_debug_page(s_pages[5]);
 
     create_top_bar(screen);
     make_nav_button(screen, 4, "<", -1);
@@ -1495,12 +1576,28 @@ static void apply_ui_locked(void)
                               0);
 
     if (s_page == 1) {
+        lv_label_set_text(s_weather_title_label, s_weather_title);
+        lv_label_set_text(s_weather_detail_label, s_weather_detail);
+        lv_label_set_text(s_weather_alert_label, s_weather_alert[0] ? s_weather_alert : "暂无天气提醒");
+        lv_label_set_text_fmt(s_weather_update_label, "更新：%s",
+                              s_dashboard_updated_at[0] ? s_dashboard_updated_at : "等待");
+    }
+
+    if (s_page == 2) {
+        lv_label_set_text(s_calendar_title_label, s_calendar_title);
+        lv_label_set_text(s_calendar_detail_label, s_calendar_detail);
+        lv_label_set_text(s_calendar_reminder_label, s_reminder_text[0] ? s_reminder_text : "暂无主动提醒");
+        lv_label_set_text_fmt(s_calendar_update_label, "更新：%s",
+                              s_dashboard_updated_at[0] ? s_dashboard_updated_at : "等待");
+    }
+
+    if (s_page == 3) {
         lv_label_set_text_fmt(s_net_wifi_label, "Wi-Fi：%s", s_wifi_connected ? "已连接" : "连接中或离线");
         lv_label_set_text_fmt(s_net_mcp_label, "MCP：%s", mcp_status_zh(s_mcp_status));
         lv_label_set_text(s_net_endpoint_label, "地址：app_config.h 配置");
     }
 
-    if (s_page == 2) {
+    if (s_page == 4) {
         char profile_text[96];
         join_text2(profile_text, sizeof(profile_text), "人设：", s_persona_label);
         lv_label_set_text(s_set_persona_label, profile_text);
@@ -1512,7 +1609,7 @@ static void apply_ui_locked(void)
         lv_label_set_text_fmt(s_set_wake_label, "唤醒：%s  Hi ESP", s_wake_enabled ? "开启" : "关闭");
     }
 
-    if (s_page == 3) {
+    if (s_page == 5) {
         lv_label_set_text_fmt(s_dbg_network_label, "%s / %s", s_wifi_connected ? "Wi-Fi 正常" : "Wi-Fi 断开",
                               s_mcp_connected ? "MCP 正常" : "MCP 断开");
         lv_label_set_text_fmt(s_dbg_audio_label, "16k / 16bit / 单声道 / 音量%02d", s_volume);
@@ -1682,7 +1779,7 @@ esp_err_t app_ui_init(void)
     if (!s_lock) {
         return ESP_ERR_NO_MEM;
     }
-    s_action_queue = xQueueCreate(UI_ACTION_QUEUE_LEN, sizeof(app_ui_action_t));
+    s_action_queue = xQueueCreateWithCaps(UI_ACTION_QUEUE_LEN, sizeof(app_ui_action_t), UI_QUEUE_CAPS);
     if (!s_action_queue) {
         return ESP_ERR_NO_MEM;
     }
@@ -1733,8 +1830,11 @@ esp_err_t app_ui_init(void)
     s_dirty = true;
     s_page_dirty = true;
     s_clock_dirty = true;
-    xTaskCreate(ui_task, "app_ui", 4096, NULL, 2, NULL);
-    xTaskCreate(action_dispatch_task, "ui_actions", 4096, NULL, 2, NULL);
+    if (xTaskCreateWithCaps(ui_task, "app_ui", 4096, NULL, 2, NULL, UI_TASK_STACK_CAPS) != pdPASS ||
+        xTaskCreateWithCaps(action_dispatch_task, "ui_actions", 4096, NULL, 2, NULL, UI_TASK_STACK_CAPS) != pdPASS) {
+        ESP_LOGE(TAG, "ui task create failed");
+        return ESP_ERR_NO_MEM;
+    }
     ESP_LOGI(TAG, "ready using LVGL %dx%d, page UI, touch=%s", UI_W, UI_H, s_touch_ready ? "yes" : "no");
     return ESP_OK;
 }
@@ -1910,6 +2010,33 @@ void app_ui_set_voice_profile(const char *label)
         copy_limited_text(s_voice_profile_label, sizeof(s_voice_profile_label), label);
         if (s_voice_profile_label[0] == '\0') {
             strlcpy(s_voice_profile_label, "默认音色", sizeof(s_voice_profile_label));
+        }
+        mark_dirty();
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void app_ui_set_dashboard(const char *weather_title,
+                          const char *weather_detail,
+                          const char *weather_alert,
+                          const char *calendar_title,
+                          const char *calendar_detail,
+                          const char *reminder_text,
+                          const char *updated_at)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        copy_limited_text(s_weather_title, sizeof(s_weather_title), weather_title);
+        copy_limited_text(s_weather_detail, sizeof(s_weather_detail), weather_detail);
+        copy_limited_text(s_weather_alert, sizeof(s_weather_alert), weather_alert);
+        copy_limited_text(s_calendar_title, sizeof(s_calendar_title), calendar_title);
+        copy_limited_text(s_calendar_detail, sizeof(s_calendar_detail), calendar_detail);
+        copy_limited_text(s_reminder_text, sizeof(s_reminder_text), reminder_text);
+        copy_limited_text(s_dashboard_updated_at, sizeof(s_dashboard_updated_at), updated_at);
+        if (s_weather_title[0] == '\0') {
+            strlcpy(s_weather_title, "天津东丽 天气待更新", sizeof(s_weather_title));
+        }
+        if (s_calendar_title[0] == '\0') {
+            strlcpy(s_calendar_title, "日历待更新", sizeof(s_calendar_title));
         }
         mark_dirty();
         xSemaphoreGive(s_lock);

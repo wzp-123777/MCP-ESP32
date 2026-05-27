@@ -52,5 +52,12 @@ void app_ui_set_chat_continuous(bool enabled);
 void app_ui_set_wake_enabled(bool enabled);
 void app_ui_set_persona(const char *label);
 void app_ui_set_voice_profile(const char *label);
+void app_ui_set_dashboard(const char *weather_title,
+                          const char *weather_detail,
+                          const char *weather_alert,
+                          const char *calendar_title,
+                          const char *calendar_detail,
+                          const char *reminder_text,
+                          const char *updated_at);
 void app_ui_next_page(void);
 void app_ui_prev_page(void);
