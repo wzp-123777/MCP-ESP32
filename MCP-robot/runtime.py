@@ -265,6 +265,25 @@ def _condition_esp32_dialog_input_pcm(
     }
 
 
+def _is_low_confidence_esp32_dialog_input(
+    *,
+    audio_source: str,
+    duration_ms: int,
+    audio_stats: dict[str, float | int],
+) -> bool:
+    source = str(audio_source or "").strip().lower()
+    if "continuous" not in source:
+        return False
+    if _ESP32_DIALOG_LOW_CONFIDENCE_MAX_MS > 0 and duration_ms > _ESP32_DIALOG_LOW_CONFIDENCE_MAX_MS:
+        return False
+    rms = float(audio_stats.get("rms") or 0.0)
+    peak = int(audio_stats.get("peak") or 0)
+    return (
+        rms <= _ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_RMS
+        and peak <= _ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_PEAK
+    )
+
+
 _TTS_AUDIO_B64_CHUNK_CHARS = 4096
 _TTS_AUDIO_CHUNK_DELAY_SECONDS = 0.005
 _TTS_STRONG_PUNCT_MIN_CHARS = 2
@@ -277,6 +296,9 @@ _ESP32_TTS_SOFT_LIMIT = 26000
 _DIALOG_TTS_TARGET_PEAK = 14000
 _DIALOG_TTS_MAX_GAIN = 8.0
 _ESP32_DIALOG_MIN_RMS = float(os.getenv("ESP32_DIALOG_MIN_RMS", "28"))
+_ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_RMS = float(os.getenv("ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_RMS", "260"))
+_ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_PEAK = int(os.getenv("ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_PEAK", "2400"))
+_ESP32_DIALOG_LOW_CONFIDENCE_MAX_MS = int(os.getenv("ESP32_DIALOG_LOW_CONFIDENCE_MAX_MS", "4500"))
 _ESP32_DIALOG_INPUT_TARGET_RMS = float(os.getenv("ESP32_DIALOG_INPUT_TARGET_RMS", "1000"))
 _ESP32_DIALOG_INPUT_TARGET_PEAK = int(os.getenv("ESP32_DIALOG_INPUT_TARGET_PEAK", "16000"))
 _ESP32_DIALOG_INPUT_MAX_GAIN = float(os.getenv("ESP32_DIALOG_INPUT_MAX_GAIN", "8"))
@@ -3082,6 +3104,40 @@ class RobotRuntime:
                     device_id=device_id,
                     session_id=session_id,
                     text="这段录音没有检测到清楚人声。",
+                )
+                return True
+            if _is_low_confidence_esp32_dialog_input(
+                audio_source=audio_source,
+                duration_ms=duration_ms,
+                audio_stats=source_audio_stats,
+            ):
+                logger.info(
+                    "ESP32 dialog low-confidence continuous audio skipped before Doubao: session=%s source=%s "
+                    "duration=%dms source_rms=%.2f source_peak=%d limit_rms=%.2f limit_peak=%d",
+                    session_id,
+                    audio_source or "",
+                    duration_ms,
+                    float(source_audio_stats.get("rms") or 0.0),
+                    int(source_audio_stats.get("peak") or 0),
+                    _ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_RMS,
+                    _ESP32_DIALOG_LOW_CONFIDENCE_SOURCE_PEAK,
+                )
+                self._trace(
+                    "dialog.low_confidence_drop",
+                    source="ESP32",
+                    device_id=device_id,
+                    session_id=session_id,
+                    audio_source=audio_source,
+                    duration_ms=duration_ms,
+                    audio_peak_source=source_audio_stats["peak"],
+                    audio_rms_source=round(float(source_audio_stats["rms"]), 2),
+                )
+                await _send_esp32_status(
+                    self.connection_manager,
+                    status=self._esp32_ready_status(device_id),
+                    device_id=device_id,
+                    session_id=session_id,
+                    text="刚刚没听清，靠近一点再说。",
                 )
                 return True
             pcm16, raw_audio_stats, audio_stats, dialog_input_gain = _normalize_esp32_dialog_input_pcm(pcm16)
