@@ -2343,10 +2343,16 @@ class RobotRuntime:
             return "room_light_toggle"
         if compact in {"播放音乐", "放音乐", "开始播放音乐", "听歌", "播放歌曲", "music", "musicplay", "playmusic", "music_play", "mp3"}:
             return "music_play"
-        if compact in {"停止音乐", "关闭音乐", "暂停音乐", "停止播放音乐", "stopmusic", "musicstop", "music_stop", "mp3stop"}:
+        if compact in {"暂停音乐", "暂停播放", "musicpause", "pausemusic", "music_pause", "mp3pause"}:
+            return "music_toggle"
+        if compact in {"停止音乐", "关闭音乐", "停止播放音乐", "stopmusic", "musicstop", "music_stop", "mp3stop"}:
             return "music_stop"
         if compact in {"下一首", "切歌", "换一首", "下一曲", "next", "nextsong", "musicnext", "music_next", "mp3next"}:
             return "music_next"
+        if compact in {"上一首", "上一曲", "上首歌", "previous", "prev", "prevsong", "previoussong", "musicprev", "music_prev", "mp3prev"}:
+            return "music_prev"
+        if compact in {"扫描音乐", "刷新音乐", "扫描歌曲", "刷新歌单", "musicrefresh", "music_refresh", "musicscan", "music_scan", "mp3scan"}:
+            return "music_refresh"
         if compact in {"开始对话", "连续对话", "打开连续对话", "chat", "chaton", "chat_start", "continuous_on"}:
             return "chat_start"
         if compact in {"停止对话", "关闭连续对话", "chatoff", "chat_stop", "continuous_off"}:
@@ -2390,13 +2396,19 @@ class RobotRuntime:
             return "room_light_toggle"
         if any(marker in compact for marker in ("下一首", "切歌", "换一首", "下一曲")) or compact in {"next", "nextsong"}:
             return "music_next"
+        if any(marker in compact for marker in ("上一首", "上一曲", "上首歌")) or compact in {"prev", "previous", "prevsong"}:
+            return "music_prev"
+        if any(marker in compact for marker in ("扫描音乐", "刷新音乐", "扫描歌曲", "刷新歌单")):
+            return "music_refresh"
         if "音乐" in compact or "歌曲" in compact or compact in {"听歌", "放歌", "music", "playmusic"}:
-            if any(marker in compact for marker in ("停止", "关闭", "暂停", "关掉", "不要放", "别放")):
+            if any(marker in compact for marker in ("暂停",)):
+                return "music_toggle"
+            if any(marker in compact for marker in ("停止", "关闭", "关掉", "不要放", "别放")):
                 return "music_stop"
             if any(marker in compact for marker in ("播放", "开始", "放", "听", "来点", "来一首")):
                 return "music_play"
         if compact in {"停止播放", "别放了", "暂停播放"}:
-            return "music_stop"
+            return "music_toggle" if "暂停" in compact else "music_stop"
         return ""
 
     async def _run_esp32_prefixed_command(self, request: TextRequest, *, raw_command: str) -> None:
@@ -2419,9 +2431,12 @@ class RobotRuntime:
             "room_light_on": "会打开房间灯控制输出；当前先映射到 Korvo-2 板载 LED。",
             "room_light_off": "会关闭房间灯控制输出；当前先映射到 Korvo-2 板载 LED。",
             "room_light_toggle": "会切换房间灯控制输出；当前先映射到 Korvo-2 板载 LED。",
-            "music_play": "会播放 TF 卡 /music 目录下的 MP3。",
+            "music_play": "会播放 TF 卡 /music 目录下的 16k 单声道 WAV/PCM。",
             "music_stop": "会停止 TF 卡音乐。",
+            "music_toggle": "会在播放和暂停 TF 卡音乐之间切换。",
             "music_next": "会切换到下一首 TF 卡音乐。",
+            "music_prev": "会切换到上一首 TF 卡音乐。",
+            "music_refresh": "会重新扫描 TF 卡 WAV/PCM 歌单。",
         }
         extra = extras.get(command, "已送达 ESP32。")
         await self._send_qq_reply(request, f"ESP32 命令：{command}\n{extra}")

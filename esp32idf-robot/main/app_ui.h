@@ -30,6 +30,10 @@ typedef enum {
     APP_UI_ACTION_WAKE_TOGGLE,
     APP_UI_ACTION_PERSONA_NEXT,
     APP_UI_ACTION_VOICE_NEXT,
+    APP_UI_ACTION_MUSIC_PREV,
+    APP_UI_ACTION_MUSIC_TOGGLE,
+    APP_UI_ACTION_MUSIC_NEXT,
+    APP_UI_ACTION_MUSIC_REFRESH,
 } app_ui_action_t;
 
 typedef void (*app_ui_action_cb_t)(app_ui_action_t action, void *ctx);
@@ -59,5 +63,13 @@ void app_ui_set_dashboard(const char *weather_title,
                           const char *calendar_detail,
                           const char *reminder_text,
                           const char *updated_at);
+void app_ui_set_music_state(bool playing,
+                            const char *title,
+                            const char *status,
+                            int track_index,
+                            int track_count,
+                            const char *line1,
+                            const char *line2,
+                            const char *line3);
 void app_ui_next_page(void);
 void app_ui_prev_page(void);

@@ -33,7 +33,7 @@
 #define UI_CLOCK_REFRESH_MS 1000
 #define UI_MCP_OFFLINE_TIMEOUT_MS 45000
 #define UI_LVGL_TICK_MS 5
-#define UI_PAGE_COUNT 6
+#define UI_PAGE_COUNT 7
 #define UI_ACTION_QUEUE_LEN 8
 #define UI_TOUCH_I2C_CLK 100000
 #define UI_TOUCH_TT21100_ADDR 0x24
@@ -123,6 +123,12 @@ static char s_calendar_title[96] = "日历待更新";
 static char s_calendar_detail[96] = "等待日期/日程";
 static char s_reminder_text[96] = "";
 static char s_dashboard_updated_at[24] = "";
+static bool s_music_playing;
+static char s_music_title[80] = "等待扫描 TF 卡";
+static char s_music_status[80] = "MUSIC READY";
+static char s_music_list[3][80] = {"把 WAV/PCM 放到 /music", "", ""};
+static int s_music_track_index;
+static int s_music_track_count;
 static int s_volume = 85;
 static bool s_chat_continuous;
 static bool s_wake_enabled;
@@ -171,6 +177,13 @@ static lv_obj_t *s_calendar_title_label;
 static lv_obj_t *s_calendar_detail_label;
 static lv_obj_t *s_calendar_reminder_label;
 static lv_obj_t *s_calendar_update_label;
+
+static lv_obj_t *s_music_title_label;
+static lv_obj_t *s_music_status_label;
+static lv_obj_t *s_music_count_label;
+static lv_obj_t *s_music_list_labels[3];
+static lv_obj_t *s_music_toggle_button;
+static lv_obj_t *s_music_toggle_label;
 
 static lv_obj_t *s_net_wifi_label;
 static lv_obj_t *s_net_mcp_label;
@@ -252,10 +265,12 @@ static const char *page_title(uint8_t page)
         case 2:
             return "日历";
         case 3:
-            return "网络";
+            return "音乐";
         case 4:
-            return "设置";
+            return "网络";
         case 5:
+            return "设置";
+        case 6:
             return "调试";
         case 0:
         default:
@@ -342,6 +357,27 @@ static const char *voice_state_zh(const char *state)
     }
     if (strcmp(state, "VOICE STOP") == 0) {
         return "播放停止";
+    }
+    if (strcmp(state, "MUSIC PLAY") == 0) {
+        return "音乐播放";
+    }
+    if (strcmp(state, "MUSIC STOP") == 0) {
+        return "音乐暂停";
+    }
+    if (strcmp(state, "MUSIC PAUSE") == 0) {
+        return "音乐暂停";
+    }
+    if (strcmp(state, "MUSIC NEXT") == 0) {
+        return "下一首";
+    }
+    if (strcmp(state, "MUSIC PREV") == 0) {
+        return "上一首";
+    }
+    if (strcmp(state, "MUSIC ERR") == 0) {
+        return "音乐错误";
+    }
+    if (strcmp(state, "MUSIC SCAN") == 0) {
+        return "扫描歌曲";
     }
     if (strcmp(state, "BT DISABLED") == 0) {
         return "蓝牙未启用";
@@ -1416,6 +1452,49 @@ static void create_calendar_page(lv_obj_t *page)
     lv_obj_set_style_text_align(s_calendar_update_label, LV_TEXT_ALIGN_CENTER, 0);
 }
 
+static void create_music_page(lv_obj_t *page)
+{
+    lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_label_set_text(title, "音乐");
+    lv_obj_set_pos(title, 42, 44);
+
+    s_music_count_label = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
+    lv_obj_set_size(s_music_count_label, 120, 18);
+    lv_obj_set_pos(s_music_count_label, UI_W - 160, 44);
+    lv_obj_set_style_text_align(s_music_count_label, LV_TEXT_ALIGN_RIGHT, 0);
+
+    lv_obj_t *now_card = make_card(page, 18, 76, UI_W - 36, 54);
+    s_music_title_label = make_label(now_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_set_size(s_music_title_label, UI_W - 54, 22);
+    lv_obj_align(s_music_title_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    s_music_status_label = make_label(now_card, UI_FONT_TEXT, lv_color_hex(UI_ACCENT_COLOR));
+    lv_obj_set_size(s_music_status_label, UI_W - 54, 18);
+    lv_obj_align(s_music_status_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    lv_obj_t *list_card = make_card(page, 18, 136, UI_W - 36, 56);
+    for (int i = 0; i < 3; ++i) {
+        s_music_list_labels[i] = make_label(list_card, UI_FONT_TEXT,
+                                            i == 0 ? lv_color_hex(UI_TEXT_COLOR) : lv_color_hex(UI_MUTED_COLOR));
+        lv_obj_set_size(s_music_list_labels[i], UI_W - 54, 16);
+        lv_obj_set_pos(s_music_list_labels[i], 0, i * 16);
+    }
+
+    make_action_button(page, 18, 202, 64, 32, "上一", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_MUSIC_PREV);
+    s_music_toggle_button = make_text_button(page,
+                                            88,
+                                            202,
+                                            70,
+                                            32,
+                                            "播放",
+                                            lv_color_hex(UI_ACCENT_SOFT_COLOR),
+                                            lv_color_hex(UI_TEXT_COLOR));
+    lv_obj_add_event_cb(s_music_toggle_button, action_button_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)APP_UI_ACTION_MUSIC_TOGGLE);
+    s_music_toggle_label = lv_obj_get_child(s_music_toggle_button, 0);
+    make_action_button(page, 164, 202, 64, 32, "下一", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_MUSIC_NEXT);
+    make_action_button(page, 234, 202, 68, 32, "扫描", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_MUSIC_REFRESH);
+}
+
 static void create_settings_page(lv_obj_t *page)
 {
     lv_obj_t *title = make_label(page, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
@@ -1524,9 +1603,10 @@ static void create_ui_objects(void)
     create_home_page(s_pages[0]);
     create_weather_page(s_pages[1]);
     create_calendar_page(s_pages[2]);
-    create_network_page(s_pages[3]);
-    create_settings_page(s_pages[4]);
-    create_debug_page(s_pages[5]);
+    create_music_page(s_pages[3]);
+    create_network_page(s_pages[4]);
+    create_settings_page(s_pages[5]);
+    create_debug_page(s_pages[6]);
 
     create_top_bar(screen);
     make_nav_button(screen, 4, "<", -1);
@@ -1592,12 +1672,36 @@ static void apply_ui_locked(void)
     }
 
     if (s_page == 3) {
+        lv_label_set_text(s_music_title_label, s_music_title);
+        lv_label_set_text(s_music_status_label, s_music_status);
+        if (s_music_track_count > 0) {
+            lv_label_set_text_fmt(s_music_count_label,
+                                  "%02d/%02d",
+                                  s_music_track_index + 1,
+                                  s_music_track_count);
+        } else {
+            lv_label_set_text(s_music_count_label, "0 首");
+        }
+        for (int i = 0; i < 3; ++i) {
+            lv_label_set_text(s_music_list_labels[i], s_music_list[i]);
+            lv_obj_set_style_text_color(s_music_list_labels[i],
+                                        s_music_list[i][0] == '>' ? lv_color_hex(UI_ACCENT_COLOR)
+                                                                  : lv_color_hex(UI_MUTED_COLOR),
+                                        0);
+        }
+        lv_label_set_text(s_music_toggle_label, s_music_playing ? "暂停" : "播放");
+        lv_obj_set_style_bg_color(s_music_toggle_button,
+                                  s_music_playing ? lv_color_hex(UI_OK_COLOR) : lv_color_hex(UI_ACCENT_SOFT_COLOR),
+                                  0);
+    }
+
+    if (s_page == 4) {
         lv_label_set_text_fmt(s_net_wifi_label, "Wi-Fi：%s", s_wifi_connected ? "已连接" : "连接中或离线");
         lv_label_set_text_fmt(s_net_mcp_label, "MCP：%s", mcp_status_zh(s_mcp_status));
         lv_label_set_text(s_net_endpoint_label, "地址：app_config.h 配置");
     }
 
-    if (s_page == 4) {
+    if (s_page == 5) {
         char profile_text[96];
         join_text2(profile_text, sizeof(profile_text), "人设：", s_persona_label);
         lv_label_set_text(s_set_persona_label, profile_text);
@@ -1609,7 +1713,7 @@ static void apply_ui_locked(void)
         lv_label_set_text_fmt(s_set_wake_label, "唤醒：%s  Hi ESP", s_wake_enabled ? "开启" : "关闭");
     }
 
-    if (s_page == 5) {
+    if (s_page == 6) {
         lv_label_set_text_fmt(s_dbg_network_label, "%s / %s", s_wifi_connected ? "Wi-Fi 正常" : "Wi-Fi 断开",
                               s_mcp_connected ? "MCP 正常" : "MCP 断开");
         lv_label_set_text_fmt(s_dbg_audio_label, "16k / 16bit / 单声道 / 音量%02d", s_volume);
@@ -1665,6 +1769,14 @@ static const char *action_name(app_ui_action_t action)
             return "persona_next";
         case APP_UI_ACTION_VOICE_NEXT:
             return "voice_next";
+        case APP_UI_ACTION_MUSIC_PREV:
+            return "music_prev";
+        case APP_UI_ACTION_MUSIC_TOGGLE:
+            return "music_toggle";
+        case APP_UI_ACTION_MUSIC_NEXT:
+            return "music_next";
+        case APP_UI_ACTION_MUSIC_REFRESH:
+            return "music_refresh";
         default:
             return "unknown";
     }
@@ -2037,6 +2149,42 @@ void app_ui_set_dashboard(const char *weather_title,
         }
         if (s_calendar_title[0] == '\0') {
             strlcpy(s_calendar_title, "日历待更新", sizeof(s_calendar_title));
+        }
+        mark_dirty();
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void app_ui_set_music_state(bool playing,
+                            const char *title,
+                            const char *status,
+                            int track_index,
+                            int track_count,
+                            const char *line1,
+                            const char *line2,
+                            const char *line3)
+{
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_music_playing = playing;
+        copy_limited_text(s_music_title, sizeof(s_music_title), title);
+        copy_limited_text(s_music_status, sizeof(s_music_status), status);
+        copy_limited_text(s_music_list[0], sizeof(s_music_list[0]), line1);
+        copy_limited_text(s_music_list[1], sizeof(s_music_list[1]), line2);
+        copy_limited_text(s_music_list[2], sizeof(s_music_list[2]), line3);
+        if (s_music_title[0] == '\0') {
+            strlcpy(s_music_title, "等待扫描 TF 卡", sizeof(s_music_title));
+        }
+        if (s_music_status[0] == '\0') {
+            strlcpy(s_music_status, "MUSIC READY", sizeof(s_music_status));
+        }
+        if (s_music_list[0][0] == '\0') {
+            strlcpy(s_music_list[0], "把 WAV/PCM 放到 /music", sizeof(s_music_list[0]));
+        }
+        s_music_track_count = track_count > 0 ? track_count : 0;
+        if (s_music_track_count > 0 && track_index >= 0 && track_index < s_music_track_count) {
+            s_music_track_index = track_index;
+        } else {
+            s_music_track_index = 0;
         }
         mark_dirty();
         xSemaphoreGive(s_lock);

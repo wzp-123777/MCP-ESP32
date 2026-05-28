@@ -39,12 +39,12 @@
 #define CONT_VAD_STOP_PEAK 1400
 #define CONT_VAD_START_HITS 6
 #define CONT_VAD_SILENCE_HITS 3
-#define CONT_VAD_TAIL_MS 900
+#define CONT_VAD_TAIL_MS 200
 #define CONT_VAD_MIN_SPEECH_MS 240
 #define CONT_VAD_MAX_SPEECH_MS 12000
 #define CONT_VAD_WATCHDOG_MS 300
-#define CONT_VAD_STALE_AUDIO_MS 900
-#define CONT_VAD_STALE_SILENCE_MS 800
+#define CONT_VAD_STALE_AUDIO_MS 250
+#define CONT_VAD_STALE_SILENCE_MS 200
 #define CONT_STARTUP_REARM_MS 350
 #define CONT_REARM_DELAY_MS 800
 #define CONT_PLAYBACK_TAIL_IGNORE_MS 650
@@ -102,6 +102,9 @@
 #define CONT_BARGE_CANDIDATE_MAX_MS 380
 #define CONT_BARGE_ACCEPT_HITS 3
 #define CONT_BARGE_ECHO_REJECT_HITS 3
+#define CONT_BARGE_PLAYBACK_CANDIDATE_MIN_MS 450
+#define CONT_BARGE_PLAYBACK_CANDIDATE_MAX_MS 900
+#define CONT_BARGE_PLAYBACK_ACCEPT_HITS 6
 #define CONT_BARGE_REF_ACTIVE_AVG 120
 #define CONT_BARGE_REF_ACTIVE_PEAK 900
 #define CONT_BARGE_CORR_HIGH 650
@@ -116,6 +119,13 @@
 #define CONT_BARGE_OVERRIDE_MIC_AVG 480
 #define CONT_BARGE_OVERRIDE_MIC_PEAK 1500
 #define CONT_BARGE_OVERRIDE_CORR_MAX 820
+#define CONT_BARGE_PLAYBACK_OVERRIDE_MIC_AVG 900
+#define CONT_BARGE_PLAYBACK_OVERRIDE_MIC_PEAK 4500
+#define CONT_BARGE_PLAYBACK_OVERRIDE_CORR_MAX 520
+#define CONT_BARGE_PLAYBACK_LOCAL_MIC_AVG 650
+#define CONT_BARGE_PLAYBACK_LOCAL_MIC_PEAK 3200
+#define CONT_BARGE_PLAYBACK_STRONG_EXTRA_AVG 160
+#define CONT_BARGE_PLAYBACK_STRONG_EXTRA_PEAK 800
 #define CONT_BARGE_STRONG_EXTRA_AVG 180
 #define CONT_BARGE_STRONG_EXTRA_PEAK 900
 #define CONT_BARGE_TAIL_LOCAL_MIC_AVG 520
@@ -197,6 +207,9 @@ typedef enum {
     VOICE_CMD_MUSIC_PLAY,
     VOICE_CMD_MUSIC_STOP,
     VOICE_CMD_MUSIC_NEXT,
+    VOICE_CMD_MUSIC_PREV,
+    VOICE_CMD_MUSIC_TOGGLE,
+    VOICE_CMD_MUSIC_REFRESH,
     VOICE_CMD_CAMERA_CAPTURE,
     VOICE_CMD_ENV_STATUS,
     VOICE_CMD_LIGHT_ON,
@@ -861,12 +874,40 @@ static void on_ui_action(app_ui_action_t action, void *ctx)
         case APP_UI_ACTION_VOICE_NEXT:
             send_cmd_nonblocking(VOICE_CMD_VOICE_NEXT, 0);
             break;
+        case APP_UI_ACTION_MUSIC_PREV:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_PREV, 0);
+            break;
+        case APP_UI_ACTION_MUSIC_TOGGLE:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_TOGGLE, 0);
+            break;
+        case APP_UI_ACTION_MUSIC_NEXT:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_NEXT, 0);
+            break;
+        case APP_UI_ACTION_MUSIC_REFRESH:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_REFRESH, 0);
+            break;
     }
 }
 
 static void on_mic_level(int peak, int avg_abs)
 {
     app_ui_set_mic_level(peak, avg_abs);
+}
+
+static void on_music_state(const music_player_state_t *state, void *ctx)
+{
+    (void)ctx;
+    if (!state) {
+        return;
+    }
+    app_ui_set_music_state(state->playing,
+                           state->title,
+                           state->status,
+                           state->track_index,
+                           state->track_count,
+                           state->list[0],
+                           state->list[1],
+                           state->list[2]);
 }
 
 static void barge_diag_note_afe_event(afe_capture_event_t event)
@@ -1990,11 +2031,14 @@ static void cont_barge_begin_candidate(TickType_t now, bool playback, bool tail)
     s_cont_barge_candidate_log_tick = 0;
     s_cont_barge_accept_hits = 0;
     s_cont_barge_echo_hits = 0;
+    int override_avg = playback ? CONT_BARGE_PLAYBACK_OVERRIDE_MIC_AVG : CONT_BARGE_OVERRIDE_MIC_AVG;
+    int override_peak = playback ? CONT_BARGE_PLAYBACK_OVERRIDE_MIC_PEAK : CONT_BARGE_OVERRIDE_MIC_PEAK;
+    int override_corr = playback ? CONT_BARGE_PLAYBACK_OVERRIDE_CORR_MAX : CONT_BARGE_OVERRIDE_CORR_MAX;
     s_cont_barge_start_local_override = playback &&
                                          raw_valid &&
-                                         raw.mic_avg >= CONT_BARGE_OVERRIDE_MIC_AVG &&
-                                         raw.mic_peak >= CONT_BARGE_OVERRIDE_MIC_PEAK &&
-                                         raw.corr_permille <= CONT_BARGE_OVERRIDE_CORR_MAX;
+                                         raw.mic_avg >= override_avg &&
+                                         raw.mic_peak >= override_peak &&
+                                         raw.corr_permille <= override_corr;
     s_cont_barge_max_afe_avg = 0;
     s_cont_barge_max_afe_peak = 0;
     s_cont_barge_max_ref_avg = raw_valid ? raw.ref_avg : 0;
@@ -2137,13 +2181,26 @@ static bool cont_barge_compute_rule(TickType_t now,
     if (playback_tail_phase && !ref_active) {
         local_dominant = tail_local_energy && tail_strong_afe && (corr_low || mic_excess || afe_strong);
     }
-    bool barge_hit = !echo_like &&
-                     (afe_voice || afe_strong) &&
-                     (local_dominant ||
-                      (afe_strong &&
-                       effective_avg >= strong_avg + CONT_BARGE_STRONG_EXTRA_AVG &&
-                       effective_peak >= strong_peak + CONT_BARGE_STRONG_EXTRA_PEAK) ||
-                      very_strong_without_raw);
+    bool playback_phase = s_cont_barge_candidate_playback;
+    bool playback_strong_afe = effective_avg >= strong_avg + CONT_BARGE_PLAYBACK_STRONG_EXTRA_AVG &&
+                               effective_peak >= strong_peak + CONT_BARGE_PLAYBACK_STRONG_EXTRA_PEAK;
+    bool playback_local_voice = raw_valid &&
+                                raw.mic_avg >= CONT_BARGE_PLAYBACK_LOCAL_MIC_AVG &&
+                                raw.mic_peak >= CONT_BARGE_PLAYBACK_LOCAL_MIC_PEAK &&
+                                (playback_strong_afe || mic_excess) &&
+                                (!corr_high || mic_excess || afe_strong);
+    bool barge_hit = false;
+    if (playback_phase) {
+        barge_hit = !echo_like && playback_local_voice;
+    } else {
+        barge_hit = !echo_like &&
+                    (afe_voice || afe_strong) &&
+                    (local_dominant ||
+                     (afe_strong &&
+                      effective_avg >= strong_avg + CONT_BARGE_STRONG_EXTRA_AVG &&
+                      effective_peak >= strong_peak + CONT_BARGE_STRONG_EXTRA_PEAK) ||
+                     very_strong_without_raw);
+    }
 
     if (raw_out) {
         *raw_out = raw;
@@ -2238,18 +2295,25 @@ static cont_barge_decision_t cont_barge_process_candidate(TickType_t now,
     }
 
     uint32_t age_ms = (uint32_t)((now - s_cont_barge_candidate_start_tick) * portTICK_PERIOD_MS);
-    if (age_ms < CONT_BARGE_CANDIDATE_MIN_MS) {
+    uint32_t candidate_min_ms = s_cont_barge_candidate_playback
+                                    ? CONT_BARGE_PLAYBACK_CANDIDATE_MIN_MS
+                                    : CONT_BARGE_CANDIDATE_MIN_MS;
+    uint32_t candidate_max_ms = s_cont_barge_candidate_playback
+                                    ? CONT_BARGE_PLAYBACK_CANDIDATE_MAX_MS
+                                    : CONT_BARGE_CANDIDATE_MAX_MS;
+    int accept_hits = s_cont_barge_candidate_playback ? CONT_BARGE_PLAYBACK_ACCEPT_HITS : CONT_BARGE_ACCEPT_HITS;
+    if (age_ms < candidate_min_ms) {
         return CONT_BARGE_DECISION_PENDING;
     }
     if (s_cont_barge_start_local_override) {
         cont_barge_log_decision("accept_local_override", now, avg_abs, peak, &raw, raw_valid, mic_excess, afe_strong);
         return CONT_BARGE_DECISION_ACCEPT;
     }
-    if (s_cont_barge_accept_hits >= CONT_BARGE_ACCEPT_HITS) {
+    if (s_cont_barge_accept_hits >= accept_hits) {
         cont_barge_log_decision("accept", now, avg_abs, peak, &raw, raw_valid, mic_excess, afe_strong);
         return CONT_BARGE_DECISION_ACCEPT;
     }
-    if (s_cont_barge_echo_hits >= CONT_BARGE_ECHO_REJECT_HITS || age_ms >= CONT_BARGE_CANDIDATE_MAX_MS) {
+    if (s_cont_barge_echo_hits >= CONT_BARGE_ECHO_REJECT_HITS || age_ms >= candidate_max_ms) {
         cont_barge_log_decision(s_cont_barge_echo_hits >= CONT_BARGE_ECHO_REJECT_HITS ? "reject_echo" : "reject_timeout",
                                 now,
                                 avg_abs,
@@ -4121,6 +4185,11 @@ static void on_mcp_device_command(const char *command, void *ctx)
         send_cmd_nonblocking(VOICE_CMD_MUSIC_PLAY, 0);
         return;
     }
+    if (command_equals(command, "music_toggle") || command_equals(command, "toggle_music") ||
+        command_equals(command, "music_pause") || command_equals(command, "pause_music")) {
+        send_cmd_nonblocking(VOICE_CMD_MUSIC_TOGGLE, 0);
+        return;
+    }
     if (command_equals(command, "music_stop") || command_equals(command, "stop_music") ||
         command_equals(command, "mp3_stop")) {
         send_cmd_nonblocking(VOICE_CMD_MUSIC_STOP, 0);
@@ -4129,6 +4198,17 @@ static void on_mcp_device_command(const char *command, void *ctx)
     if (command_equals(command, "music_next") || command_equals(command, "next_music") ||
         command_equals(command, "next_song") || command_equals(command, "mp3_next")) {
         send_cmd_nonblocking(VOICE_CMD_MUSIC_NEXT, 0);
+        return;
+    }
+    if (command_equals(command, "music_prev") || command_equals(command, "prev_music") ||
+        command_equals(command, "previous_song") || command_equals(command, "prev_song") ||
+        command_equals(command, "mp3_prev")) {
+        send_cmd_nonblocking(VOICE_CMD_MUSIC_PREV, 0);
+        return;
+    }
+    if (command_equals(command, "music_refresh") || command_equals(command, "scan_music") ||
+        command_equals(command, "music_scan") || command_equals(command, "mp3_scan")) {
+        send_cmd_nonblocking(VOICE_CMD_MUSIC_REFRESH, 0);
         return;
     }
     if (command_equals(command, "env_status") || command_equals(command, "environment") ||
@@ -4346,13 +4426,40 @@ static void playback_task(void *arg)
                 break;
             case VOICE_CMD_MUSIC_STOP:
                 music_player_stop();
-                app_ui_set_recent_text("停止音乐");
+                app_ui_set_recent_text("暂停 TF 卡音乐");
                 app_ui_set_voice_state("MUSIC STOP");
                 break;
             case VOICE_CMD_MUSIC_NEXT:
                 if (music_player_next() == ESP_OK) {
                     app_ui_set_recent_text("下一首音乐");
                     app_ui_set_voice_state("MUSIC NEXT");
+                } else {
+                    app_ui_set_voice_state("MUSIC ERR");
+                }
+                break;
+            case VOICE_CMD_MUSIC_PREV:
+                if (music_player_prev() == ESP_OK) {
+                    app_ui_set_recent_text("上一首音乐");
+                    app_ui_set_voice_state("MUSIC PREV");
+                } else {
+                    app_ui_set_voice_state("MUSIC ERR");
+                }
+                break;
+            case VOICE_CMD_MUSIC_TOGGLE:
+            {
+                bool was_playing = music_player_is_playing();
+                if (music_player_toggle() == ESP_OK) {
+                    app_ui_set_recent_text(was_playing ? "暂停 TF 卡音乐" : "播放 TF 卡音乐");
+                    app_ui_set_voice_state(was_playing ? "MUSIC STOP" : "MUSIC PLAY");
+                } else {
+                    app_ui_set_voice_state("MUSIC ERR");
+                }
+                break;
+            }
+            case VOICE_CMD_MUSIC_REFRESH:
+                if (music_player_refresh() == ESP_OK) {
+                    app_ui_set_recent_text("扫描 TF 卡音乐");
+                    app_ui_set_voice_state("MUSIC SCAN");
                 } else {
                     app_ui_set_voice_state("MUSIC ERR");
                 }
@@ -4608,10 +4715,18 @@ static void command_task(void *arg)
             send_cmd(VOICE_CMD_VOICE_NEXT, 0);
         } else if (strcmp(line, "MUSIC") == 0 || strcmp(line, "MUSIC PLAY") == 0 || strcmp(line, "MP3") == 0) {
             send_cmd(VOICE_CMD_MUSIC_PLAY, 0);
+        } else if (strcmp(line, "MUSIC PAUSE") == 0 || strcmp(line, "MUSIC TOGGLE") == 0 ||
+                   strcmp(line, "MP3 PAUSE") == 0) {
+            send_cmd(VOICE_CMD_MUSIC_TOGGLE, 0);
         } else if (strcmp(line, "MUSIC STOP") == 0 || strcmp(line, "MP3 STOP") == 0) {
             send_cmd(VOICE_CMD_MUSIC_STOP, 0);
         } else if (strcmp(line, "MUSIC NEXT") == 0 || strcmp(line, "MP3 NEXT") == 0 || strcmp(line, "NEXT") == 0) {
             send_cmd(VOICE_CMD_MUSIC_NEXT, 0);
+        } else if (strcmp(line, "MUSIC PREV") == 0 || strcmp(line, "MUSIC PREVIOUS") == 0 ||
+                   strcmp(line, "MP3 PREV") == 0 || strcmp(line, "PREV") == 0) {
+            send_cmd(VOICE_CMD_MUSIC_PREV, 0);
+        } else if (strcmp(line, "MUSIC SCAN") == 0 || strcmp(line, "MUSIC REFRESH") == 0 || strcmp(line, "MP3 SCAN") == 0) {
+            send_cmd(VOICE_CMD_MUSIC_REFRESH, 0);
         } else if (strcmp(line, "CAMERA") == 0 || strcmp(line, "PHOTO") == 0 || strcmp(line, "CAPTURE") == 0) {
             send_cmd(VOICE_CMD_CAMERA_CAPTURE, 0);
         } else if (strcmp(line, "ENV") == 0 || strcmp(line, "HUMIDITY") == 0 || strcmp(line, "TEMP") == 0) {
@@ -4749,6 +4864,7 @@ void app_main(void)
         ESP_LOGW(TAG, "peripheral scaffold init failed");
     }
     app_ui_set_action_callback(on_ui_action, NULL);
+    music_player_set_state_callback(on_music_state, NULL);
     app_ui_set_volume(audio_player_get_volume());
     app_ui_set_voice_state("VOICE READY");
     app_ui_set_bluetooth_available(false);

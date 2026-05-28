@@ -56,7 +56,7 @@ class DoubaoDialogConfig:
     tts_channel: int = 1
     timeout_seconds: float = 30.0
     audio_chunk_ms: int = 100
-    vad_tail_silence_ms: int = 800
+    vad_tail_silence_ms: int = 200
     output_flush_ms: int = 250
     persona_dir: Path = BASE_DIR / "data" / "personas"
     voice_preset_file: Path = BASE_DIR / "data" / "voice_presets.json"
@@ -490,7 +490,7 @@ def load_config() -> AppConfig:
             audio_chunk_ms=max(20, int(os.getenv("DOUBAO_DIALOG_AUDIO_CHUNK_MS", "40"))),
             # File-style ESP32 uploads still need a short explicit silence tail for EOS,
             # but a long tail makes every spoken turn feel late.
-            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "800"))),
+            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "200"))),
             output_flush_ms=max(120, int(os.getenv("DOUBAO_DIALOG_OUTPUT_FLUSH_MS", "160"))),
             persona_dir=Path(os.getenv("MCP_PERSONA_DIR", str(data_dir / "personas"))).resolve(),
             voice_preset_file=Path(os.getenv("MCP_VOICE_PRESET_FILE", str(data_dir / "voice_presets.json"))).resolve(),

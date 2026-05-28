@@ -11,44 +11,40 @@
 #include <strings.h>
 #include <sys/stat.h>
 
-#include "audio_element.h"
-#include "audio_event_iface.h"
 #include "audio_mem.h"
-#include "audio_pipeline.h"
 #include "audio_player.h"
 #include "board.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_peripherals.h"
-#include "fatfs_stream.h"
-#include "filter_resample.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "mp3_decoder.h"
-#include "raw_stream.h"
-#include "esp_heap_caps.h"
 
 #define MUSIC_ROOT_PRIMARY "/sdcard/music"
 #define MUSIC_ROOT_FALLBACK "/sdcard"
-#define MUSIC_MAX_TRACKS 48
+#define MUSIC_MAX_TRACKS 64
 #define MUSIC_PATH_MAX 192
-#define MUSIC_CMD_QUEUE_LEN 6
-#define MUSIC_TASK_STACK 6144
-#define MUSIC_DECODE_CHUNK_BYTES 2048
+#define MUSIC_CMD_QUEUE_LEN 8
+#define MUSIC_TASK_STACK 5120
+#define MUSIC_STREAM_CHUNK_BYTES 4096
 #define MUSIC_OUTPUT_RATE 16000
 #define MUSIC_OUTPUT_CHANNELS 1
 #define MUSIC_OUTPUT_BITS 16
 #define MUSIC_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define MUSIC_QUEUE_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define MUSIC_STREAM_BUFFER_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define MUSIC_SD_FAIL_COOLDOWN_MS 30000
 
 typedef enum {
     MUSIC_CMD_PLAY = 0,
     MUSIC_CMD_STOP,
     MUSIC_CMD_NEXT,
+    MUSIC_CMD_PREV,
+    MUSIC_CMD_REFRESH,
 } music_cmd_id_t;
 
 typedef struct {
@@ -56,23 +52,20 @@ typedef struct {
 } music_cmd_t;
 
 typedef struct {
-    audio_pipeline_handle_t pipeline;
-    audio_element_handle_t fatfs;
-    audio_element_handle_t mp3;
-    audio_element_handle_t filter;
-    audio_element_handle_t raw;
-    audio_event_iface_handle_t evt;
-} music_pipeline_t;
+    FILE *file;
+    uint32_t data_remaining;
+    bool bounded;
+} music_file_stream_t;
 
 static const char *TAG = "MUSIC_PLAYER";
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_cmd_queue;
 static esp_periph_set_handle_t s_periph_set;
-static audio_pipeline_handle_t s_active_pipeline;
 static bool s_mounted;
 static bool s_playing;
 static bool s_stop_requested;
 static bool s_next_requested;
+static bool s_prev_requested;
 static bool s_sd_fail_latched;
 static TickType_t s_sd_retry_after_tick;
 static esp_err_t s_last_sd_error = ESP_OK;
@@ -80,7 +73,56 @@ static uint32_t s_sd_fail_count;
 static char s_tracks[MUSIC_MAX_TRACKS][MUSIC_PATH_MAX];
 static int s_track_count;
 static int s_track_index;
-static char s_status[80] = "MUSIC IDLE";
+static char s_status[MUSIC_PLAYER_STATUS_MAX] = "MUSIC IDLE";
+static music_player_state_cb_t s_state_cb;
+static void *s_state_ctx;
+
+static void notify_state(void);
+
+static uint16_t read_u16_le(const uint8_t *data)
+{
+    return (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
+}
+
+static uint32_t read_u32_le(const uint8_t *data)
+{
+    return (uint32_t)data[0] |
+           ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) |
+           ((uint32_t)data[3] << 24);
+}
+
+static bool has_extension(const char *name, const char *ext)
+{
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    return dot && ext && strcasecmp(dot, ext) == 0;
+}
+
+static bool is_prepared_audio_file(const char *name)
+{
+    return has_extension(name, ".wav") || has_extension(name, ".pcm");
+}
+
+static void copy_track_title(const char *path, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    const char *name = path && path[0] ? strrchr(path, '/') : NULL;
+    if (!name) {
+        name = path && path[0] ? strrchr(path, '\\') : NULL;
+    }
+    name = name ? name + 1 : path;
+    if (!name || !name[0]) {
+        strlcpy(dst, "NO TRACK", dst_size);
+        return;
+    }
+    strlcpy(dst, name, dst_size);
+    char *dot = strrchr(dst, '.');
+    if (dot && (strcasecmp(dot, ".wav") == 0 || strcasecmp(dot, ".pcm") == 0)) {
+        *dot = '\0';
+    }
+}
 
 static void set_status(const char *status)
 {
@@ -99,6 +141,7 @@ static void set_status(const char *status)
     if (changed) {
         ESP_LOGI(TAG, "%s", status);
     }
+    notify_state();
 }
 
 const char *music_player_get_status(void)
@@ -119,23 +162,82 @@ bool music_player_is_playing(void)
     return playing;
 }
 
-static bool request_stop_locked(bool next)
+void music_player_get_state(music_player_state_t *out)
+{
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    out->mounted = s_mounted;
+    out->playing = s_playing;
+    out->track_count = s_track_count;
+    out->track_index = s_track_index;
+    strlcpy(out->status, s_status, sizeof(out->status));
+    if (s_track_count > 0 && s_track_index >= 0 && s_track_index < s_track_count) {
+        copy_track_title(s_tracks[s_track_index], out->title, sizeof(out->title));
+    } else {
+        strlcpy(out->title, s_mounted ? "NO WAV/PCM FOUND" : "SCAN TF CARD", sizeof(out->title));
+    }
+
+    int start = s_track_index - 1;
+    if (start < 0) {
+        start = 0;
+    }
+    if (s_track_count > MUSIC_PLAYER_LIST_LINES && start > s_track_count - MUSIC_PLAYER_LIST_LINES) {
+        start = s_track_count - MUSIC_PLAYER_LIST_LINES;
+    }
+    for (int i = 0; i < MUSIC_PLAYER_LIST_LINES; ++i) {
+        int idx = start + i;
+        if (idx >= 0 && idx < s_track_count) {
+            char title[48];
+            copy_track_title(s_tracks[idx], title, sizeof(title));
+            snprintf(out->list[i], sizeof(out->list[i]), "%c %02d %s",
+                     idx == s_track_index ? '>' : ' ',
+                     idx + 1,
+                     title);
+        } else if (i == 0 && s_track_count <= 0) {
+            strlcpy(out->list[i], "Put 16k mono WAV in /music", sizeof(out->list[i]));
+        }
+    }
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void notify_state(void)
+{
+    music_player_state_cb_t cb = s_state_cb;
+    void *ctx = s_state_ctx;
+    if (!cb) {
+        return;
+    }
+    music_player_state_t state;
+    music_player_get_state(&state);
+    cb(&state, ctx);
+}
+
+static bool request_stop_locked(int step)
 {
     bool was_playing = s_playing;
     s_stop_requested = true;
-    if (next) {
+    if (step > 0) {
         s_next_requested = true;
+    } else if (step < 0) {
+        s_prev_requested = true;
     }
     return was_playing;
 }
 
-static void request_stop(bool next)
+static void request_stop(int step)
 {
     bool was_playing = false;
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
-    was_playing = request_stop_locked(next);
+    was_playing = request_stop_locked(step);
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
@@ -157,18 +259,23 @@ static bool stop_requested(void)
     return requested;
 }
 
-static bool take_next_requested(void)
+static int take_track_step_requested(void)
 {
-    bool requested = false;
+    int step = 0;
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
-    requested = s_next_requested;
+    if (s_prev_requested) {
+        step = -1;
+    } else if (s_next_requested) {
+        step = 1;
+    }
+    s_prev_requested = false;
     s_next_requested = false;
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
-    return requested;
+    return step;
 }
 
 static void clear_stop_requested(void)
@@ -184,30 +291,18 @@ static void clear_stop_requested(void)
 
 static void mark_playing(bool playing)
 {
+    bool changed = false;
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
+    changed = s_playing != playing;
     s_playing = playing;
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
-}
-
-static void set_active_pipeline(audio_pipeline_handle_t pipeline)
-{
-    if (s_lock) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (changed) {
+        notify_state();
     }
-    s_active_pipeline = pipeline;
-    if (s_lock) {
-        xSemaphoreGive(s_lock);
-    }
-}
-
-static bool has_mp3_extension(const char *name)
-{
-    const char *dot = name ? strrchr(name, '.') : NULL;
-    return dot && strcasecmp(dot, ".mp3") == 0;
 }
 
 static bool sd_retry_is_deferred(void)
@@ -243,7 +338,7 @@ static void sort_tracks(void)
     }
 }
 
-static esp_err_t scan_dir_for_mp3(const char *root)
+static esp_err_t scan_dir_for_tracks(const char *root)
 {
     DIR *dir = opendir(root);
     if (!dir) {
@@ -253,10 +348,7 @@ static esp_err_t scan_dir_for_mp3(const char *root)
 
     struct dirent *entry = NULL;
     while ((entry = readdir(dir)) != NULL && s_track_count < MUSIC_MAX_TRACKS) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-        if (!has_mp3_extension(entry->d_name)) {
+        if (entry->d_name[0] == '.' || !is_prepared_audio_file(entry->d_name)) {
             continue;
         }
 
@@ -329,242 +421,193 @@ static esp_err_t refresh_playlist(void)
     }
 
     s_track_count = 0;
-    ret = scan_dir_for_mp3(MUSIC_ROOT_PRIMARY);
+    ret = scan_dir_for_tracks(MUSIC_ROOT_PRIMARY);
     if (ret != ESP_OK) {
-        ret = scan_dir_for_mp3(MUSIC_ROOT_FALLBACK);
+        ret = scan_dir_for_tracks(MUSIC_ROOT_FALLBACK);
     }
     if (s_track_count <= 0) {
-        set_status("MUSIC NO MP3");
-        ESP_LOGW(TAG, "no mp3 found under %s or %s", MUSIC_ROOT_PRIMARY, MUSIC_ROOT_FALLBACK);
+        set_status("MUSIC NO WAV");
+        ESP_LOGW(TAG, "no prepared wav/pcm found under %s or %s", MUSIC_ROOT_PRIMARY, MUSIC_ROOT_FALLBACK);
         return ESP_ERR_NOT_FOUND;
     }
     sort_tracks();
     if (s_track_index < 0 || s_track_index >= s_track_count) {
         s_track_index = 0;
     }
+    char status[MUSIC_PLAYER_STATUS_MAX];
+    snprintf(status, sizeof(status), "MUSIC LIST %d", s_track_count);
+    set_status(status);
     ESP_LOGI(TAG, "playlist tracks=%d current=%s", s_track_count, s_tracks[s_track_index]);
     return ESP_OK;
 }
 
-static bool pipeline_stop_event(const audio_event_iface_msg_t *msg, const music_pipeline_t *pipe)
+static esp_err_t open_pcm_file(const char *path, music_file_stream_t *stream)
 {
-    if (!msg || !pipe || msg->source_type != AUDIO_ELEMENT_TYPE_ELEMENT) {
-        return false;
+    if (!path || !stream) {
+        return ESP_ERR_INVALID_ARG;
     }
-    if (msg->cmd != AEL_MSG_CMD_REPORT_STATUS) {
-        return false;
+    memset(stream, 0, sizeof(*stream));
+    stream->file = fopen(path, "rb");
+    if (!stream->file) {
+        ESP_LOGW(TAG, "open track failed path=%s", path);
+        return ESP_FAIL;
     }
-    audio_element_state_t state = audio_element_get_state((audio_element_handle_t)msg->source);
-    if (state == AEL_STATE_FINISHED || state == AEL_STATE_STOPPED || state == AEL_STATE_ERROR) {
-        ESP_LOGI(TAG, "pipeline element stopped state=%d source=%p", state, msg->source);
-        return msg->source == pipe->fatfs || msg->source == pipe->mp3 || msg->source == pipe->filter ||
-               msg->source == pipe->raw;
-    }
-    return false;
-}
 
-static void handle_pipeline_events(music_pipeline_t *pipe, bool *pipeline_finished)
-{
-    audio_event_iface_msg_t msg = {0};
-    while (audio_event_iface_listen(pipe->evt, &msg, 0) == ESP_OK) {
-        if (msg.source == (void *)pipe->mp3 && msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO) {
-            audio_element_info_t info = {0};
-            audio_element_getinfo(pipe->mp3, &info);
-            ESP_LOGI(TAG,
-                     "mp3 info rate=%d bits=%d ch=%d",
-                     info.sample_rates,
-                     info.bits,
-                     info.channels);
-            if (info.sample_rates > 0 && info.channels > 0) {
-                rsp_filter_change_src_info(pipe->filter, info.sample_rates, info.channels, info.bits > 0 ? info.bits : 16);
+    if (has_extension(path, ".pcm")) {
+        stream->bounded = false;
+        return ESP_OK;
+    }
+
+    uint8_t header[12];
+    if (fread(header, 1, sizeof(header), stream->file) != sizeof(header) ||
+        memcmp(header, "RIFF", 4) != 0 ||
+        memcmp(header + 8, "WAVE", 4) != 0) {
+        ESP_LOGW(TAG, "unsupported wav header path=%s", path);
+        fclose(stream->file);
+        stream->file = NULL;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    bool have_fmt = false;
+    uint16_t audio_format = 0;
+    uint16_t channels = 0;
+    uint32_t sample_rate = 0;
+    uint16_t bits = 0;
+    while (true) {
+        uint8_t chunk[8];
+        if (fread(chunk, 1, sizeof(chunk), stream->file) != sizeof(chunk)) {
+            break;
+        }
+        uint32_t chunk_size = read_u32_le(chunk + 4);
+        long payload_pos = ftell(stream->file);
+        if (payload_pos < 0) {
+            break;
+        }
+        if (memcmp(chunk, "fmt ", 4) == 0) {
+            uint8_t fmt[16];
+            if (chunk_size < sizeof(fmt) || fread(fmt, 1, sizeof(fmt), stream->file) != sizeof(fmt)) {
+                break;
             }
-            continue;
+            audio_format = read_u16_le(fmt);
+            channels = read_u16_le(fmt + 2);
+            sample_rate = read_u32_le(fmt + 4);
+            bits = read_u16_le(fmt + 14);
+            have_fmt = true;
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            if (!have_fmt ||
+                audio_format != 1 ||
+                channels != MUSIC_OUTPUT_CHANNELS ||
+                sample_rate != MUSIC_OUTPUT_RATE ||
+                bits != MUSIC_OUTPUT_BITS) {
+                ESP_LOGW(TAG,
+                         "wav must be PCM %dHz %dbit mono path=%s fmt=%u rate=%u bits=%u ch=%u",
+                         MUSIC_OUTPUT_RATE,
+                         MUSIC_OUTPUT_BITS,
+                         path,
+                         audio_format,
+                         (unsigned)sample_rate,
+                         bits,
+                         channels);
+                break;
+            }
+            stream->bounded = true;
+            stream->data_remaining = chunk_size & ~1U;
+            return ESP_OK;
         }
-        if (pipeline_stop_event(&msg, pipe)) {
-            *pipeline_finished = true;
+
+        uint32_t skip = chunk_size + (chunk_size & 1U);
+        if (fseek(stream->file, payload_pos + (long)skip, SEEK_SET) != 0) {
+            break;
         }
     }
+
+    fclose(stream->file);
+    stream->file = NULL;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-static void deinit_pipeline(music_pipeline_t *pipe)
+static void close_pcm_file(music_file_stream_t *stream)
 {
-    if (!pipe || !pipe->pipeline) {
+    if (!stream || !stream->file) {
         return;
     }
-    audio_pipeline_stop(pipe->pipeline);
-    audio_pipeline_wait_for_stop(pipe->pipeline);
-    audio_pipeline_terminate(pipe->pipeline);
-    if (pipe->evt) {
-        audio_pipeline_remove_listener(pipe->pipeline);
-        audio_event_iface_destroy(pipe->evt);
-        pipe->evt = NULL;
-    }
-    if (pipe->fatfs) {
-        audio_pipeline_unregister(pipe->pipeline, pipe->fatfs);
-    }
-    if (pipe->mp3) {
-        audio_pipeline_unregister(pipe->pipeline, pipe->mp3);
-    }
-    if (pipe->filter) {
-        audio_pipeline_unregister(pipe->pipeline, pipe->filter);
-    }
-    if (pipe->raw) {
-        audio_pipeline_unregister(pipe->pipeline, pipe->raw);
-    }
-    audio_pipeline_deinit(pipe->pipeline);
-    if (pipe->fatfs) {
-        audio_element_deinit(pipe->fatfs);
-    }
-    if (pipe->mp3) {
-        audio_element_deinit(pipe->mp3);
-    }
-    if (pipe->filter) {
-        audio_element_deinit(pipe->filter);
-    }
-    if (pipe->raw) {
-        audio_element_deinit(pipe->raw);
-    }
-    memset(pipe, 0, sizeof(*pipe));
+    fclose(stream->file);
+    stream->file = NULL;
 }
 
-static esp_err_t init_pipeline(const char *path, music_pipeline_t *pipe)
+static int read_pcm_chunk(music_file_stream_t *stream, uint8_t *buffer, size_t buffer_size)
 {
-    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipe->pipeline = audio_pipeline_init(&pipeline_cfg);
-    if (!pipe->pipeline) {
-        return ESP_ERR_NO_MEM;
+    if (!stream || !stream->file || !buffer || buffer_size == 0) {
+        return -1;
     }
-
-    fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
-    fatfs_cfg.type = AUDIO_STREAM_READER;
-    pipe->fatfs = fatfs_stream_init(&fatfs_cfg);
-
-    mp3_decoder_cfg_t mp3_cfg = DEFAULT_MP3_DECODER_CONFIG();
-    mp3_cfg.task_prio = 5;
-    mp3_cfg.task_core = 0;
-    mp3_cfg.stack_in_ext = true;
-    pipe->mp3 = mp3_decoder_init(&mp3_cfg);
-
-    rsp_filter_cfg_t rsp_cfg = DEFAULT_RESAMPLE_FILTER_CONFIG();
-    rsp_cfg.dest_rate = MUSIC_OUTPUT_RATE;
-    rsp_cfg.dest_ch = MUSIC_OUTPUT_CHANNELS;
-    rsp_cfg.dest_bits = MUSIC_OUTPUT_BITS;
-    rsp_cfg.src_rate = 44100;
-    rsp_cfg.src_ch = 2;
-    rsp_cfg.src_bits = 16;
-    rsp_cfg.max_indata_bytes = 1024;
-    rsp_cfg.out_len_bytes = 1024;
-    rsp_cfg.task_prio = 5;
-    rsp_cfg.task_core = 0;
-    rsp_cfg.stack_in_ext = true;
-    pipe->filter = rsp_filter_init(&rsp_cfg);
-
-    raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
-    raw_cfg.type = AUDIO_STREAM_WRITER;
-    raw_cfg.out_rb_size = 8 * 1024;
-    pipe->raw = raw_stream_init(&raw_cfg);
-
-    if (!pipe->fatfs || !pipe->mp3 || !pipe->filter || !pipe->raw) {
-        deinit_pipeline(pipe);
-        return ESP_ERR_NO_MEM;
+    size_t want = buffer_size & ~(size_t)1;
+    if (stream->bounded) {
+        if (stream->data_remaining == 0) {
+            return 0;
+        }
+        if (want > stream->data_remaining) {
+            want = stream->data_remaining;
+        }
     }
-
-    audio_element_set_uri(pipe->fatfs, path);
-    audio_element_set_input_timeout(pipe->raw, pdMS_TO_TICKS(100));
-
-    audio_pipeline_register(pipe->pipeline, pipe->fatfs, "file");
-    audio_pipeline_register(pipe->pipeline, pipe->mp3, "mp3");
-    audio_pipeline_register(pipe->pipeline, pipe->filter, "filter");
-    audio_pipeline_register(pipe->pipeline, pipe->raw, "raw");
-    const char *link_tag[4] = {"file", "mp3", "filter", "raw"};
-    esp_err_t ret = audio_pipeline_link(pipe->pipeline, link_tag, 4);
-    if (ret != ESP_OK) {
-        deinit_pipeline(pipe);
-        return ret;
+    size_t got = fread(buffer, 1, want, stream->file);
+    got &= ~(size_t)1;
+    if (stream->bounded) {
+        stream->data_remaining -= (uint32_t)got;
     }
-
-    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
-    pipe->evt = audio_event_iface_init(&evt_cfg);
-    if (!pipe->evt) {
-        deinit_pipeline(pipe);
-        return ESP_ERR_NO_MEM;
+    if (got == 0) {
+        return 0;
     }
-    audio_pipeline_set_listener(pipe->pipeline, pipe->evt);
-    return ESP_OK;
+    return (int)got;
 }
 
 static esp_err_t play_track(const char *path)
 {
-    if (!path || !path[0]) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    music_pipeline_t pipe = {0};
-    esp_err_t ret = init_pipeline(path, &pipe);
+    music_file_stream_t stream = {0};
+    esp_err_t ret = open_pcm_file(path, &stream);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "music pipeline init failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    char status[80];
+    bool buffer_from_audio_malloc = false;
+    uint8_t *buffer = heap_caps_malloc(MUSIC_STREAM_CHUNK_BYTES, MUSIC_STREAM_BUFFER_CAPS);
+    if (!buffer) {
+        buffer = audio_malloc(MUSIC_STREAM_CHUNK_BYTES);
+        buffer_from_audio_malloc = buffer != NULL;
+    }
+    if (!buffer) {
+        close_pcm_file(&stream);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char status[MUSIC_PLAYER_STATUS_MAX];
     snprintf(status, sizeof(status), "MUSIC %d/%d", s_track_index + 1, s_track_count);
     set_status(status);
-    ESP_LOGI(TAG, "play %s", path);
+    ESP_LOGI(TAG, "play prepared audio %s", path);
 
     clear_stop_requested();
     mark_playing(true);
-    set_active_pipeline(pipe.pipeline);
     ret = audio_player_stream_begin("music", true);
-    if (ret == ESP_OK) {
-        ret = audio_pipeline_run(pipe.pipeline);
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "music start failed: %s", esp_err_to_name(ret));
-        set_active_pipeline(NULL);
-        mark_playing(false);
-        deinit_pipeline(&pipe);
-        return ret;
-    }
-
-    char *buffer = audio_malloc(MUSIC_DECODE_CHUNK_BYTES);
-    if (!buffer) {
-        request_stop(false);
-        ret = ESP_ERR_NO_MEM;
-    }
-
-    bool pipeline_finished = false;
     while (ret == ESP_OK && !stop_requested()) {
-        handle_pipeline_events(&pipe, &pipeline_finished);
-        int read = raw_stream_read(pipe.raw, buffer, MUSIC_DECODE_CHUNK_BYTES);
+        int read = read_pcm_chunk(&stream, buffer, MUSIC_STREAM_CHUNK_BYTES);
         if (read > 0) {
-            ret = audio_player_stream_write_pcm16((const uint8_t *)buffer, (size_t)read, "music");
+            ret = audio_player_stream_write_pcm16(buffer, (size_t)read, "music");
             continue;
         }
-        if (read == AEL_IO_TIMEOUT) {
-            if (pipeline_finished) {
-                break;
-            }
-            continue;
-        }
-        if (read == AEL_IO_DONE || read == AEL_IO_OK) {
-            pipeline_finished = true;
-            continue;
-        }
-        if (pipeline_finished) {
+        if (read == 0) {
             break;
         }
-        ESP_LOGW(TAG, "raw read stopped ret=%d", read);
         ret = ESP_FAIL;
         break;
     }
 
-    if (buffer) {
+    if (buffer_from_audio_malloc) {
         audio_free(buffer);
+    } else {
+        heap_caps_free(buffer);
     }
-    audio_player_stream_end("music", 80);
-    set_active_pipeline(NULL);
+    audio_player_stream_end("music", 40);
+    close_pcm_file(&stream);
     mark_playing(false);
-    deinit_pipeline(&pipe);
     if (stop_requested()) {
         ESP_LOGI(TAG, "music stopped");
         return ESP_ERR_INVALID_STATE;
@@ -582,17 +625,42 @@ static void advance_track(void)
     s_track_index = (s_track_index + 1) % s_track_count;
 }
 
+static void retreat_track(void)
+{
+    if (s_track_count <= 0) {
+        s_track_index = 0;
+        return;
+    }
+    s_track_index = (s_track_index + s_track_count - 1) % s_track_count;
+}
+
+static void step_track(int step)
+{
+    if (step > 0) {
+        advance_track();
+    } else if (step < 0) {
+        retreat_track();
+    }
+    notify_state();
+}
+
 static void drain_pending_music_command(bool *keep_playing)
 {
     music_cmd_t cmd = {0};
     while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
         if (cmd.id == MUSIC_CMD_STOP) {
-            request_stop(false);
+            request_stop(0);
             *keep_playing = false;
             return;
         }
         if (cmd.id == MUSIC_CMD_NEXT) {
-            advance_track();
+            step_track(1);
+            clear_stop_requested();
+            *keep_playing = true;
+            return;
+        }
+        if (cmd.id == MUSIC_CMD_PREV) {
+            step_track(-1);
             clear_stop_requested();
             *keep_playing = true;
             return;
@@ -614,12 +682,19 @@ static void music_task(void *arg)
         }
 
         if (cmd.id == MUSIC_CMD_STOP) {
-            request_stop(false);
+            request_stop(0);
             set_status("MUSIC STOP");
             continue;
         }
         if (cmd.id == MUSIC_CMD_NEXT) {
-            advance_track();
+            step_track(1);
+        }
+        if (cmd.id == MUSIC_CMD_PREV) {
+            step_track(-1);
+        }
+        if (cmd.id == MUSIC_CMD_REFRESH) {
+            refresh_playlist();
+            continue;
         }
 
         esp_err_t ret = refresh_playlist();
@@ -630,9 +705,9 @@ static void music_task(void *arg)
         bool keep_playing = true;
         while (keep_playing && s_track_count > 0) {
             ret = play_track(s_tracks[s_track_index]);
-            bool next_requested = take_next_requested();
-            if (next_requested) {
-                advance_track();
+            int step_requested = take_track_step_requested();
+            if (step_requested != 0) {
+                step_track(step_requested);
                 clear_stop_requested();
                 keep_playing = true;
             } else if (ret == ESP_ERR_INVALID_STATE) {
@@ -640,6 +715,7 @@ static void music_task(void *arg)
                 clear_stop_requested();
             } else {
                 advance_track();
+                notify_state();
                 keep_playing = true;
             }
             drain_pending_music_command(&keep_playing);
@@ -681,7 +757,7 @@ esp_err_t music_player_init(void)
                                                    "music_player",
                                                    MUSIC_TASK_STACK,
                                                    NULL,
-                                                   4,
+                                                   3,
                                                    NULL,
                                                    0,
                                                    MUSIC_TASK_STACK_CAPS);
@@ -690,6 +766,7 @@ esp_err_t music_player_init(void)
         return ESP_ERR_NO_MEM;
     }
     set_status("MUSIC READY");
+    queue_music_cmd(MUSIC_CMD_REFRESH);
     return ESP_OK;
 }
 
@@ -701,7 +778,7 @@ esp_err_t music_player_play(void)
 
 esp_err_t music_player_stop(void)
 {
-    request_stop(false);
+    request_stop(0);
     return queue_music_cmd(MUSIC_CMD_STOP);
 }
 
@@ -711,7 +788,7 @@ esp_err_t music_player_next(void)
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
-    was_playing = request_stop_locked(true);
+    was_playing = request_stop_locked(1);
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
@@ -720,4 +797,44 @@ esp_err_t music_player_next(void)
         return ESP_OK;
     }
     return queue_music_cmd(MUSIC_CMD_NEXT);
+}
+
+esp_err_t music_player_prev(void)
+{
+    bool was_playing = false;
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    was_playing = request_stop_locked(-1);
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+    if (was_playing) {
+        audio_player_cancel();
+        return ESP_OK;
+    }
+    return queue_music_cmd(MUSIC_CMD_PREV);
+}
+
+esp_err_t music_player_toggle(void)
+{
+    return music_player_is_playing() ? music_player_stop() : music_player_play();
+}
+
+esp_err_t music_player_refresh(void)
+{
+    return queue_music_cmd(MUSIC_CMD_REFRESH);
+}
+
+void music_player_set_state_callback(music_player_state_cb_t cb, void *ctx)
+{
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    s_state_cb = cb;
+    s_state_ctx = ctx;
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+    notify_state();
 }

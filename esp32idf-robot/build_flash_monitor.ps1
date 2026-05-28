@@ -57,20 +57,20 @@ $env:ADF_PATH = $AdfPath
 Set-Location $ProjectDir
 
 if (-not (Test-Path (Join-Path $ProjectDir "sdkconfig"))) {
-  Invoke-Checked idf.py set-target esp32s3
+  Invoke-Checked -FilePath idf.py -Arguments @("set-target", "esp32s3")
 } else {
   $ConfiguredTarget = Select-String -Path (Join-Path $ProjectDir "sdkconfig") -Pattern '^CONFIG_IDF_TARGET="esp32s3"$' -ErrorAction SilentlyContinue
   if (-not $ConfiguredTarget) {
-    Invoke-Checked idf.py set-target esp32s3
+    Invoke-Checked -FilePath idf.py -Arguments @("set-target", "esp32s3")
   }
 }
 
-Invoke-Checked idf.py -DCCACHE_ENABLE=0 build
+Invoke-Checked -FilePath idf.py -Arguments @("-DCCACHE_ENABLE=0", "build")
 
 if (-not $NoFlash) {
-  Invoke-Checked idf.py -p $Port flash
+  Invoke-Checked -FilePath idf.py -Arguments @("-p", $Port, "flash")
 }
 
 if (-not $NoMonitor) {
-  idf.py -p $Port monitor
+  idf.py @("-p", $Port, "monitor")
 }
