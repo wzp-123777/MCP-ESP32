@@ -25,6 +25,8 @@ typedef void (*mcp_client_playback_cb_t)(bool busy, void *ctx);
 void mcp_client_set_playback_callback(mcp_client_playback_cb_t cb, void *ctx);
 typedef void (*mcp_client_device_command_cb_t)(const char *command, void *ctx);
 void mcp_client_set_device_command_callback(mcp_client_device_command_cb_t cb, void *ctx);
+typedef size_t (*mcp_client_telemetry_extra_cb_t)(char *buffer, size_t buffer_len, void *ctx);
+void mcp_client_set_telemetry_extra_callback(mcp_client_telemetry_extra_cb_t cb, void *ctx);
 esp_err_t mcp_client_send_text_request(const char *text);
 esp_err_t mcp_client_send_diagnostic_event(const char *name, const char *phase, const char *detail);
 esp_err_t mcp_client_audio_stream_begin(const char *session_id);

@@ -38,6 +38,7 @@
 #define MUSIC_QUEUE_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define MUSIC_STREAM_BUFFER_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define MUSIC_SD_FAIL_COOLDOWN_MS 30000
+#define MUSIC_INVALID_INDEX (-1)
 
 typedef enum {
     MUSIC_CMD_PLAY = 0,
@@ -45,10 +46,12 @@ typedef enum {
     MUSIC_CMD_NEXT,
     MUSIC_CMD_PREV,
     MUSIC_CMD_REFRESH,
+    MUSIC_CMD_SELECT,
 } music_cmd_id_t;
 
 typedef struct {
     music_cmd_id_t id;
+    int index;
 } music_cmd_t;
 
 typedef struct {
@@ -66,6 +69,8 @@ static bool s_playing;
 static bool s_stop_requested;
 static bool s_next_requested;
 static bool s_prev_requested;
+static bool s_select_requested;
+static int s_select_index = MUSIC_INVALID_INDEX;
 static bool s_sd_fail_latched;
 static TickType_t s_sd_retry_after_tick;
 static esp_err_t s_last_sd_error = ESP_OK;
@@ -101,6 +106,18 @@ static bool has_extension(const char *name, const char *ext)
 static bool is_prepared_audio_file(const char *name)
 {
     return has_extension(name, ".wav") || has_extension(name, ".pcm");
+}
+
+static int visible_start_for_index(int track_index, int track_count)
+{
+    int start = track_index - 1;
+    if (start < 0) {
+        start = 0;
+    }
+    if (track_count > MUSIC_PLAYER_LIST_LINES && start > track_count - MUSIC_PLAYER_LIST_LINES) {
+        start = track_count - MUSIC_PLAYER_LIST_LINES;
+    }
+    return start;
 }
 
 static void copy_track_title(const char *path, char *dst, size_t dst_size)
@@ -182,13 +199,7 @@ void music_player_get_state(music_player_state_t *out)
         strlcpy(out->title, s_mounted ? "NO WAV/PCM FOUND" : "SCAN TF CARD", sizeof(out->title));
     }
 
-    int start = s_track_index - 1;
-    if (start < 0) {
-        start = 0;
-    }
-    if (s_track_count > MUSIC_PLAYER_LIST_LINES && start > s_track_count - MUSIC_PLAYER_LIST_LINES) {
-        start = s_track_count - MUSIC_PLAYER_LIST_LINES;
-    }
+    int start = visible_start_for_index(s_track_index, s_track_count);
     for (int i = 0; i < MUSIC_PLAYER_LIST_LINES; ++i) {
         int idx = start + i;
         if (idx >= 0 && idx < s_track_count) {
@@ -228,6 +239,15 @@ static bool request_stop_locked(int step)
     } else if (step < 0) {
         s_prev_requested = true;
     }
+    return was_playing;
+}
+
+static bool request_select_locked(int index)
+{
+    bool was_playing = s_playing;
+    s_select_requested = true;
+    s_select_index = index;
+    s_stop_requested = was_playing;
     return was_playing;
 }
 
@@ -278,6 +298,26 @@ static int take_track_step_requested(void)
     return step;
 }
 
+static bool take_track_select_requested(int *index)
+{
+    bool requested = false;
+    int selected = MUSIC_INVALID_INDEX;
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    requested = s_select_requested;
+    selected = s_select_index;
+    s_select_requested = false;
+    s_select_index = MUSIC_INVALID_INDEX;
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+    if (requested && index) {
+        *index = selected;
+    }
+    return requested;
+}
+
 static void clear_stop_requested(void)
 {
     if (s_lock) {
@@ -303,6 +343,29 @@ static void mark_playing(bool playing)
     if (changed) {
         notify_state();
     }
+}
+
+static esp_err_t set_track_index(int index)
+{
+    bool changed = false;
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    if (index < 0 || index >= s_track_count) {
+        if (s_lock) {
+            xSemaphoreGive(s_lock);
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+    changed = s_track_index != index;
+    s_track_index = index;
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+    if (changed) {
+        notify_state();
+    }
+    return ESP_OK;
 }
 
 static bool sd_retry_is_deferred(void)
@@ -438,6 +501,9 @@ static esp_err_t refresh_playlist(void)
     snprintf(status, sizeof(status), "MUSIC LIST %d", s_track_count);
     set_status(status);
     ESP_LOGI(TAG, "playlist tracks=%d current=%s", s_track_count, s_tracks[s_track_index]);
+    for (int i = 0; i < s_track_count; ++i) {
+        ESP_LOGI(TAG, "playlist[%02d]=%s", i + 1, s_tracks[i]);
+    }
     return ESP_OK;
 }
 
@@ -565,6 +631,12 @@ static esp_err_t play_track(const char *path)
     music_file_stream_t stream = {0};
     esp_err_t ret = open_pcm_file(path, &stream);
     if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "track open/format failed index=%d/%d ret=%s path=%s",
+                 s_track_index + 1,
+                 s_track_count,
+                 esp_err_to_name(ret),
+                 path ? path : "");
         return ret;
     }
 
@@ -696,6 +768,14 @@ static void music_task(void *arg)
             refresh_playlist();
             continue;
         }
+        if (cmd.id == MUSIC_CMD_SELECT) {
+            if (cmd.index < 0) {
+                set_status("MUSIC BAD SEL");
+                continue;
+            }
+            set_track_index(cmd.index);
+            clear_stop_requested();
+        }
 
         esp_err_t ret = refresh_playlist();
         if (ret != ESP_OK) {
@@ -705,14 +785,31 @@ static void music_task(void *arg)
         bool keep_playing = true;
         while (keep_playing && s_track_count > 0) {
             ret = play_track(s_tracks[s_track_index]);
+            int selected_index = MUSIC_INVALID_INDEX;
+            bool select_requested = take_track_select_requested(&selected_index);
             int step_requested = take_track_step_requested();
-            if (step_requested != 0) {
+            if (select_requested) {
+                if (set_track_index(selected_index) == ESP_OK) {
+                    clear_stop_requested();
+                    keep_playing = true;
+                } else {
+                    set_status("MUSIC BAD SEL");
+                    keep_playing = false;
+                    clear_stop_requested();
+                }
+            } else if (step_requested != 0) {
                 step_track(step_requested);
                 clear_stop_requested();
                 keep_playing = true;
             } else if (ret == ESP_ERR_INVALID_STATE) {
                 keep_playing = false;
                 clear_stop_requested();
+            } else if (ret != ESP_OK) {
+                char status[MUSIC_PLAYER_STATUS_MAX];
+                snprintf(status, sizeof(status), "MUSIC ERR %02d", s_track_index + 1);
+                set_status(status);
+                clear_stop_requested();
+                keep_playing = false;
             } else {
                 advance_track();
                 notify_state();
@@ -726,17 +823,22 @@ static void music_task(void *arg)
     }
 }
 
-static esp_err_t queue_music_cmd(music_cmd_id_t id)
+static esp_err_t queue_music_cmd_arg(music_cmd_id_t id, int index)
 {
     if (!s_cmd_queue) {
         return ESP_ERR_INVALID_STATE;
     }
-    music_cmd_t cmd = {.id = id};
+    music_cmd_t cmd = {.id = id, .index = index};
     if (xQueueSend(s_cmd_queue, &cmd, 0) != pdTRUE) {
         ESP_LOGW(TAG, "music command queue full id=%d", id);
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
+}
+
+static esp_err_t queue_music_cmd(music_cmd_id_t id)
+{
+    return queue_music_cmd_arg(id, MUSIC_INVALID_INDEX);
 }
 
 esp_err_t music_player_init(void)
@@ -824,6 +926,54 @@ esp_err_t music_player_toggle(void)
 esp_err_t music_player_refresh(void)
 {
     return queue_music_cmd(MUSIC_CMD_REFRESH);
+}
+
+esp_err_t music_player_select_visible(int row)
+{
+    if (row < 0 || row >= MUSIC_PLAYER_LIST_LINES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int index = MUSIC_INVALID_INDEX;
+    bool was_playing = false;
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    if (s_track_count > 0) {
+        int start = visible_start_for_index(s_track_index, s_track_count);
+        index = start + row;
+        if (index >= s_track_count) {
+            index = MUSIC_INVALID_INDEX;
+        }
+    }
+    if (index >= 0) {
+        was_playing = s_playing;
+        if (was_playing) {
+            request_select_locked(index);
+        } else {
+            s_select_requested = false;
+            s_select_index = MUSIC_INVALID_INDEX;
+            s_stop_requested = false;
+            s_next_requested = false;
+            s_prev_requested = false;
+            s_track_index = index;
+        }
+    }
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+
+    if (index < 0) {
+        set_status("MUSIC BAD SEL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    notify_state();
+    if (was_playing) {
+        audio_player_cancel();
+        return ESP_OK;
+    }
+    return queue_music_cmd_arg(MUSIC_CMD_SELECT, index);
 }
 
 void music_player_set_state_callback(music_player_state_cb_t cb, void *ctx)

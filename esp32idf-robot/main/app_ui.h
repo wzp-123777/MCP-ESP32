@@ -34,6 +34,10 @@ typedef enum {
     APP_UI_ACTION_MUSIC_TOGGLE,
     APP_UI_ACTION_MUSIC_NEXT,
     APP_UI_ACTION_MUSIC_REFRESH,
+    APP_UI_ACTION_MUSIC_SELECT_0,
+    APP_UI_ACTION_MUSIC_SELECT_1,
+    APP_UI_ACTION_MUSIC_SELECT_2,
+    APP_UI_ACTION_MUSIC_SELECT_3,
 } app_ui_action_t;
 
 typedef void (*app_ui_action_cb_t)(app_ui_action_t action, void *ctx);
@@ -70,6 +74,7 @@ void app_ui_set_music_state(bool playing,
                             int track_count,
                             const char *line1,
                             const char *line2,
-                            const char *line3);
+                            const char *line3,
+                            const char *line4);
 void app_ui_next_page(void);
 void app_ui_prev_page(void);

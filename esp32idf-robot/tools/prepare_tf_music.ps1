@@ -29,9 +29,15 @@ Get-ChildItem -LiteralPath $InputDir -File | Sort-Object Name | ForEach-Object {
   }
 
   $safeName = [IO.Path]::GetFileNameWithoutExtension($_.Name)
+  $safeName = $safeName -replace '[^A-Za-z0-9._ -]', '_'
   $safeName = $safeName -replace '[\\/:*?"<>|]', '_'
-  if ($safeName.Length -gt 54) {
-    $safeName = $safeName.Substring(0, 54)
+  $safeName = $safeName -replace '_+', '_'
+  $safeName = $safeName.Trim(' ', '.', '_')
+  if ([string]::IsNullOrWhiteSpace($safeName)) {
+    $safeName = "track"
+  }
+  if ($safeName.Length -gt 40) {
+    $safeName = $safeName.Substring(0, 40).Trim(' ', '.', '_')
   }
   $outName = "{0:D2}_{1}.wav" -f $index, $safeName
   $outPath = Join-Path $OutputDir $outName

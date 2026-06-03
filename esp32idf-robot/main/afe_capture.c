@@ -989,7 +989,7 @@ esp_err_t afe_capture_init(afe_capture_event_cb_t event_cb, void *event_ctx)
                  vad_min_noise_ms,
                  vad_delay_ms);
     }
-    afe_cfg->afe_linear_gain = 1.0f;
+    afe_cfg->afe_linear_gain = 1.6f;
     afe_cfg = afe_config_check(afe_cfg);
     if (!afe_cfg) {
         ESP_LOGE(TAG, "afe_config_check failed");

@@ -39,12 +39,12 @@
 #define CONT_VAD_STOP_PEAK 1400
 #define CONT_VAD_START_HITS 6
 #define CONT_VAD_SILENCE_HITS 3
-#define CONT_VAD_TAIL_MS 200
-#define CONT_VAD_MIN_SPEECH_MS 240
+#define CONT_VAD_TAIL_MS 350
+#define CONT_VAD_MIN_SPEECH_MS 700
 #define CONT_VAD_MAX_SPEECH_MS 12000
 #define CONT_VAD_WATCHDOG_MS 300
 #define CONT_VAD_STALE_AUDIO_MS 250
-#define CONT_VAD_STALE_SILENCE_MS 200
+#define CONT_VAD_STALE_SILENCE_MS 350
 #define CONT_STARTUP_REARM_MS 350
 #define CONT_REARM_DELAY_MS 800
 #define CONT_PLAYBACK_TAIL_IGNORE_MS 650
@@ -210,6 +210,10 @@ typedef enum {
     VOICE_CMD_MUSIC_PREV,
     VOICE_CMD_MUSIC_TOGGLE,
     VOICE_CMD_MUSIC_REFRESH,
+    VOICE_CMD_MUSIC_SELECT_0,
+    VOICE_CMD_MUSIC_SELECT_1,
+    VOICE_CMD_MUSIC_SELECT_2,
+    VOICE_CMD_MUSIC_SELECT_3,
     VOICE_CMD_CAMERA_CAPTURE,
     VOICE_CMD_ENV_STATUS,
     VOICE_CMD_LIGHT_ON,
@@ -300,6 +304,8 @@ static bool s_audio_busy;
 static bool s_assistant_playback_busy;
 static volatile bool s_loop_enabled;
 static volatile bool s_barge_playback_cancelled;
+static robot_env_reading_t s_last_env_reading;
+static bool s_last_env_valid;
 static TickType_t s_last_chat_toggle_tick;
 static TickType_t s_cont_speech_start_tick;
 static TickType_t s_cont_last_voice_tick;
@@ -886,6 +892,18 @@ static void on_ui_action(app_ui_action_t action, void *ctx)
         case APP_UI_ACTION_MUSIC_REFRESH:
             send_cmd_nonblocking(VOICE_CMD_MUSIC_REFRESH, 0);
             break;
+        case APP_UI_ACTION_MUSIC_SELECT_0:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_SELECT_0, 0);
+            break;
+        case APP_UI_ACTION_MUSIC_SELECT_1:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_SELECT_1, 0);
+            break;
+        case APP_UI_ACTION_MUSIC_SELECT_2:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_SELECT_2, 0);
+            break;
+        case APP_UI_ACTION_MUSIC_SELECT_3:
+            send_cmd_nonblocking(VOICE_CMD_MUSIC_SELECT_3, 0);
+            break;
     }
 }
 
@@ -907,7 +925,8 @@ static void on_music_state(const music_player_state_t *state, void *ctx)
                            state->track_count,
                            state->list[0],
                            state->list[1],
-                           state->list[2]);
+                           state->list[2],
+                           state->list[3]);
 }
 
 static void barge_diag_note_afe_event(afe_capture_event_t event)
@@ -1372,8 +1391,7 @@ static app_ui_assistant_state_t continuous_ready_state(void)
 
 static bool cont_upload_mode_prefers_raw(void)
 {
-    return s_cont_upload_mode == CONT_UPLOAD_MODE_AUTO ||
-           s_cont_upload_mode == CONT_UPLOAD_MODE_RAW_MIC;
+    return s_cont_upload_mode == CONT_UPLOAD_MODE_RAW_MIC;
 }
 
 static void extend_afe_reject_until(TickType_t until_tick)
@@ -4139,6 +4157,35 @@ static bool command_has_token_prefix(const char *command, const char *prefix)
     return *prefix == '\0' && (*command == '\0' || isspace((unsigned char)*command));
 }
 
+static size_t on_peripheral_telemetry_extra(char *buffer, size_t buffer_len, void *ctx)
+{
+    (void)ctx;
+    if (!buffer || buffer_len == 0) {
+        return 0;
+    }
+    char temperature[20] = "null";
+    char humidity[20] = "null";
+    if (s_last_env_valid && s_last_env_reading.valid) {
+        snprintf(temperature, sizeof(temperature), "%.1f", (double)s_last_env_reading.temperature_c_x10 / 10.0);
+        snprintf(humidity, sizeof(humidity), "%.1f", (double)s_last_env_reading.humidity_x10 / 10.0);
+    }
+    int written = snprintf(buffer,
+                           buffer_len,
+                           ",\"temperature\":%s,\"humidity\":%s,\"light_on\":%s,\"camera_available\":false",
+                           temperature,
+                           humidity,
+                           robot_peripherals_room_light_is_on() ? "true" : "false");
+    if (written < 0) {
+        buffer[0] = '\0';
+        return 0;
+    }
+    if ((size_t)written >= buffer_len) {
+        buffer[buffer_len - 1] = '\0';
+        return buffer_len - 1;
+    }
+    return (size_t)written;
+}
+
 static void on_mcp_device_command(const char *command, void *ctx)
 {
     (void)ctx;
@@ -4151,14 +4198,16 @@ static void on_mcp_device_command(const char *command, void *ctx)
         return;
     }
     if (command_equals(command, "chat_start") || command_equals(command, "chat_on") ||
-        command_equals(command, "continuous_on")) {
+        command_equals(command, "chat start") || command_equals(command, "chat on") ||
+        command_equals(command, "continuous_on") || command_equals(command, "continuous on")) {
         if (!s_continuous_chat) {
             send_cmd_nonblocking(VOICE_CMD_CHAT_START, 0);
         }
         return;
     }
     if (command_equals(command, "chat_stop") || command_equals(command, "chat_off") ||
-        command_equals(command, "continuous_off")) {
+        command_equals(command, "chat stop") || command_equals(command, "chat off") ||
+        command_equals(command, "continuous_off") || command_equals(command, "continuous off")) {
         if (s_continuous_chat) {
             send_cmd_nonblocking(VOICE_CMD_CHAT_STOP, 0);
         }
@@ -4464,20 +4513,38 @@ static void playback_task(void *arg)
                     app_ui_set_voice_state("MUSIC ERR");
                 }
                 break;
+            case VOICE_CMD_MUSIC_SELECT_0:
+            case VOICE_CMD_MUSIC_SELECT_1:
+            case VOICE_CMD_MUSIC_SELECT_2:
+            case VOICE_CMD_MUSIC_SELECT_3:
+            {
+                int row = (int)cmd.type - (int)VOICE_CMD_MUSIC_SELECT_0;
+                if (music_player_select_visible(row) == ESP_OK) {
+                    app_ui_set_recent_text("播放选中歌曲");
+                    app_ui_set_voice_state("MUSIC PLAY");
+                } else {
+                    app_ui_set_voice_state("MUSIC ERR");
+                }
+                break;
+            }
             case VOICE_CMD_CAMERA_CAPTURE: {
                 char detail[192];
                 esp_err_t ret = robot_peripherals_camera_capture(detail, sizeof(detail));
                 app_ui_set_recent_text(ret == ESP_OK ? "摄像头拍照完成" : "摄像头等待硬件接入");
                 app_ui_set_voice_state(ret == ESP_OK ? "CAMERA OK" : "CAMERA WAIT");
                 mcp_client_send_diagnostic_event("camera", ret == ESP_OK ? "capture" : "not_ready", detail);
+                mcp_client_send_telemetry();
                 break;
             }
             case VOICE_CMD_ENV_STATUS: {
                 robot_env_reading_t reading = {0};
                 esp_err_t ret = robot_peripherals_read_environment(&reading);
+                s_last_env_reading = reading;
+                s_last_env_valid = ret == ESP_OK && reading.valid;
                 app_ui_set_recent_text(reading.detail[0] ? reading.detail : "温湿度传感器未接入");
                 app_ui_set_voice_state(ret == ESP_OK ? "ENV OK" : "ENV WAIT");
                 mcp_client_send_diagnostic_event("environment", ret == ESP_OK ? "status" : "not_ready", reading.detail);
+                mcp_client_send_telemetry();
                 break;
             }
             case VOICE_CMD_LIGHT_ON:
@@ -4493,6 +4560,7 @@ static void playback_task(void *arg)
                 app_ui_set_recent_text(detail);
                 app_ui_set_voice_state(ret == ESP_OK ? "LIGHT OK" : "LIGHT ERR");
                 mcp_client_send_diagnostic_event("room_light", ret == ESP_OK ? "state" : "error", detail);
+                mcp_client_send_telemetry();
                 break;
             }
             case VOICE_CMD_VOL_SET:
@@ -4877,6 +4945,7 @@ void app_main(void)
     mcp_client_set_busy_callback(on_mcp_assistant_busy, NULL);
     mcp_client_set_playback_callback(on_mcp_playback_busy, NULL);
     mcp_client_set_device_command_callback(on_mcp_device_command, NULL);
+    mcp_client_set_telemetry_extra_callback(on_peripheral_telemetry_extra, NULL);
     app_ui_set_mcp_status(mcp_client_get_status_text());
 
     s_cmd_queue = xQueueCreate(16, sizeof(voice_cmd_t));

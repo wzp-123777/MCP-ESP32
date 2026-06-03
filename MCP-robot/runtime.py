@@ -3399,7 +3399,6 @@ class RobotRuntime:
             error_text = str(exc)
             if (
                 "DialogAudioIdleTimeoutError" in error_text
-                and not final_asr
                 and not sent_pcm_start
             ):
                 logger.info(

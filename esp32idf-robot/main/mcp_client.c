@@ -167,6 +167,8 @@ static mcp_client_playback_cb_t s_playback_cb;
 static void *s_playback_ctx;
 static mcp_client_device_command_cb_t s_device_command_cb;
 static void *s_device_command_ctx;
+static mcp_client_telemetry_extra_cb_t s_telemetry_extra_cb;
+static void *s_telemetry_extra_ctx;
 
 #define MCP_WIFI_CONNECTED_BIT BIT0
 #define MCP_SEND_TIMEOUT pdMS_TO_TICKS(3000)
@@ -2285,6 +2287,12 @@ void mcp_client_set_device_command_callback(mcp_client_device_command_cb_t cb, v
     s_device_command_ctx = ctx;
 }
 
+void mcp_client_set_telemetry_extra_callback(mcp_client_telemetry_extra_cb_t cb, void *ctx)
+{
+    s_telemetry_extra_cb = cb;
+    s_telemetry_extra_ctx = ctx;
+}
+
 esp_err_t mcp_client_send_text_request(const char *text)
 {
     if (!text || !text[0]) {
@@ -2476,19 +2484,24 @@ esp_err_t mcp_client_send_telemetry(void)
     if (!s_ws_connected) {
         return ESP_ERR_INVALID_STATE;
     }
-    char payload[256];
+    char payload[512];
+    char extra[192] = {0};
     int rssi = -127;
     if (s_wifi_connected) {
         esp_wifi_sta_get_rssi(&rssi);
     }
+    if (s_telemetry_extra_cb) {
+        s_telemetry_extra_cb(extra, sizeof(extra), s_telemetry_extra_ctx);
+    }
     snprintf(payload,
              sizeof(payload),
-             "{\"type\":\"telemetry\",\"device_id\":\"%s\",\"free_heap\":%u,\"wifi_rssi\":%d,\"uptime_ms\":%u,\"ws_connected\":true,\"sr_enabled\":%s}",
+             "{\"type\":\"telemetry\",\"device_id\":\"%s\",\"free_heap\":%u,\"wifi_rssi\":%d,\"uptime_ms\":%u,\"ws_connected\":true,\"sr_enabled\":%s%s}",
              ROBOT_DEVICE_ID,
              (unsigned)esp_get_free_heap_size(),
              rssi,
              (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-             s_sr_enabled ? "true" : "false");
+             s_sr_enabled ? "true" : "false",
+             extra);
     esp_err_t err = ws_send_json(payload);
     if (err == ESP_OK) {
         app_ui_set_mcp_connected(true);

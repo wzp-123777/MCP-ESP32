@@ -35,6 +35,7 @@
 #define UI_LVGL_TICK_MS 5
 #define UI_PAGE_COUNT 7
 #define UI_ACTION_QUEUE_LEN 8
+#define UI_MUSIC_LIST_LINES 4
 #define UI_TOUCH_I2C_CLK 100000
 #define UI_TOUCH_TT21100_ADDR 0x24
 #define UI_TOUCH_GT911_ADDR 0x5D
@@ -126,7 +127,7 @@ static char s_dashboard_updated_at[24] = "";
 static bool s_music_playing;
 static char s_music_title[80] = "等待扫描 TF 卡";
 static char s_music_status[80] = "MUSIC READY";
-static char s_music_list[3][80] = {"把 WAV/PCM 放到 /music", "", ""};
+static char s_music_list[UI_MUSIC_LIST_LINES][80] = {"把 WAV/PCM 放到 /music", "", "", ""};
 static int s_music_track_index;
 static int s_music_track_count;
 static int s_volume = 85;
@@ -181,7 +182,8 @@ static lv_obj_t *s_calendar_update_label;
 static lv_obj_t *s_music_title_label;
 static lv_obj_t *s_music_status_label;
 static lv_obj_t *s_music_count_label;
-static lv_obj_t *s_music_list_labels[3];
+static lv_obj_t *s_music_list_buttons[UI_MUSIC_LIST_LINES];
+static lv_obj_t *s_music_list_labels[UI_MUSIC_LIST_LINES];
 static lv_obj_t *s_music_toggle_button;
 static lv_obj_t *s_music_toggle_label;
 
@@ -1157,6 +1159,46 @@ static lv_obj_t *make_action_button(lv_obj_t *parent,
     return btn;
 }
 
+static app_ui_action_t music_select_action_for_row(int row)
+{
+    switch (row) {
+        case 0:
+            return APP_UI_ACTION_MUSIC_SELECT_0;
+        case 1:
+            return APP_UI_ACTION_MUSIC_SELECT_1;
+        case 2:
+            return APP_UI_ACTION_MUSIC_SELECT_2;
+        case 3:
+        default:
+            return APP_UI_ACTION_MUSIC_SELECT_3;
+    }
+}
+
+static lv_obj_t *make_music_row_button(lv_obj_t *parent, int row)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, UI_W - 54, 15);
+    lv_obj_set_pos(btn, 0, row * 15);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(UI_ACCENT_SOFT_COLOR), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 4, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn,
+                        action_button_event_cb,
+                        LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)music_select_action_for_row(row));
+
+    lv_obj_t *label = make_label(btn, UI_FONT_TEXT, lv_color_hex(UI_MUTED_COLOR));
+    lv_obj_set_size(label, UI_W - 62, 15);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_EVENT_BUBBLE);
+    return btn;
+}
+
 static lv_obj_t *make_page(lv_obj_t *screen)
 {
     lv_obj_t *page = lv_obj_create(screen);
@@ -1463,7 +1505,7 @@ static void create_music_page(lv_obj_t *page)
     lv_obj_set_pos(s_music_count_label, UI_W - 160, 44);
     lv_obj_set_style_text_align(s_music_count_label, LV_TEXT_ALIGN_RIGHT, 0);
 
-    lv_obj_t *now_card = make_card(page, 18, 76, UI_W - 36, 54);
+    lv_obj_t *now_card = make_card(page, 18, 72, UI_W - 36, 48);
     s_music_title_label = make_label(now_card, UI_FONT_TEXT, lv_color_hex(UI_TEXT_COLOR));
     lv_obj_set_size(s_music_title_label, UI_W - 54, 22);
     lv_obj_align(s_music_title_label, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -1471,12 +1513,10 @@ static void create_music_page(lv_obj_t *page)
     lv_obj_set_size(s_music_status_label, UI_W - 54, 18);
     lv_obj_align(s_music_status_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
-    lv_obj_t *list_card = make_card(page, 18, 136, UI_W - 36, 56);
-    for (int i = 0; i < 3; ++i) {
-        s_music_list_labels[i] = make_label(list_card, UI_FONT_TEXT,
-                                            i == 0 ? lv_color_hex(UI_TEXT_COLOR) : lv_color_hex(UI_MUTED_COLOR));
-        lv_obj_set_size(s_music_list_labels[i], UI_W - 54, 16);
-        lv_obj_set_pos(s_music_list_labels[i], 0, i * 16);
+    lv_obj_t *list_card = make_card(page, 18, 126, UI_W - 36, 68);
+    for (int i = 0; i < UI_MUSIC_LIST_LINES; ++i) {
+        s_music_list_buttons[i] = make_music_row_button(list_card, i);
+        s_music_list_labels[i] = lv_obj_get_child(s_music_list_buttons[i], 0);
     }
 
     make_action_button(page, 18, 202, 64, 32, "上一", lv_color_hex(UI_PANEL_COLOR), APP_UI_ACTION_MUSIC_PREV);
@@ -1682,12 +1722,16 @@ static void apply_ui_locked(void)
         } else {
             lv_label_set_text(s_music_count_label, "0 首");
         }
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < UI_MUSIC_LIST_LINES; ++i) {
+            bool selected = s_music_list[i][0] == '>';
             lv_label_set_text(s_music_list_labels[i], s_music_list[i]);
             lv_obj_set_style_text_color(s_music_list_labels[i],
-                                        s_music_list[i][0] == '>' ? lv_color_hex(UI_ACCENT_COLOR)
-                                                                  : lv_color_hex(UI_MUTED_COLOR),
+                                        selected ? lv_color_hex(UI_ACCENT_COLOR) : lv_color_hex(UI_MUTED_COLOR),
                                         0);
+            lv_obj_set_style_bg_opa(s_music_list_buttons[i], selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_set_style_bg_color(s_music_list_buttons[i],
+                                      selected ? lv_color_hex(UI_ACCENT_SOFT_COLOR) : lv_color_hex(UI_PANEL_COLOR),
+                                      0);
         }
         lv_label_set_text(s_music_toggle_label, s_music_playing ? "暂停" : "播放");
         lv_obj_set_style_bg_color(s_music_toggle_button,
@@ -1777,6 +1821,14 @@ static const char *action_name(app_ui_action_t action)
             return "music_next";
         case APP_UI_ACTION_MUSIC_REFRESH:
             return "music_refresh";
+        case APP_UI_ACTION_MUSIC_SELECT_0:
+            return "music_select_0";
+        case APP_UI_ACTION_MUSIC_SELECT_1:
+            return "music_select_1";
+        case APP_UI_ACTION_MUSIC_SELECT_2:
+            return "music_select_2";
+        case APP_UI_ACTION_MUSIC_SELECT_3:
+            return "music_select_3";
         default:
             return "unknown";
     }
@@ -2162,7 +2214,8 @@ void app_ui_set_music_state(bool playing,
                             int track_count,
                             const char *line1,
                             const char *line2,
-                            const char *line3)
+                            const char *line3,
+                            const char *line4)
 {
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
         s_music_playing = playing;
@@ -2171,6 +2224,7 @@ void app_ui_set_music_state(bool playing,
         copy_limited_text(s_music_list[0], sizeof(s_music_list[0]), line1);
         copy_limited_text(s_music_list[1], sizeof(s_music_list[1]), line2);
         copy_limited_text(s_music_list[2], sizeof(s_music_list[2]), line3);
+        copy_limited_text(s_music_list[3], sizeof(s_music_list[3]), line4);
         if (s_music_title[0] == '\0') {
             strlcpy(s_music_title, "等待扫描 TF 卡", sizeof(s_music_title));
         }

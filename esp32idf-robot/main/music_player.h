@@ -4,7 +4,7 @@
 
 #include "esp_err.h"
 
-#define MUSIC_PLAYER_LIST_LINES 3
+#define MUSIC_PLAYER_LIST_LINES 4
 #define MUSIC_PLAYER_TITLE_MAX 72
 #define MUSIC_PLAYER_STATUS_MAX 80
 
@@ -27,6 +27,7 @@ esp_err_t music_player_next(void);
 esp_err_t music_player_prev(void);
 esp_err_t music_player_toggle(void);
 esp_err_t music_player_refresh(void);
+esp_err_t music_player_select_visible(int row);
 bool music_player_is_playing(void);
 const char *music_player_get_status(void);
 void music_player_get_state(music_player_state_t *out);
