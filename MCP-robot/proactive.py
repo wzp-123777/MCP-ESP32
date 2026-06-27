@@ -27,6 +27,7 @@ TraceEvent = Callable[[str, dict[str, Any]], None]
 
 @dataclass(slots=True)
 class CalendarEvent:
+    kind: str
     title: str
     start: datetime
     end: datetime | None = None
@@ -103,6 +104,35 @@ def _safe_text(value: Any, max_len: int = 120) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:max_len]
 
 
+def _normalize_event_kind(value: Any) -> str:
+    text = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "", str(value or "").strip().lower())
+    if text in {"alarm", "timer", "闹钟", "倒计时"}:
+        return "alarm"
+    if text in {"reminder", "remind", "提醒", "提醒事项"}:
+        return "reminder"
+    return "calendar"
+
+
+def _is_alarm_like(event: CalendarEvent) -> bool:
+    return event.kind in {"alarm", "reminder"}
+
+
+def _countdown_label(start: datetime, now: datetime | None = None) -> str:
+    seconds_left = int((start - (now or _now_local())).total_seconds())
+    if seconds_left <= 0:
+        return "正在提醒"
+    minutes_left = max(1, (seconds_left + 59) // 60)
+    days, remainder = divmod(minutes_left, 24 * 60)
+    hours, minutes = divmod(remainder, 60)
+    if days > 0:
+        if hours > 0:
+            return f"{days}天{hours}小时"
+        return f"{days}天"
+    if hours > 0:
+        return f"{hours}小时{minutes:02d}分钟"
+    return f"{minutes}分钟"
+
+
 def _redact_secret(text: Any, *secrets: str) -> str:
     result = str(text or "")
     for secret in secrets:
@@ -173,6 +203,17 @@ class ProactiveEngine:
 
     async def _refresh_weather(self) -> None:
         location = self.config.aiot_weather_location
+        if self.config.tool_api.amap_key:
+            await self._refresh_weather_from_amap()
+            if self._weather_now and (
+                isinstance(self._weather_daily, dict) and self._weather_daily.get("daily")
+            ):
+                self.trace(
+                    "proactive.weather.refresh",
+                    {"location": location, "provider": "amap", "now_ok": True, "daily_ok": True},
+                )
+                return
+
         now_result = await self.weather_tool.execute({"location": location, "kind": "now"})
         if now_result.ok and isinstance(now_result.content, dict):
             self._weather_now = dict(now_result.content)
@@ -183,7 +224,14 @@ class ProactiveEngine:
             self._weather_daily = dict(daily_result.content)
         else:
             logger.warning("weather daily failed: %s", _redact_secret(daily_result.error, self.config.tool_api.seniverse_key))
-        if not self._weather_now and self.config.tool_api.amap_key:
+        weather_now_missing = not self._weather_now
+        weather_daily_missing = not (
+            isinstance(self._weather_daily, dict) and self._weather_daily.get("daily")
+        )
+        if (
+            self.config.tool_api.amap_key
+            and (weather_now_missing or weather_daily_missing or not now_result.ok or not daily_result.ok)
+        ):
             await self._refresh_weather_from_amap()
         self.trace(
             "proactive.weather.refresh",
@@ -262,14 +310,17 @@ class ProactiveEngine:
             title = _safe_text(item.get("title"), 60)
             if not title:
                 continue
+            kind = _normalize_event_kind(item.get("kind") or item.get("type"))
+            raw_remind_minutes = _to_int(item.get("remind_minutes"), 20)
             events.append(
                 CalendarEvent(
+                    kind=kind,
                     title=title,
                     start=start,
                     end=end,
                     location=_safe_text(item.get("location"), 40),
                     note=_safe_text(item.get("note"), 80),
-                    remind_minutes=max(1, min(1440, _to_int(item.get("remind_minutes"), 20))),
+                    remind_minutes=max(0 if kind in {"alarm", "reminder"} else 1, min(1440, raw_remind_minutes)),
                     enabled=bool(item.get("enabled", True)),
                 )
             )
@@ -302,8 +353,16 @@ class ProactiveEngine:
 
         now_local = _now_local()
         calendar_title = _calendar_today_label(now_local)
+        next_alarm = self._next_alarm_event(calendar)
         next_event = self._next_calendar_event(calendar)
-        if next_event:
+        previous_reminder = str(self._dashboard.get("reminder_text") or "").strip()
+        reminder_text = previous_reminder
+        if next_alarm:
+            start_label = _event_start_label(next_alarm.start, now_local)
+            countdown = _countdown_label(next_alarm.start, now_local)
+            calendar_detail = f"闹钟 {start_label} {next_alarm.title}"
+            reminder_text = f"闹钟倒计时 {countdown}：{next_alarm.title}"
+        elif next_event:
             start_label = _event_start_label(next_event.start, now_local)
             detail_extra = next_event.location or next_event.note or f"提前{next_event.remind_minutes}分钟提醒"
             calendar_detail = f"下个日程 {start_label} {next_event.title}"
@@ -321,19 +380,21 @@ class ProactiveEngine:
             "weather_alert": weather_alert[:96],
             "calendar_title": calendar_title[:80],
             "calendar_detail": calendar_detail[:96],
-            "reminder_text": self._dashboard.get("reminder_text", "")[:96],
+            "reminder_text": reminder_text[:96],
             "updated_at": _now_local().strftime("%H:%M"),
         }
 
     def _weather_alert_text(self) -> str:
         if not self._weather_now and not (self._weather_daily.get("daily") if isinstance(self._weather_daily, dict) else None):
             return ""
+        daily = self._weather_daily.get("daily") if isinstance(self._weather_daily, dict) else []
+        today = daily[0] if isinstance(daily, list) and daily and isinstance(daily[0], dict) else {}
         text = " ".join(
             str(item or "")
             for item in (
                 self._weather_now.get("text"),
-                *(day.get("text_day") for day in (self._weather_daily.get("daily") or [])[:2] if isinstance(day, dict)),
-                *(day.get("text_night") for day in (self._weather_daily.get("daily") or [])[:2] if isinstance(day, dict)),
+                today.get("text_day"),
+                today.get("text_night"),
             )
         )
         temp = _to_int(self._weather_now.get("temperature"), -1000)
@@ -349,6 +410,13 @@ class ProactiveEngine:
         now = _now_local() - timedelta(minutes=5)
         for event in calendar:
             if event.enabled and event.start >= now:
+                return event
+        return None
+
+    def _next_alarm_event(self, calendar: list[CalendarEvent]) -> CalendarEvent | None:
+        now = _now_local() - timedelta(minutes=2)
+        for event in calendar:
+            if event.enabled and _is_alarm_like(event) and event.start >= now:
                 return event
         return None
 
@@ -372,13 +440,17 @@ class ProactiveEngine:
                 continue
             minutes_left = (event.start - now).total_seconds() / 60.0
             if -2 <= minutes_left <= event.remind_minutes:
+                kind = event.kind if _is_alarm_like(event) else "calendar"
+                event_prefix = "闹钟" if kind == "alarm" else ("提醒" if kind == "reminder" else "日程")
                 due.append(
                     {
-                        "kind": "calendar",
-                        "dedupe_key": f"calendar:{event.start.isoformat()}:{event.title}",
-                        "event_text": f"{event.title}，{max(0, round(minutes_left))}分钟后开始。{event.location or event.note}",
+                        "kind": kind,
+                        "dedupe_key": f"{kind}:{event.start.isoformat()}:{event.title}",
+                        "title": event.title,
+                        "event_text": f"{event_prefix}{event.title}，{max(0, round(minutes_left))}分钟后开始。{event.location or event.note}",
                         "priority": "high",
-                        "fallback": f"{event.title}快开始了。",
+                        "fallback": f"{event.title}时间到了。",
+                        "alarm_music_index": 2 if _is_alarm_like(event) else None,
                     }
                 )
         return due

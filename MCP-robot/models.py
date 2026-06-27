@@ -387,6 +387,47 @@ class LanguageModelService:
             if text.strip():
                 yield text
 
+    async def compose_esp32_vision_reply(
+        self,
+        *,
+        user_text: str,
+        image_answer: str,
+        scene_summary: str = "",
+        mode: str = "general",
+    ) -> str:
+        system_prompt = (
+            "你是小乐的语音回答整理器。"
+            "把视觉模型或题解模型的结果整理成中文短句，适合 ESP32 直接朗读。"
+            "只输出最终回答，不要 Markdown、编号、代码块、emoji，也不要提模型或后台。"
+            "普通识物尽量一句话；拍题最多两句话，只说关键答案和最短思路。"
+        )
+        user_prompt = json.dumps(
+            {
+                "mode": mode,
+                "user_text": user_text,
+                "scene_summary": scene_summary,
+                "image_answer": image_answer,
+                "style_hint": "短、直接、口语化；复杂题只先讲关键结论。",
+            },
+            ensure_ascii=False,
+        )
+        try:
+            text = await self._client.complete_text(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.25,
+                max_tokens=140,
+            )
+            cleaned = re.sub(r"[#*`]+", "", text).strip()
+            if cleaned:
+                return cleaned
+        except Exception as exc:
+            logger.warning("ESP32 视觉短答整理失败，改用兜底文案: %s", exc)
+        fallback = image_answer or scene_summary or "我看到了，但还没识别清楚。"
+        return fallback[:120]
+
     async def compose_image_followup(
         self,
         *,

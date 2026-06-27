@@ -54,6 +54,7 @@ class DoubaoDialogConfig:
     tts_format: str = "pcm_s16le"
     tts_sample_rate: int = 24000
     tts_channel: int = 1
+    input_mod: str = "keep_alive"
     timeout_seconds: float = 30.0
     audio_chunk_ms: int = 100
     vad_tail_silence_ms: int = 200
@@ -100,6 +101,7 @@ class AppConfig:
     qq_tool_model: ModelConfig
     vision_model: ModelConfig
     vision_highres_model: ModelConfig
+    problem_model: ModelConfig
     asr_model: ModelConfig
     tts_model: ModelConfig
     context_embedding: EmbeddingConfig
@@ -387,6 +389,12 @@ def load_config() -> AppConfig:
             model=os.getenv("VISION_HIGHRES_MODEL", "qwen3.6-plus").strip(),
             timeout_seconds=float(os.getenv("VISION_HIGHRES_TIMEOUT_SECONDS", "120")),
         ),
+        problem_model=ModelConfig(
+            api_key=os.getenv("PROBLEM_MODEL_API_KEY", mimo_api_key).strip(),
+            base_url=os.getenv("PROBLEM_MODEL_BASE_URL", mimo_base_url).strip(),
+            model=os.getenv("PROBLEM_MODEL", os.getenv("MIMO_PROBLEM_MODEL", os.getenv("MIMO_LANGUAGE_MODEL", "mimo-v2.5-pro"))).strip(),
+            timeout_seconds=float(os.getenv("PROBLEM_MODEL_TIMEOUT_SECONDS", os.getenv("MIMO_TIMEOUT_SECONDS", "120"))),
+        ),
         asr_model=ModelConfig(
             api_key=os.getenv("ASR_API_KEY", qwen_api_key).strip(),
             base_url=os.getenv("ASR_BASE_URL", qwen_base_url).strip(),
@@ -486,11 +494,13 @@ def load_config() -> AppConfig:
             tts_format=os.getenv("DOUBAO_DIALOG_TTS_FORMAT", "pcm_s16le").strip(),
             tts_sample_rate=max(8000, int(os.getenv("DOUBAO_DIALOG_TTS_SAMPLE_RATE", "24000"))),
             tts_channel=max(1, int(os.getenv("DOUBAO_DIALOG_TTS_CHANNEL", "1"))),
+            input_mod=os.getenv("DOUBAO_DIALOG_INPUT_MOD", "keep_alive").strip() or "keep_alive",
             timeout_seconds=float(os.getenv("DOUBAO_DIALOG_TIMEOUT_SECONDS", "30")),
             audio_chunk_ms=max(20, int(os.getenv("DOUBAO_DIALOG_AUDIO_CHUNK_MS", "40"))),
-            # File-style ESP32 uploads still need a short explicit silence tail for EOS,
-            # but a long tail makes every spoken turn feel late.
-            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "200"))),
+            # File-style ESP32 uploads need enough explicit silence for Doubao VAD to close.
+            # 300ms still caused occasional ClientLackDataError on real ESP32 captures; 400ms
+            # keeps turns responsive while avoiding the common no-speech timeout.
+            vad_tail_silence_ms=max(0, int(os.getenv("DOUBAO_DIALOG_VAD_TAIL_SILENCE_MS", "400"))),
             output_flush_ms=max(120, int(os.getenv("DOUBAO_DIALOG_OUTPUT_FLUSH_MS", "160"))),
             persona_dir=Path(os.getenv("MCP_PERSONA_DIR", str(data_dir / "personas"))).resolve(),
             voice_preset_file=Path(os.getenv("MCP_VOICE_PRESET_FILE", str(data_dir / "voice_presets.json"))).resolve(),

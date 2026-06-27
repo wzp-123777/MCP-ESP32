@@ -239,7 +239,7 @@ class DoubaoRealtimeDialogClient:
                     "bot_name": bot_name_override.strip() or self.config.bot_name,
                     "system_role": system_role,
                     "extra": {
-                        "input_mod": "audio",
+                        "input_mod": self.config.input_mod or "keep_alive",
                     },
                 },
                 "tts": {
