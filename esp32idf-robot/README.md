@@ -1,37 +1,79 @@
 # esp32idf-robot
 
-ESP-IDF + ESP-ADF 语音机器人工程，目标硬件为 ESP32-S3-Korvo-2 V3。
+ESP-IDF + ESP-ADF 语音机器人工程，目标硬件为 ESP32-S3-Korvo-2 V3。启动后会连接 Wi-Fi 和 MCP WebSocket，按住 `SET` 录音，松开发送到 MCP；服务端 TTS WAV 下行后通过 ES8311 播放。
 
-当前默认不再循环播放“小乐”。启动后会自动连接 Wi-Fi 和 MCP WebSocket，按住 `SET` 录音，松开发送到 MCP，服务端 TTS WAV 下行后通过 ES8311 播放。
+## 可复现环境
 
-默认配置在 `main/app_config.h` 中设置。发布仓库使用占位符，本地工作副本可以填自己的 Wi-Fi 和 MCP 地址：
+| 项目 | 版本/型号 |
+| --- | --- |
+| 硬件 | ESP32-S3-Korvo-2 V3 |
+| 芯片目标 | `esp32s3` |
+| Flash | 16 MB |
+| ESP-IDF | v5.5.3 |
+| ESP-ADF | v2.8，本地验证 checkout `d049321` |
+| ESP-SR | 2.4.6 |
 
-- Wi-Fi：`YOUR_WIFI_SSID`
-- MCP：`ws://YOUR_MCP_SERVER_IP:8080/esp32_ws`
-- 设备：`ESP32_KORVO_2`
+`main/idf_component.yml` 固定了关键托管组件：
 
-## 连续聊天和全双工
+```yaml
+dependencies:
+  espressif/esp-sr: "2.4.6"
+  lvgl/lvgl: "^8.4.0"
+  esp_lcd_touch_gt911: "^1"
+  esp_lcd_touch_tt21100: ">=1.0.0"
+```
 
-当前连续聊天仍走 `mic_diag` 的 16 kHz / 16-bit / mono PCM 采集，并使用轻量 VAD 断句。已经加入动态噪声底和连续静音判断，避免单个峰值或播放回声让“说完了”一直不结束。
+## 公开配置
 
-ESP32-S3-Korvo-2 硬件支持全双工 AEC，但不能只改阈值实现。官方路线是切到 ESP-SR AFE：
+公开版本的 `main/app_config.h` 只保留占位符：
 
-- AEC 示例：`$ADF_PATH/examples/advanced_examples/aec/main/aec_examples.c`
-- WakeNet/VAD 示例：`$ADF_PATH/examples/speech_recognition/wwe/main/main.c`
-- 实时通信示例：`$ADF_PATH/examples/ai_agent/volc_rtc/components/audio_processor/`
+```c
+#define ROBOT_WIFI_SSID "YOUR_WIFI_SSID"
+#define ROBOT_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define ROBOT_MCP_URI "ws://YOUR_MCP_SERVER_IP:8080/esp32_ws"
+#define ROBOT_DEVICE_ID "ESP32_KORVO_2"
+```
 
-主工程里 `main/afe_full_duplex_plan.h` 记录了迁移入口，默认 `ROBOT_AFE_FULL_DUPLEX_EXPERIMENTAL=0`。真正启用前需要先增加 `model` 分区、选择 ESP-SR/WakeNet 模型，并把采集入口从 mono PCM 替换成带 ES7210 reference channel 的 AFE feed/fetch。
+本地运行时把 `YOUR_WIFI_SSID`、`YOUR_WIFI_PASSWORD` 和 `YOUR_MCP_SERVER_IP` 改成自己的环境。不要把真实配置提交到公开仓库。
+
+## 安装 ESP-IDF / ESP-ADF
+
+Windows PowerShell 示例：
+
+```powershell
+git clone --recursive -b v2.8 https://github.com/espressif/esp-adf.git D:\Espressif\esp-adf-v2.8
+cd D:\Espressif\esp-adf-v2.8\esp-idf
+git fetch --tags
+git checkout v5.5.3
+.\install.ps1 esp32s3
+.\export.ps1
+$env:ADF_PATH='D:\Espressif\esp-adf-v2.8'
+idf.py --version
+```
+
+构建前必须设置 `ADF_PATH`，因为根 `CMakeLists.txt` 通过 `$ENV{ADF_PATH}/CMakeLists.txt` 引入 ESP-ADF 组件。
 
 ## 构建和烧录
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\esp32\esp32idf-robot\build_flash_monitor.ps1 -Port COM3
+cd <本仓库>\esp32idf-robot
+$env:IDF_CCACHE_ENABLE='0'
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COM3 flash monitor
 ```
 
 如果只想编译不烧录：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\esp32\esp32idf-robot\build_flash_monitor.ps1 -NoFlash -NoMonitor
+idf.py build
+```
+
+也可以使用脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_flash_monitor.ps1 -Port COM3
+powershell -ExecutionPolicy Bypass -File .\build_flash_monitor.ps1 -NoFlash -NoMonitor
 ```
 
 ## 按键
@@ -44,8 +86,6 @@ powershell -ExecutionPolicy Bypass -File D:\esp32\esp32idf-robot\build_flash_mon
 
 ## 串口命令
 
-串口仍保留为备用调试入口，但主流程不依赖串口输入。
-
 - `PLAY` / `XIAOLE`：播放一次
 - `LOOP`：循环播放
 - `STOP`：停止循环，当前一句播完后停止
@@ -56,3 +96,11 @@ powershell -ExecutionPolicy Bypass -File D:\esp32\esp32idf-robot\build_flash_mon
 - `MCP URL <url>`：设置 MCP 服务地址
 - `MCP CONNECT`：启动 Wi-Fi/MCP 连接
 - `HELP`：打印命令
+
+## 连续聊天和全双工
+
+当前连续聊天仍走 `mic_diag` 的 16 kHz / 16-bit / mono PCM 采集，并使用轻量 VAD 断句。工程中保留 ESP-SR AFE/AEC 迁移记录，后续可继续对齐官方 AFE feed/fetch、WakeNet/VAD 和 ES7210 reference channel。
+
+## 提交注意
+
+公开 GitHub 保留占位符配置即可；比赛现场可运行包可以保留真实 Wi-Fi 和 `local_keys.py`，但不要上传公开仓库。
